@@ -227,6 +227,22 @@ def test_inspect_accepts_legacy_model_subword_form():
     assert args.model_args == ["model", "models/example"]
 
 
+def test_inspect_human_output_is_default(tmp_path, capsys):
+    model = tmp_path / "plain-model"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type": "llama"}\n', encoding="utf-8")
+
+    code = main(["inspect", str(model)])
+
+    captured = capsys.readouterr().out
+    assert code == 2
+    assert "MTPLX inspect" in captured
+    assert f"model: {model}" in captured
+    assert "tier: no-MTP" in captured
+    assert "can_run: false" in captured
+    assert "message: Model has no MTP head." in captured
+
+
 def test_profiles_command_lists_default_without_mlx(capsys):
     code = main(["profiles", "--json"])
 

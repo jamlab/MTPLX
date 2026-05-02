@@ -235,12 +235,41 @@ def cmd_inspect_model_public(args: Any) -> int:
     except Exception as exc:
         _print({"error": "inspect failed", "model": model, "detail": str(exc)})
         return 1
-    _print(inspection)
+    if getattr(args, "json", False):
+        _print(inspection)
+    else:
+        _print_inspect_human(inspection)
     compatibility = inspection.get("compatibility") or {}
     exit_code = int(compatibility.get("exit_code", 0))
     if args.require_mtp or getattr(args, "strict_exit_code", True):
         return exit_code
     return 0
+
+
+def _print_inspect_human(inspection: dict[str, Any]) -> None:
+    compatibility = inspection.get("compatibility") or {}
+    mtp = inspection.get("mtp") or {}
+    architecture = inspection.get("architecture") or inspection.get("model_type") or "unknown"
+    tensor_count = mtp.get("tensor_count")
+    mtp_layers = inspection.get("mtp_num_hidden_layers")
+    runtime_contract_present = bool(inspection.get("runtime_contract_path"))
+    print("MTPLX inspect")
+    print(f"model: {inspection.get('model_dir')}")
+    print(f"source: {inspection.get('source') or 'local'}")
+    print(f"architecture: {architecture}")
+    print(f"tier: {compatibility.get('tier', 'unknown')}")
+    print(f"can_run: {str(bool(compatibility.get('can_run'))).lower()}")
+    if mtp_layers is not None:
+        print(f"mtp_layers: {mtp_layers}")
+    if tensor_count is not None:
+        print(f"mtp_tensors_present: {tensor_count}")
+    print(f"runtime_contract: {str(runtime_contract_present).lower()}")
+    recommended = compatibility.get("recommended_profile") or inspection.get("recommended_profile")
+    if recommended:
+        print(f"recommended_profile: {recommended}")
+    message = compatibility.get("message")
+    if message:
+        print(f"message: {message}")
 
 
 def cmd_bench_public(args: Any) -> int:
