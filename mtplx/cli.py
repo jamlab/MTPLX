@@ -139,6 +139,12 @@ def cmd_thermal_public(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+def cmd_max_public(args: argparse.Namespace) -> int:
+    from .commands.public import cmd_max_public as handler
+
+    return handler(args)
+
+
 def _cmd_env(args: argparse.Namespace) -> int:
     from .env import collect_environment
 
@@ -185,12 +191,13 @@ def _cmd_inspect_model(args: argparse.Namespace) -> int:
 
 def _cmd_init(args: argparse.Namespace) -> int:
     from .hf_loader import model_cache_dir, pull_model
+    from .thermal import detect_thermal_control
 
     config_path = Path(args.config).expanduser()
     model_dir = model_cache_dir(args.model_dir)
-    thermalforge = shutil.which("thermalforge")
-    tgpro = shutil.which("tgpro") or shutil.which("tgpro-cli")
-    thermal_tool = "thermalforge" if thermalforge else ("tgpro" if tgpro else "none")
+    thermal_detection = detect_thermal_control()
+    selected_thermal = thermal_detection.get("selected") or {}
+    thermal_tool = selected_thermal.get("kind", "none")
     hardware = {
         "system": platform.system(),
         "release": platform.release(),
@@ -217,8 +224,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         "thermal_control": {
             "requested": args.thermal_control,
             "detected": thermal_tool,
-            "thermalforge": thermalforge,
-            "tgpro": tgpro,
+            "details": thermal_detection,
         },
         "download_requested": bool(args.download),
         "downloaded": False,
@@ -1031,6 +1037,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--quiet", action="store_true", help="Hide the stats footer")
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     run_p.add_argument("--expect-python", action="store_true")
+    run_p.add_argument("--max", action="store_true", help="Opt into ThermalForge/TG Pro performance fan profile for this run")
     run_p.set_defaults(func=cmd_run_public)
 
     chat_p = sub.add_parser("chat", help="Run one native-MTP chat smoke generation")
@@ -1047,6 +1054,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat_p.add_argument("--depth", type=int, default=3)
     chat_p.add_argument("--seed", type=int, default=0)
     chat_p.add_argument("--expect-python", action="store_true")
+    chat_p.add_argument("--max", action="store_true", help="Opt into ThermalForge/TG Pro performance fan profile for this run")
     chat_p.set_defaults(func=cmd_chat_public)
 
     serve_p = sub.add_parser("serve", help="Start the OpenAI-compatible MTPLX server")
@@ -1084,6 +1092,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--default-temperature", dest="temperature", type=float, default=0.6)
     serve_p.add_argument("--default-top-p", dest="top_p", type=float, default=0.95)
     serve_p.add_argument("--reasoning-parser", choices=["qwen3", "none"], default="qwen3")
+    serve_p.add_argument("--max", action="store_true", help="Opt into ThermalForge/TG Pro performance fan profile for the server lifetime")
     serve_p.add_argument(
         "--warmup-tokens",
         type=int,
@@ -1158,6 +1167,7 @@ def build_parser() -> argparse.ArgumentParser:
     bench_p.add_argument("--strict-cold", action="store_true", help="Enforce cold 55 tok/s regression gate")
     bench_p.add_argument("--no-fanmax", action="store_true", help="Mark run as no-fan product candidate")
     bench_p.add_argument("--fanmax", action="store_true", help="Mark run as fan-controlled diagnostic")
+    bench_p.add_argument("--max", action="store_true", dest="fanmax", help="Alias for --fanmax")
     bench_p.add_argument("--unsafe-force-unverified", action="store_true")
     bench_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
     bench_p.add_argument("--dry-run", action="store_true")
@@ -1300,6 +1310,16 @@ def build_parser() -> argparse.ArgumentParser:
     fanmax_p.add_argument("--output-dir")
     fanmax_p.add_argument("--dry-run", action="store_true")
     fanmax_p.set_defaults(func=cmd_thermal_public)
+
+    max_p = sub.add_parser("max", help="Opt-in fan profile control via ThermalForge or TG Pro")
+    max_group = max_p.add_mutually_exclusive_group(required=True)
+    max_group.add_argument("--on", dest="max_action", action="store_const", const="performance", help="Set the Performance fan profile")
+    max_group.add_argument("--max", dest="max_action", action="store_const", const="max", help="Set the Max fan profile")
+    max_group.add_argument("--off", dest="max_action", action="store_const", const="silent", help="Restore the Silent fan profile")
+    max_group.add_argument("--status", dest="max_action", action="store_const", const="status", help="Show thermal-control status")
+    max_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    max_p.add_argument("--dry-run", action="store_true", help="Show the command without changing fan state")
+    max_p.set_defaults(func=cmd_max_public)
 
     smoke_p = sub.add_parser("runtime-smoke", help="Load model, inject MTP, and run one AR/MTP forward")
     smoke_p.add_argument("--model", default=default_model)

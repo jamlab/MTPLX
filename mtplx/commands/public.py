@@ -203,11 +203,13 @@ class _temporary_env:
 def cmd_doctor(args: Any) -> int:
     env = collect_environment(args.project_root).to_dict()
     from mtplx.hf_loader import hf_cache_report
+    from mtplx.thermal import detect_thermal_control
 
     smc_path = Path(args.smc_path)
     report = {
         "environment": env,
         "huggingface": hf_cache_report(cache_dir=getattr(args, "model_cache", None)),
+        "thermal_control": detect_thermal_control(),
         "tools": {
             "python": sys.executable,
             "powermetrics": shutil.which("powermetrics"),
@@ -1595,6 +1597,34 @@ def cmd_thermal_public(args: Any) -> int:
     return subprocess.call(cmd, cwd=repo_root())
 
 
+def cmd_max_public(args: Any) -> int:
+    from mtplx.thermal import set_thermal_profile, thermal_status
+
+    action = args.max_action
+    if action == "status":
+        payload = thermal_status()
+        code = 0
+    else:
+        payload = set_thermal_profile(action, dry_run=bool(getattr(args, "dry_run", False)))
+        code = 0 if payload.get("ok") or getattr(args, "dry_run", False) else 1
+    if getattr(args, "json", False):
+        _print(payload)
+    else:
+        selected = (payload.get("detection") or {}).get("selected") or {}
+        tool = selected.get("kind", "none")
+        print(f"thermal tool: {tool}")
+        if action == "status":
+            print(f"available: {str(bool((payload.get('detection') or {}).get('available'))).lower()}")
+        else:
+            print(f"profile: {action}")
+            print(f"ok: {str(bool(payload.get('ok'))).lower()}")
+        if payload.get("message"):
+            print(payload["message"])
+        elif (payload.get("detection") or {}).get("instructions"):
+            print((payload.get("detection") or {})["instructions"])
+    return code
+
+
 def cmd_serve_public(args: Any) -> int:
     api_key = getattr(args, "api_key", None)
     if not _is_localhost_bind(getattr(args, "host", None)) and not api_key:
@@ -1664,6 +1694,19 @@ def cmd_serve_public(args: Any) -> int:
         cmd.extend(["--reasoning-parser", str(args.reasoning_parser)])
     if getattr(args, "strict_warmup", False):
         cmd.append("--strict-warmup")
+    if getattr(args, "max", False):
+        from mtplx.thermal import set_thermal_profile
+
+        thermal = {"start": set_thermal_profile("performance"), "restore": None}
+        start = thermal["start"]
+        if not start.get("ok"):
+            print(json.dumps({"warning": "fan control unavailable; continuing without --max", "thermal": thermal}), file=sys.stderr)
+        try:
+            proc = subprocess.run(cmd, env=os.environ.copy(), cwd=repo_root(), check=False)
+            return int(proc.returncode)
+        finally:
+            if start.get("detection", {}).get("available"):
+                thermal["restore"] = set_thermal_profile("silent")
     os.execvpe(sys.executable, cmd, os.environ.copy())
     return 0
 
@@ -1688,40 +1731,52 @@ def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
 
+    thermal: dict[str, Any] | None = None
+    if getattr(args, "max", False):
+        from mtplx.thermal import set_thermal_profile
+
+        thermal = {"start": set_thermal_profile("performance"), "restore": None}
+
     from mtplx.benchmarks.schema import PromptCase, encode_prompt_case
     from mtplx.generation import generate_mtpk
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
 
-    rt = load(runtime_model, mtp=True)
-    messages = None
-    system = getattr(args, "system", None)
-    if system:
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ]
-    case = PromptCase(
-        id=f"cli_{command}",
-        category=command,
-        prompt=prompt,
-        max_tokens=args.max_tokens,
-        messages=messages,
-    )
-    prompt_ids = encode_prompt_case(rt.tokenizer, case, chat_template=True, enable_thinking=False)
-    out = generate_mtpk(
-        rt,
-        prompt_ids,
-        max_tokens=args.max_tokens,
-        sampler=SamplerConfig(temperature=args.temperature, top_p=args.top_p, top_k=args.top_k),
-        speculative_depth=args.depth,
-        seed=args.seed,
-        mtp_hidden_variant="post_norm",
-        mtp_cache_policy="persistent",
-        mtp_history_policy="committed",
-        verify_strategy="capture_commit",
-        verify_core="linear-gdn-from-conv-tape",
-    )
+    try:
+        rt = load(runtime_model, mtp=True)
+        messages = None
+        system = getattr(args, "system", None)
+        if system:
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ]
+        case = PromptCase(
+            id=f"cli_{command}",
+            category=command,
+            prompt=prompt,
+            max_tokens=args.max_tokens,
+            messages=messages,
+        )
+        prompt_ids = encode_prompt_case(rt.tokenizer, case, chat_template=True, enable_thinking=False)
+        out = generate_mtpk(
+            rt,
+            prompt_ids,
+            max_tokens=args.max_tokens,
+            sampler=SamplerConfig(temperature=args.temperature, top_p=args.top_p, top_k=args.top_k),
+            speculative_depth=args.depth,
+            seed=args.seed,
+            mtp_hidden_variant="post_norm",
+            mtp_cache_policy="persistent",
+            mtp_history_policy="committed",
+            verify_strategy="capture_commit",
+            verify_core="linear-gdn-from-conv-tape",
+        )
+    finally:
+        if thermal is not None:
+            from mtplx.thermal import set_thermal_profile
+
+            thermal["restore"] = set_thermal_profile("silent")
     validations = [
         validate_no_degenerate_loop(out.text),
         validate_balanced_delimiters(out.text),
@@ -1743,6 +1798,8 @@ def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str
         },
         "validations": [v.__dict__ for v in validations],
     }
+    if thermal is not None:
+        payload["thermal"] = thermal
     return 0 if all(v.passed for v in validations) else EXIT_QUALITY, payload, validations
 
 

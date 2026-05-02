@@ -265,3 +265,11 @@ def test_profiles_without_mlx(tmp_path: Path) -> None:
         "exact",
         "max-diagnostic",
     ]
+
+
+def test_max_status_without_mlx(tmp_path: Path) -> None:
+    proc = _run_no_mlx(tmp_path, ["-m", "mtplx.cli", "max", "--status", "--json"])
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert "detection" in payload

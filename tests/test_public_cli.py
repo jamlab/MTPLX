@@ -202,12 +202,14 @@ def test_chat_and_serve_default_to_stable_profile():
     run_args = parser.parse_args(["run", "hello", "--cache-dir", "/tmp/mtplx-models"])
     chat_args = parser.parse_args(["chat", "--prompt", "hello"])
     serve_args = parser.parse_args(["serve"])
+    serve_max_args = parser.parse_args(["serve", "--max"])
 
     assert run_args.profile == "stable"
     assert run_args.prompt_arg == "hello"
     assert run_args.cache_dir == "/tmp/mtplx-models"
     assert chat_args.profile == "stable"
     assert serve_args.profile == "stable"
+    assert serve_max_args.max is True
     assert serve_args.stream_interval == 1
     assert serve_args.rate_limit == 0
     assert serve_args.reasoning_parser == "qwen3"
@@ -292,6 +294,20 @@ def test_serve_rejects_non_localhost_without_api_key(monkeypatch, capsys):
     assert public.cmd_serve_public(args) == 2
     captured = capsys.readouterr().out
     assert "--api-key is required" in captured
+
+
+def test_max_status_command_is_no_mlx_safe(monkeypatch, capsys):
+    from mtplx import thermal
+
+    thermal.detect_thermal_control.cache_clear()
+    monkeypatch.setattr(thermal.shutil, "which", lambda _name: None)
+
+    code = main(["max", "--status", "--json"])
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["detection"]["available"] is False
+    thermal.detect_thermal_control.cache_clear()
 
 
 def test_inspect_accepts_direct_model_argument():
