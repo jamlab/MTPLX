@@ -7,6 +7,16 @@ from mtplx.cli import build_parser, main
 from mtplx.commands import public
 
 
+def test_version_command_without_subcommand(capsys):
+    try:
+        main(["--version"])
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    captured = capsys.readouterr().out
+    assert "mtplx 0.1.0-preview (0.1.0rc0)" in captured
+
+
 def test_public_bench_run_dry_run(capsys):
     code = main(
         [

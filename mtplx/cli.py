@@ -18,6 +18,7 @@ from .profiles import (
     get_profile,
     list_profiles,
 )
+from .version import DISPLAY_VERSION, __version__
 
 
 DEFAULT_TRUTH_MODES = (
@@ -950,6 +951,11 @@ def _cmd_session_bank(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mtplx")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"mtplx {DISPLAY_VERSION} ({__version__})",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     default_model = str(DEFAULT_RUNTIME_MODEL_DIR)
 

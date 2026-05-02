@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["MTPLXRuntime", "load"]
+from .version import DISPLAY_VERSION, __version__
+
+__all__ = ["MTPLXRuntime", "load", "__version__", "DISPLAY_VERSION"]
 
 
 def __getattr__(name: str) -> Any:
