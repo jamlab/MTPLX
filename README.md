@@ -11,8 +11,10 @@ Native MTP speculative decoding for Qwen3-Next on Apple Silicon.
 > Preview status: v0.1.0-preview.1 ships the clean install surface, the verified cold MTP path, honest benchmark reporting, `mtplx help`, and OpenAI-compatible serving work in progress. Sustained no-fan long-context throughput is currently below target: recent Flappy 10k evidence is about 37 tok/s no-fan versus a 50+ tok/s goal. The default profile is `stable`. The cold 60+ tok/s path is opt-in as `--profile performance-cold`; `--max` is opt-in and is never required for the headline quick start.
 
 ```bash
+gh repo clone youssofal/mtplx mtplx-preview
+cd mtplx-preview
 gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl'
-python -m pip install './mtplx-0.1.0rc1-py3-none-any.whl[server]'
+scripts/install_preview_global.sh ./mtplx-0.1.0rc1-py3-none-any.whl
 mtplx help
 mtplx doctor --json
 mtplx init --model /path/to/verified/model --write
@@ -36,11 +38,10 @@ MTPLX is not DFlash, DDTree, or an external-drafter system. It is a native-MTP r
 ## Quick Start
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -U pip
+gh repo clone youssofal/mtplx mtplx-preview
+cd mtplx-preview
 gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl'
-python -m pip install './mtplx-0.1.0rc1-py3-none-any.whl[server]'
+scripts/install_preview_global.sh ./mtplx-0.1.0rc1-py3-none-any.whl
 
 mtplx help
 mtplx doctor --json
@@ -48,7 +49,7 @@ mtplx init --model /path/to/verified/model --write
 mtplx inspect /path/to/verified/model --json
 ```
 
-Public `pip install mtplx` is the Stage C target after PyPI Trusted Publishing is configured. The current private preview install path is the GitHub release wheel above.
+Public `pip install mtplx` is the Stage C target after PyPI Trusted Publishing is configured. The current private preview install path is the GitHub release wheel above plus the global preview launcher script. The launcher installs into `~/.mtplx/preview-venv`, writes `~/.local/bin/mtplx`, and writes `/opt/homebrew/bin/mtplx` when Homebrew's bin directory is writable.
 
 After selecting or downloading a verified model:
 

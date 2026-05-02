@@ -23,9 +23,17 @@ python -m pip install mtplx
 Private preview install, while the GitHub repository is private:
 
 ```bash
+gh repo clone youssofal/mtplx mtplx-preview
+cd mtplx-preview
 gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl'
-python -m pip install './mtplx-0.1.0rc1-py3-none-any.whl[server]'
+scripts/install_preview_global.sh ./mtplx-0.1.0rc1-py3-none-any.whl
 ```
+
+The preview installer writes a durable launcher at `~/.local/bin/mtplx`, adds
+`~/.local/bin` to zsh startup files when needed, and writes
+`/opt/homebrew/bin/mtplx` on Apple Silicon Homebrew installs when that directory
+is writable. That means `mtplx help` works from a normal new Terminal tab
+without activating a project venv.
 
 For local development:
 
