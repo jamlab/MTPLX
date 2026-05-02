@@ -30,7 +30,12 @@ BLOCK_MLX = textwrap.dedent(
 )
 
 
-def _run_no_mlx(tmp_path: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_no_mlx(
+    tmp_path: Path,
+    args: list[str],
+    *,
+    env_extra: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     blocker = tmp_path / "blocker"
     blocker.mkdir(exist_ok=True)
     (blocker / "sitecustomize.py").write_text(BLOCK_MLX, encoding="utf-8")
@@ -38,6 +43,8 @@ def _run_no_mlx(tmp_path: Path, args: list[str]) -> subprocess.CompletedProcess[
     if os.environ.get("PYTHONPATH"):
         pythonpath_parts.append(os.environ["PYTHONPATH"])
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(pythonpath_parts)}
+    if env_extra:
+        env.update(env_extra)
     return subprocess.run(
         [sys.executable, *args],
         cwd=ROOT,
@@ -152,6 +159,29 @@ def test_run_reports_uncached_hf_model_without_importing_mlx(tmp_path: Path) -> 
     assert "Traceback" not in proc.stderr
     payload = json.loads(proc.stdout)
     assert payload["error"] == "model is not available locally"
+    assert "mtplx pull mtplx/example" in payload["detail"]
+
+
+def test_run_uses_config_model_without_importing_mlx(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    cache = tmp_path / "cache"
+    config.write_text(
+        'model = "mtplx/example"\n'
+        f'model_dir = "{cache}"\n'
+        'profile = "exact"\n',
+        encoding="utf-8",
+    )
+
+    proc = _run_no_mlx(
+        tmp_path,
+        ["-m", "mtplx.cli", "run", "hello", "--json"],
+        env_extra={"MTPLX_CONFIG": str(config)},
+    )
+
+    assert proc.returncode == 1, proc.stderr
+    assert "Traceback" not in proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["model"] == "mtplx/example"
     assert "mtplx pull mtplx/example" in payload["detail"]
 
 

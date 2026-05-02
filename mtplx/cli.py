@@ -1806,6 +1806,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    from .config import apply_user_config
+
+    apply_user_config(args)
     return int(args.func(args))
 
 
