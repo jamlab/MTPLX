@@ -22,8 +22,9 @@ gh release create v0.1.0-preview.1 dist/* --prerelease --title "MTPLX v0.1.0-pre
 While the repository is private, direct unauthenticated release-asset URLs return 404. Use GitHub CLI authentication for private artifact smoke tests:
 
 ```bash
-gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl'
-python -m pip install ./mtplx-0.1.0rc1-py3-none-any.whl
+gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl' --pattern 'install_preview_global.sh'
+bash install_preview_global.sh ./mtplx-0.1.0rc1-py3-none-any.whl
+mtplx help
 ```
 
 PyPI publishing is wired through Trusted Publishing, not local long-lived tokens. Before enabling the upload job, configure a pending publisher on PyPI:

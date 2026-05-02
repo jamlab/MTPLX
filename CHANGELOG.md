@@ -4,6 +4,10 @@ All notable user-facing changes are recorded here.
 
 ## v0.1.0-preview.1
 
+### Added
+
+- Added `install_preview_global.sh` to the private GitHub release path so the preview wheel installs into a durable `~/.mtplx/preview-venv` and exposes a normal global `mtplx` launcher.
+
 ### Fixed
 
 - Added `mtplx help` as a first-class alias for `mtplx --help`.
