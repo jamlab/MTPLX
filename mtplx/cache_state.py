@@ -420,13 +420,41 @@ class BlockOwnedKVCache(TailOwnedKVCache):
 
 
 def _vllm_metal_reference_path() -> Path:
+    override = os.environ.get("MTPLX_VLLM_METAL_REPO")
+    if override:
+        return Path(override).expanduser()
     return Path(__file__).resolve().parents[1] / "REFERENCES:TOOLS" / "vllm-metal"
+
+
+def _paged_attention_impl_from_env() -> str:
+    return (
+        os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+
+
+def _paged_attention_requires_external_ops(*, turboquant_config: Any | None = None) -> bool:
+    if turboquant_config is not None:
+        return True
+    impl = _paged_attention_impl_from_env()
+    if impl in {"fast_sdpa_gather", "sdpa_gather", "exact_gather"}:
+        return False
+    if impl in {"sdpa_2pass_paged", "mlx_vector_paged"}:
+        return False
+    return True
 
 
 def _load_vllm_metal_ops():
     repo = _vllm_metal_reference_path()
     if not repo.exists():
-        raise RuntimeError(f"vllm-metal reference repo is missing: {repo}")
+        raise RuntimeError(
+            "vllm-metal reference repo is missing: "
+            f"{repo}. Set MTPLX_VLLM_METAL_REPO to the checkout path, or use "
+            "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL=mlx_vector_paged for the packaged "
+            "in-tree paged attention path."
+        )
     repo_text = str(repo)
     if repo_text not in sys.path:
         sys.path.insert(0, repo_text)
@@ -1751,13 +1779,21 @@ def install_vllm_metal_paged_attention_kv_cache(
         "block_size": int(block_size),
         "num_blocks": int(num_blocks),
         "turboquant": int(bool(turboquant_config)),
+        "attention_impl": _paged_attention_impl_from_env() or "vllm_metal",
     }
+    external_ops_required = _paged_attention_requires_external_ops(
+        turboquant_config=turboquant_config,
+    )
+    stats["external_ops_required"] = int(external_ops_required)
     if turboquant_config is not None:
         stats["turboquant_k_quant"] = str(turboquant_config.key_quant)
         stats["turboquant_v_quant"] = str(turboquant_config.value_quant)
-    # Validate the optional dependency once at install time so profile failures
-    # are immediate rather than appearing mid-generation.
-    _load_vllm_metal_ops()
+    # Validate the optional dependency once at install time only for paths that
+    # actually dispatch into the external vLLM-Metal ops. The packaged
+    # mlx_vector_paged and sdpa_2pass_paged paths are in-tree and must survive a
+    # clean product checkout without REFERENCES:TOOLS.
+    if external_ops_required:
+        _load_vllm_metal_ops()
     for idx, entry in enumerate(cache or []):
         if entry is None:
             stats["skipped"] = int(stats["skipped"]) + 1
