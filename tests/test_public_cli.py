@@ -257,6 +257,34 @@ def test_model_cache_commands_parse():
     assert remove_args.missing_ok is True
 
 
+def test_init_parser_exposes_model_cache_and_profile_options():
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "init",
+            "--model",
+            "mtplx/example",
+            "--model-dir",
+            "/tmp/mtplx-models",
+            "--profile",
+            "exact",
+            "--thermal-control",
+            "none",
+            "--download",
+            "--write",
+        ]
+    )
+
+    assert args.command == "init"
+    assert args.model == "mtplx/example"
+    assert args.model_dir == "/tmp/mtplx-models"
+    assert args.profile == "exact"
+    assert args.thermal_control == "none"
+    assert args.download is True
+    assert args.write is True
+
+
 def test_compile_audit_dry_run_is_real_command(capsys):
     code = main(
         [

@@ -157,10 +157,21 @@ def test_run_reports_uncached_hf_model_without_importing_mlx(tmp_path: Path) -> 
 
 def test_init_dry_run_without_mlx_does_not_write_config(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
+    model_dir = tmp_path / "models"
 
     proc = _run_no_mlx(
         tmp_path,
-        ["-m", "mtplx.cli", "init", "--dry-run", "--json", "--config", str(config)],
+        [
+            "-m",
+            "mtplx.cli",
+            "init",
+            "--dry-run",
+            "--json",
+            "--config",
+            str(config),
+            "--model-dir",
+            str(model_dir),
+        ],
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -168,7 +179,48 @@ def test_init_dry_run_without_mlx_does_not_write_config(tmp_path: Path) -> None:
     assert payload["status"] == "ready_for_init"
     assert payload["dry_run"] is True
     assert payload["wrote_config"] is False
+    assert payload["model"].startswith("mtplx/")
+    assert payload["model_dir"] == str(model_dir)
+    assert payload["profile"]["name"] == "stable"
+    assert payload["hardware"]["system"]
+    assert payload["commands"]["pull"].startswith("mtplx pull ")
     assert not config.exists()
+
+
+def test_init_write_without_mlx_writes_config(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    model_dir = tmp_path / "models"
+
+    proc = _run_no_mlx(
+        tmp_path,
+        [
+            "-m",
+            "mtplx.cli",
+            "init",
+            "--write",
+            "--json",
+            "--config",
+            str(config),
+            "--model",
+            "mtplx/example",
+            "--model-dir",
+            str(model_dir),
+            "--profile",
+            "exact",
+            "--thermal-control",
+            "none",
+        ],
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["wrote_config"] is True
+    assert payload["downloaded"] is False
+    text = config.read_text(encoding="utf-8")
+    assert 'model = "mtplx/example"' in text
+    assert f'model_dir = "{model_dir}"' in text
+    assert 'profile = "exact"' in text
+    assert 'thermal_control = "none"' in text
 
 
 def test_profiles_without_mlx(tmp_path: Path) -> None:

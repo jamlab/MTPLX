@@ -5,10 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
+import shutil
 from pathlib import Path
 
 from .constants import DEFAULT_RUNTIME_MODEL_DIR
 from .profiles import (
+    DEFAULT_HF_MODEL_ID,
     DEFAULT_MODEL_ID,
     DEFAULT_PROFILE_NAME,
     PROFILE_CHOICES,
@@ -181,38 +184,93 @@ def _cmd_inspect_model(args: argparse.Namespace) -> int:
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
+    from .hf_loader import model_cache_dir, pull_model
+
     config_path = Path(args.config).expanduser()
+    model_dir = model_cache_dir(args.model_dir)
+    thermalforge = shutil.which("thermalforge")
+    tgpro = shutil.which("tgpro") or shutil.which("tgpro-cli")
+    thermal_tool = "thermalforge" if thermalforge else ("tgpro" if tgpro else "none")
+    hardware = {
+        "system": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+        "is_macos": platform.system() == "Darwin",
+        "is_apple_silicon": platform.system() == "Darwin" and platform.machine() == "arm64",
+    }
+    profile = get_profile(args.profile)
+    commands = {
+        "doctor": "mtplx doctor --json",
+        "pull": f"mtplx pull {args.model}",
+        "inspect": f"mtplx inspect {args.model} --json",
+        "run": f"mtplx run \"hello\" --model {args.model}",
+        "serve": f"mtplx serve --model {args.model}",
+    }
     report = {
         "status": "ready_for_init",
         "config_path": str(config_path),
         "dry_run": bool(args.dry_run),
+        "model": args.model,
+        "model_dir": str(model_dir),
+        "profile": profile.to_dict(),
+        "hardware": hardware,
+        "thermal_control": {
+            "requested": args.thermal_control,
+            "detected": thermal_tool,
+            "thermalforge": thermalforge,
+            "tgpro": tgpro,
+        },
+        "download_requested": bool(args.download),
+        "downloaded": False,
         "wrote_config": False,
-        "next_steps": [
-            "run mtplx doctor --json",
-            "run mtplx profiles --json",
-            "run mtplx inspect model --model <local-model-path>",
-            "install MLX runtime dependencies before mtplx run or mtplx serve",
-        ],
+        "commands": commands,
+        "next_steps": list(commands.values()),
     }
     if args.write and not args.dry_run:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(
             "# MTPLX user configuration\n"
-            f"model_dir = {json.dumps(str(Path('~/.mtplx/models').expanduser()))}\n",
-            f"profile = {json.dumps(DEFAULT_PROFILE_NAME)}\n",
+            f"model = {json.dumps(args.model)}\n"
+            f"model_dir = {json.dumps(str(model_dir))}\n"
+            f"profile = {json.dumps(profile.name)}\n"
+            f"thermal_control = {json.dumps(args.thermal_control)}\n",
             encoding="utf-8",
         )
         report["wrote_config"] = True
+    if args.download and not args.dry_run:
+        try:
+            report["download_result"] = pull_model(args.model, cache_dir=model_dir)
+        except Exception as exc:
+            report["download_error"] = str(exc)
+            if args.json:
+                print(json.dumps(report, indent=2, sort_keys=True))
+            else:
+                print("MTPLX init")
+                print(f"download failed: {exc}")
+            return 1
+        report["downloaded"] = True
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print("MTPLX init")
         print(f"config: {config_path}")
-        print("status: no-MLX-safe initializer is available")
+        print(f"model: {args.model}")
+        print(f"profile: {profile.name}")
+        print(f"model cache: {model_dir}")
+        print(
+            "hardware: "
+            f"{hardware['system']} {hardware['release']} {hardware['machine']} "
+            f"(apple_silicon={str(hardware['is_apple_silicon']).lower()})"
+        )
+        print(f"thermal control: {thermal_tool}")
         if args.write and not args.dry_run:
             print("wrote config")
         else:
             print("dry run: no files written")
+        if args.download and not args.dry_run:
+            print("downloaded model")
+        print(f"next: {commands['doctor']}")
+        print(f"next: {commands['pull']}")
     return 0
 
 
@@ -922,6 +980,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_p = sub.add_parser("init", help="Initialize MTPLX user config without importing MLX")
     init_p.add_argument("--config", default="~/.mtplx/config.toml")
+    init_p.add_argument("--model", default=DEFAULT_HF_MODEL_ID, help="Default verified model repo id or path")
+    init_p.add_argument("--model-dir", help="Model cache directory; defaults to MTPLX_MODEL_DIR or ~/.mtplx/models")
+    init_p.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
+    init_p.add_argument("--thermal-control", choices=("auto", "none"), default="auto")
+    init_p.add_argument("--download", action="store_true", help="Download the selected model into the cache")
     init_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     init_p.add_argument("--dry-run", action="store_true", help="Show init actions without writing files")
     init_p.add_argument("--write", action="store_true", help="Write the initial config file")

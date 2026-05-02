@@ -18,6 +18,7 @@ DEFAULT_PROFILE_NAME = "stable"
 PROFILE_CHOICES = ("stable", "performance-cold", "exact", "max-diagnostic")
 
 DEFAULT_MODEL_ID = "models/Qwen3.6-27B-MTPLX-GDN8-Speed4-CyanKiwiMTP"
+DEFAULT_HF_MODEL_ID = "mtplx/Qwen3.6-27B-MTPLX-GDN8-Speed4-CyanKiwiMTP"
 NATIVE_MTP_60_MLX_FORK_COMMIT = "2377a99f"
 NATIVE_MTP_60_MLX_FORK_FRAGMENT = "mlx-mtplx-0.31.2-qmm"
 
