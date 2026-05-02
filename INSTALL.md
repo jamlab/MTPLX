@@ -23,10 +23,8 @@ python -m pip install mtplx
 Private preview install, while the GitHub repository is private:
 
 ```bash
-gh repo clone youssofal/mtplx mtplx-preview
-cd mtplx-preview
-gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl'
-scripts/install_preview_global.sh ./mtplx-0.1.0rc1-py3-none-any.whl
+gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl' --pattern 'install_preview_global.sh'
+bash install_preview_global.sh ./mtplx-0.1.0rc1-py3-none-any.whl
 ```
 
 The preview installer writes a durable launcher at `~/.local/bin/mtplx`, adds
