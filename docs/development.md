@@ -14,16 +14,16 @@ Keep generated artifacts, model weights, and local credentials out of Git. The r
 Private GitHub preview artifacts are published from a clean tag:
 
 ```bash
-git tag -a v0.1.0-preview -m "MTPLX v0.1.0-preview"
-git push origin v0.1.0-preview
-gh release create v0.1.0-preview dist/* --prerelease --title "MTPLX v0.1.0-preview"
+git tag -a v0.1.0-preview.1 -m "MTPLX v0.1.0-preview.1"
+git push origin v0.1.0-preview.1
+gh release create v0.1.0-preview.1 dist/* --prerelease --title "MTPLX v0.1.0-preview.1"
 ```
 
 While the repository is private, direct unauthenticated release-asset URLs return 404. Use GitHub CLI authentication for private artifact smoke tests:
 
 ```bash
-gh release download v0.1.0-preview --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc0-py3-none-any.whl'
-python -m pip install ./mtplx-0.1.0rc0-py3-none-any.whl
+gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl'
+python -m pip install ./mtplx-0.1.0rc1-py3-none-any.whl
 ```
 
 PyPI publishing is wired through Trusted Publishing, not local long-lived tokens. Before enabling the upload job, configure a pending publisher on PyPI:

@@ -9,4 +9,4 @@ MTPLX separates detection from support.
 | Incompatible architecture | MTP markers exist for an unsupported architecture | Exit with roadmap pointer |
 | No MTP | No MTP head detected | Exit with a clear message |
 
-Only verified Qwen3-Next-MTP models are supported for v0.1.0-preview product runs.
+Only verified Qwen3-Next-MTP models are supported for v0.1.0-preview.1 product runs.

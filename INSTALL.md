@@ -23,8 +23,8 @@ python -m pip install mtplx
 Private preview install, while the GitHub repository is private:
 
 ```bash
-gh release download v0.1.0-preview --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc0-py3-none-any.whl'
-python -m pip install ./mtplx-0.1.0rc0-py3-none-any.whl
+gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl'
+python -m pip install ./mtplx-0.1.0rc1-py3-none-any.whl
 ```
 
 For local development:

@@ -14,7 +14,7 @@ def test_version_command_without_subcommand(capsys):
         assert exc.code == 0
 
     captured = capsys.readouterr().out
-    assert "mtplx 0.1.0-preview (0.1.0rc0)" in captured
+    assert "mtplx 0.1.0-preview.1 (0.1.0rc1)" in captured
 
 
 def test_help_command_aliases_top_level_and_subcommands(capsys):

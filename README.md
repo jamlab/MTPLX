@@ -6,9 +6,9 @@ Native MTP speculative decoding for Qwen3-Next on Apple Silicon.
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-black)](https://developer.apple.com/metal/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
-[![Preview](https://img.shields.io/badge/status-v0.1.0--preview-orange)](CHANGELOG.md)
+[![Preview](https://img.shields.io/badge/status-v0.1.0--preview.1-orange)](CHANGELOG.md)
 
-> Preview status: v0.1.0-preview ships the clean install surface, the verified cold MTP path, honest benchmark reporting, and OpenAI-compatible serving work in progress. Sustained no-fan long-context throughput is currently below target: recent Flappy 10k evidence is about 37 tok/s no-fan versus a 50+ tok/s goal. The default profile is `stable`. The cold 60+ tok/s path is opt-in as `--profile performance-cold`; `--max` is opt-in and is never required for the headline quick start.
+> Preview status: v0.1.0-preview.1 ships the clean install surface, the verified cold MTP path, honest benchmark reporting, `mtplx help`, and OpenAI-compatible serving work in progress. Sustained no-fan long-context throughput is currently below target: recent Flappy 10k evidence is about 37 tok/s no-fan versus a 50+ tok/s goal. The default profile is `stable`. The cold 60+ tok/s path is opt-in as `--profile performance-cold`; `--max` is opt-in and is never required for the headline quick start.
 
 ```bash
 pip install mtplx
@@ -134,7 +134,7 @@ flowchart TB
 
 ## Roadmap
 
-- v0.1.0-preview: clean install, no-MLX CLI survival, honest docs, Qwen3-Next verified path, OpenAI baseline.
+- v0.1.0-preview.1: clean install, no-MLX CLI survival, human-friendly `mtplx help`, honest docs, Qwen3-Next verified path, OpenAI baseline.
 - v0.2: sustained no-fan kernel ladder, dispatch/watts reduction, DeepSeek V3 investigation.
 - v0.3: broader architecture registry, better server concurrency, optional Homebrew tap.
 

@@ -2,6 +2,13 @@
 
 All notable user-facing changes are recorded here.
 
+## v0.1.0-preview.1
+
+### Fixed
+
+- Added `mtplx help` as a first-class alias for `mtplx --help`.
+- Added nested help aliases such as `mtplx help run` and `mtplx help qa exactness`.
+
 ## v0.1.0-preview
 
 ### Added
