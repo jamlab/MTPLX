@@ -306,6 +306,26 @@ class CompletionRequest(BaseModel):
     stream: bool = False
 
 
+class AnthropicMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    role: str
+    content: Any = ""
+
+
+class AnthropicMessagesRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = None
+    max_tokens: int | None = None
+    messages: list[AnthropicMessage] = Field(default_factory=list)
+    system: Any | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    stream: bool = False
+
+
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -505,6 +525,82 @@ def _content_to_text(content: Any) -> str:
                 parts.append(str(item))
         return "".join(parts)
     return str(content)
+
+
+def _anthropic_content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                block_type = str(item.get("type") or "")
+                if block_type == "text" or "text" in item:
+                    parts.append(str(item.get("text", "")))
+                elif block_type == "tool_result":
+                    parts.append(_anthropic_content_to_text(item.get("content")))
+                else:
+                    parts.append(json.dumps(item, sort_keys=True))
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    if isinstance(content, dict):
+        if content.get("type") == "text" or "text" in content:
+            return str(content.get("text", ""))
+        return json.dumps(content, sort_keys=True)
+    return str(content)
+
+
+def _anthropic_to_chat_request(request: AnthropicMessagesRequest) -> ChatCompletionRequest:
+    messages: list[ChatMessage] = []
+    system_text = _anthropic_content_to_text(request.system).strip()
+    if system_text:
+        messages.append(ChatMessage(role="system", content=system_text))
+    for message in request.messages:
+        role = "assistant" if message.role == "assistant" else "user"
+        messages.append(
+            ChatMessage(
+                role=role,
+                content=_anthropic_content_to_text(message.content),
+            )
+        )
+    return ChatCompletionRequest(
+        model=request.model,
+        messages=messages,
+        max_tokens=request.max_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        top_k=request.top_k,
+        stream=False,
+    )
+
+
+def _anthropic_payload_from_openai(openai_payload: dict[str, Any]) -> dict[str, Any]:
+    choices = openai_payload.get("choices") or []
+    choice = choices[0] if choices else {}
+    message = choice.get("message") or {}
+    text = str(message.get("content") or choice.get("text") or "")
+    usage = openai_payload.get("usage") or {}
+    finish_reason = choice.get("finish_reason") or "stop"
+    stop_reason = "max_tokens" if finish_reason == "length" else "end_turn"
+    return {
+        "id": "msg_" + uuid.uuid4().hex,
+        "type": "message",
+        "role": "assistant",
+        "model": openai_payload.get("model"),
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": int(usage.get("prompt_tokens") or 0),
+            "output_tokens": int(usage.get("completion_tokens") or 0),
+        },
+        "mtplx_stats": openai_payload.get("mtplx_stats"),
+    }
 
 
 def _strip_stats_footer(text: str) -> str:
@@ -2393,6 +2489,28 @@ def create_app(state: ServerState) -> FastAPI:
                 "mtplx_stats": generated["stats"],
             }
         )
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(raw_request: Request, request: AnthropicMessagesRequest) -> Any:
+        if not request.messages:
+            raise HTTPException(status_code=400, detail="messages must not be empty")
+        if request.stream:
+            raise HTTPException(
+                status_code=501,
+                detail="Anthropic streaming is not implemented yet; send stream=false.",
+            )
+        chat_request = _anthropic_to_chat_request(request)
+        response = await chat_completions(raw_request, chat_request)
+        if not isinstance(response, JSONResponse):
+            return response
+        try:
+            openai_payload = json.loads(response.body)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"failed to translate response: {exc}") from exc
+        if response.status_code >= 400:
+            return response
+        payload = _anthropic_payload_from_openai(openai_payload)
+        return JSONResponse(payload, status_code=response.status_code)
 
     @app.post("/v1/completions")
     async def completions(request: CompletionRequest) -> Any:

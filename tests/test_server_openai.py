@@ -73,3 +73,20 @@ def test_openai_server_auth_and_rate_limit_fake_state():
     limited = client.get("/v1/models", headers={"Authorization": "Bearer test-key"})
     assert limited.status_code == 429
     assert int(limited.headers["Retry-After"]) > 0
+
+
+def test_anthropic_streaming_reports_explicit_not_implemented():
+    client = TestClient(create_app(_fake_state()))
+
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 8,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 501
+    assert "Anthropic streaming is not implemented" in response.json()["detail"]

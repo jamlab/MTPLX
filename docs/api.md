@@ -24,6 +24,21 @@ Use `--stream-interval N` to batch committed-token SSE chunks when a client pref
 
 Legacy OpenAI completions.
 
+## `POST /v1/messages`
+
+Anthropic Messages baseline. Non-stream requests are translated into the same internal chat path as `/v1/chat/completions` and returned as Anthropic-shaped message payloads.
+
+Supported now:
+
+- `system` as text or text content blocks
+- `messages[].content` as text or text/tool-result content blocks
+- `max_tokens`, `temperature`, `top_p`, and `top_k`
+- `stream=false`
+
+Not supported yet:
+
+- `stream=true` Anthropic SSE. The server returns 501 until the event stream is implemented.
+
 ## Server Flags
 
 ```bash
@@ -43,5 +58,3 @@ X-API-Key: <key>
 ```
 
 `--warmup-tokens` runs a small startup generation after model load and reports the result in `/health`. `--strict-warmup` makes warmup failure fatal.
-
-Anthropic `/v1/messages` compatibility is deferred until the OpenAI baseline is stable.

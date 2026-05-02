@@ -12,6 +12,7 @@ All notable user-facing changes are recorded here.
 - Public benchmark dry-run paths that do not import heavy runtime modules.
 - Packaged OpenAI server entrypoint with API-key guard, rate-limit knob, stream interval, warmup metadata, `/health`, `/metrics`, and `/v1/models` fake-state tests.
 - No-MLX-safe `mtplx max` thermal-control surface with explicit ThermalForge/TG Pro detection and opt-in `--max` wiring.
+- Baseline non-stream Anthropic `/v1/messages` translator; streaming returns an explicit 501 until Anthropic SSE is implemented.
 
 ### Known Caveats
 
