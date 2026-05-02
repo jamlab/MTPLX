@@ -38,6 +38,13 @@ Supported now:
 
 Current streaming note: Qwen reasoning deltas are exposed as text deltas until the Anthropic thinking-block mapping is validated against real Claude Code / OpenCode clients.
 
+Examples:
+
+- [Anthropic Python client](../examples/anthropic-python-client.py)
+- [Anthropic Messages curl](../examples/curl-messages.sh)
+- [OpenAI Python client](../examples/openai-python-client.py)
+- [OpenAI chat completions curl](../examples/curl-chat-completions.sh)
+
 ## Server Flags
 
 ```bash

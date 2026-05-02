@@ -30,6 +30,13 @@ For Open WebUI, set the OpenAI-compatible base URL to:
 http://127.0.0.1:8000/v1
 ```
 
+For Anthropic Messages-compatible clients, point the client base URL at the
+same local server root:
+
+```text
+http://127.0.0.1:8000/v1
+```
+
 Use `--no-stats-footer` for Open WebUI, Claude Code, OpenCode, and other
 clients that treat assistant content as the only user-visible answer. Metrics
 remain available at `/metrics`.
