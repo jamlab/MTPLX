@@ -17,6 +17,40 @@ def test_version_command_without_subcommand(capsys):
     assert "mtplx 0.1.0-preview (0.1.0rc0)" in captured
 
 
+def test_run_json_model_summary_excludes_heavy_inspect_fields():
+    summary = public._compact_model_summary(
+        {
+            "source": "local",
+            "model_dir": "/models/champion",
+            "architecture": "Qwen3_5ForConditionalGeneration",
+            "model_type": "qwen3_5_text",
+            "mtp_arch": "qwen3-next-mtp",
+            "mtp_supported": "yes",
+            "recommended_backend": "qwen3_next",
+            "runtime_compatibility": "native",
+            "runtime_contract_path": None,
+            "mtp": {"tensors": [{"key": "large"}]},
+            "quantization": {"language_model.model.layers.0": {"bits": 4}},
+            "compatibility": {
+                "tier": "verified",
+                "can_run": True,
+                "supported": True,
+                "exit_code": 0,
+                "message": "Verified MTPLX runtime contract found.",
+                "arch_id": "qwen3-next-mtp",
+                "recommended_profile": "stable",
+                "runtime_contract_path": "/models/champion/mtplx_runtime.json",
+            },
+        }
+    )
+
+    assert summary["model_dir"] == "/models/champion"
+    assert summary["compatibility"]["tier"] == "verified"
+    assert summary["runtime_contract_path"] == "/models/champion/mtplx_runtime.json"
+    assert "mtp" not in summary
+    assert "quantization" not in summary
+
+
 def test_public_bench_run_dry_run(capsys):
     code = main(
         [

@@ -120,6 +120,38 @@ def _model_gate(
     return inspection, exit_code
 
 
+def _compact_model_summary(inspection: dict[str, Any]) -> dict[str, Any]:
+    compatibility = inspection.get("compatibility") or {}
+    return {
+        "source": inspection.get("source"),
+        "model_dir": inspection.get("model_dir"),
+        "architecture": inspection.get("architecture"),
+        "model_type": inspection.get("model_type"),
+        "mtp_arch": inspection.get("mtp_arch"),
+        "mtp_supported": inspection.get("mtp_supported"),
+        "recommended_backend": inspection.get("recommended_backend"),
+        "recommended_profile": (
+            compatibility.get("recommended_profile")
+            or inspection.get("recommended_profile")
+        ),
+        "runtime_compatibility": inspection.get("runtime_compatibility"),
+        "runtime_contract_path": (
+            compatibility.get("runtime_contract_path")
+            or inspection.get("runtime_contract_path")
+        ),
+        "compatibility": {
+            "tier": compatibility.get("tier"),
+            "can_run": compatibility.get("can_run"),
+            "supported": compatibility.get("supported"),
+            "exit_code": compatibility.get("exit_code"),
+            "message": compatibility.get("message"),
+            "arch_id": compatibility.get("arch_id"),
+            "unsafe_force_required": compatibility.get("unsafe_force_required"),
+            "unverified_model": compatibility.get("unverified_model"),
+        },
+    }
+
+
 def _resolve_runtime_model_path(model: str, *, cache_dir: str | None = None) -> tuple[str, dict[str, Any] | None]:
     from mtplx.hf_loader import resolve_model_path
 
@@ -1785,7 +1817,7 @@ def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str
         validations.append(validate_python_syntax(out.text))
     payload = {
         "text": out.text,
-        "model": inspection,
+        "model": _compact_model_summary(inspection),
         "profile": profile.to_dict(),
         "stats": {
             "generated_tokens": out.stats.generated_tokens,
