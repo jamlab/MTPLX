@@ -1,3 +1,6 @@
+import asyncio
+import json
+
 import pytest
 
 from mtplx.server.openai import (
@@ -8,6 +11,7 @@ from mtplx.server.openai import (
     _RateLimiter,
     _anthropic_content_to_text,
     _anthropic_payload_from_openai,
+    _anthropic_stream_from_openai_sse,
     _anthropic_to_chat_request,
     _IncrementalTokenDecoder,
     _ThinkingContentStreamSplitter,
@@ -161,6 +165,62 @@ def test_anthropic_payload_from_openai_response():
     assert payload["content"] == [{"type": "text", "text": "hello"}]
     assert payload["usage"] == {"input_tokens": 12, "output_tokens": 3}
     assert payload["mtplx_stats"] == {"tok_s": 42.0}
+
+
+def test_anthropic_stream_translates_openai_sse_events():
+    async def upstream():
+        yield (
+            'data: {"choices":[{"delta":{"role":"assistant"},'
+            '"finish_reason":null}]}\n\n'
+        )
+        yield (
+            'data: {"choices":[{"delta":{"content":"Hel"},'
+            '"finish_reason":null}]}\n\n'
+        )
+        yield (
+            'data: {"choices":[{"delta":{"content":"lo"},'
+            '"finish_reason":null}]}\n\n'
+        )
+        yield (
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+            '"usage":{"prompt_tokens":5,"completion_tokens":2},'
+            '"mtplx_stats":{"tok_s":12.5}}\n\n'
+        )
+        yield "data: [DONE]\n\n"
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in _anthropic_stream_from_openai_sse(
+                upstream(),
+                model="mtplx",
+            )
+        ]
+
+    chunks = asyncio.run(collect())
+    frames = [frame for frame in "".join(chunks).split("\n\n") if frame]
+    events = []
+    for frame in frames:
+        lines = frame.splitlines()
+        event = lines[0].removeprefix("event: ")
+        data = json.loads(lines[1].removeprefix("data: "))
+        events.append((event, data))
+
+    assert [event for event, _data in events] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert events[0][1]["message"]["model"] == "mtplx"
+    assert events[2][1]["delta"] == {"type": "text_delta", "text": "Hel"}
+    assert events[3][1]["delta"] == {"type": "text_delta", "text": "lo"}
+    assert events[5][1]["delta"]["stop_reason"] == "end_turn"
+    assert events[5][1]["usage"] == {"output_tokens": 2}
+    assert events[5][1]["mtplx_stats"] == {"tok_s": 12.5}
 
 
 class RecordingTokenizer:

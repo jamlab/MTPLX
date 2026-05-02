@@ -603,6 +603,150 @@ def _anthropic_payload_from_openai(openai_payload: dict[str, Any]) -> dict[str, 
     }
 
 
+def _anthropic_sse(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+
+
+async def _iter_sse_data(body_iterator: Any):
+    buffer = ""
+    async for raw_chunk in body_iterator:
+        chunk = raw_chunk.decode("utf-8") if isinstance(raw_chunk, bytes) else str(raw_chunk)
+        buffer += chunk
+        while "\n\n" in buffer:
+            frame, buffer = buffer.split("\n\n", 1)
+            data_lines = [
+                line.removeprefix("data:").strip()
+                for line in frame.splitlines()
+                if line.startswith("data:")
+            ]
+            if data_lines:
+                yield "\n".join(data_lines)
+    if buffer.strip():
+        data_lines = [
+            line.removeprefix("data:").strip()
+            for line in buffer.splitlines()
+            if line.startswith("data:")
+        ]
+        if data_lines:
+            yield "\n".join(data_lines)
+
+
+async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
+    message_id = "msg_" + uuid.uuid4().hex
+    content_started = False
+    stop_reason = "end_turn"
+    usage = {"input_tokens": 0, "output_tokens": 0}
+    mtplx_stats: dict[str, Any] | None = None
+
+    yield _anthropic_sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": usage,
+            },
+        },
+    )
+
+    def start_content_block() -> str:
+        return _anthropic_sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+
+    try:
+        async for data in _iter_sse_data(body_iterator):
+            if data == "[DONE]":
+                break
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError as exc:
+                yield _anthropic_sse(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": f"failed to parse upstream SSE chunk: {exc}",
+                        },
+                    },
+                )
+                return
+            if "error" in payload:
+                error = payload.get("error") or {}
+                yield _anthropic_sse(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": str(error.get("type") or "api_error"),
+                            "message": str(error.get("message") or error),
+                        },
+                    },
+                )
+                return
+            if payload.get("usage"):
+                upstream_usage = payload.get("usage") or {}
+                usage = {
+                    "input_tokens": int(upstream_usage.get("prompt_tokens") or 0),
+                    "output_tokens": int(upstream_usage.get("completion_tokens") or 0),
+                }
+            if payload.get("mtplx_stats") is not None:
+                mtplx_stats = payload.get("mtplx_stats")
+            for choice in payload.get("choices") or []:
+                delta = choice.get("delta") or {}
+                text = ""
+                if delta.get("reasoning_content"):
+                    text += str(delta.get("reasoning_content") or "")
+                if delta.get("content"):
+                    text += str(delta.get("content") or "")
+                if text:
+                    if not content_started:
+                        content_started = True
+                        yield start_content_block()
+                    yield _anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": text},
+                        },
+                    )
+                finish_reason = choice.get("finish_reason")
+                if finish_reason:
+                    stop_reason = "max_tokens" if finish_reason == "length" else "end_turn"
+    finally:
+        if hasattr(body_iterator, "aclose"):
+            try:
+                await body_iterator.aclose()
+            except Exception:
+                pass
+
+    if not content_started:
+        yield start_content_block()
+    yield _anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+    delta_payload: dict[str, Any] = {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": usage["output_tokens"]},
+    }
+    if mtplx_stats is not None:
+        delta_payload["mtplx_stats"] = mtplx_stats
+    yield _anthropic_sse("message_delta", delta_payload)
+    yield _anthropic_sse("message_stop", {"type": "message_stop"})
+
+
 def _strip_stats_footer(text: str) -> str:
     marker_index = text.rfind(STATS_FOOTER_MARKER)
     if marker_index < 0:
@@ -2494,13 +2638,19 @@ def create_app(state: ServerState) -> FastAPI:
     async def anthropic_messages(raw_request: Request, request: AnthropicMessagesRequest) -> Any:
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
-        if request.stream:
-            raise HTTPException(
-                status_code=501,
-                detail="Anthropic streaming is not implemented yet; send stream=false.",
-            )
         chat_request = _anthropic_to_chat_request(request)
+        chat_request.stream = bool(request.stream)
         response = await chat_completions(raw_request, chat_request)
+        if request.stream:
+            if not isinstance(response, StreamingResponse):
+                return response
+            return StreamingResponse(
+                _anthropic_stream_from_openai_sse(
+                    response.body_iterator,
+                    model=request.model or state.model_id,
+                ),
+                media_type="text/event-stream",
+            )
         if not isinstance(response, JSONResponse):
             return response
         try:

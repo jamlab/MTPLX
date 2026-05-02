@@ -26,7 +26,7 @@ Legacy OpenAI completions.
 
 ## `POST /v1/messages`
 
-Anthropic Messages baseline. Non-stream requests are translated into the same internal chat path as `/v1/chat/completions` and returned as Anthropic-shaped message payloads.
+Anthropic Messages baseline. Requests are translated into the same internal chat path as `/v1/chat/completions` and returned as Anthropic-shaped message payloads.
 
 Supported now:
 
@@ -34,10 +34,9 @@ Supported now:
 - `messages[].content` as text or text/tool-result content blocks
 - `max_tokens`, `temperature`, `top_p`, and `top_k`
 - `stream=false`
+- `stream=true` server-sent events with `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`
 
-Not supported yet:
-
-- `stream=true` Anthropic SSE. The server returns 501 until the event stream is implemented.
+Current streaming note: Qwen reasoning deltas are exposed as text deltas until the Anthropic thinking-block mapping is validated against real Claude Code / OpenCode clients.
 
 ## Server Flags
 

@@ -75,7 +75,7 @@ def test_openai_server_auth_and_rate_limit_fake_state():
     assert int(limited.headers["Retry-After"]) > 0
 
 
-def test_anthropic_streaming_reports_explicit_not_implemented():
+def test_anthropic_messages_rejects_empty_request_before_generation():
     client = TestClient(create_app(_fake_state()))
 
     response = client.post(
@@ -84,9 +84,9 @@ def test_anthropic_streaming_reports_explicit_not_implemented():
             "model": "mtplx-test-model",
             "max_tokens": 8,
             "stream": True,
-            "messages": [{"role": "user", "content": "hello"}],
+            "messages": [],
         },
     )
 
-    assert response.status_code == 501
-    assert "Anthropic streaming is not implemented" in response.json()["detail"]
+    assert response.status_code == 400
+    assert response.json()["detail"] == "messages must not be empty"
