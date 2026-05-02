@@ -990,6 +990,90 @@ def _repair_streamed_generation_stats(
     return repaired
 
 
+PUBLIC_MTPLX_STATS_KEYS = (
+    "mode",
+    "generation_mode",
+    "generated_tokens",
+    "prompt_tokens",
+    "completion_tokens",
+    "elapsed_s",
+    "tok_s",
+    "prompt_eval_time_s",
+    "ttft_s",
+    "decode_elapsed_s",
+    "request_elapsed_s",
+    "request_tok_s",
+    "decode_tok_s",
+    "sliding_decode_tok_s_first_32",
+    "sliding_decode_tok_s_first_64",
+    "sliding_decode_tok_s_last_32",
+    "sliding_decode_tok_s_last_64",
+    "accepted_drafts",
+    "rejected_drafts",
+    "drafted_tokens",
+    "verify_calls",
+    "accepted_by_depth",
+    "drafted_by_depth",
+    "mean_accept_probability_by_depth",
+    "correction_tokens",
+    "bonus_tokens",
+    "verify_time_s",
+    "draft_time_s",
+    "accept_time_s",
+    "repair_time_s",
+    "session_cache_hit",
+    "cached_tokens",
+    "new_prefill_tokens",
+    "cache_miss_reason",
+    "session_restore_mode",
+    "session_id",
+    "context_len",
+    "lock_wait_time_s",
+    "request_max_tokens",
+    "server_max_response_tokens",
+    "effective_max_tokens",
+    "remaining_context_tokens",
+    "server_cap_applied",
+    "context_cap_applied",
+    "server_elapsed_s",
+    "server_tok_s",
+    "server_seed",
+    "server_attempts",
+    "server_blank_retries",
+    "server_blank_retry_suppressed",
+    "mtp_depth",
+    "speculative_depth",
+    "peak_memory_bytes",
+    "reasoning_reentries",
+)
+PUBLIC_POSTCOMMIT_KEYS = (
+    "stored",
+    "mode",
+    "reason",
+    "prefix_len",
+    "nbytes",
+    "elapsed_s",
+    "error",
+)
+
+
+def _public_mtplx_stats(generated: dict[str, Any]) -> dict[str, Any]:
+    stats = generated.get("stats") or {}
+    public = {
+        key: stats[key]
+        for key in PUBLIC_MTPLX_STATS_KEYS
+        if key in stats
+    }
+    postcommit = stats.get("session_postcommit_snapshot")
+    if isinstance(postcommit, dict):
+        public["session_postcommit_snapshot"] = {
+            key: postcommit[key]
+            for key in PUBLIC_POSTCOMMIT_KEYS
+            if key in postcommit
+        }
+    return _json_safe(public)
+
+
 def _request_observability(
     request: ChatCompletionRequest,
     *,
@@ -2513,7 +2597,7 @@ def create_app(state: ServerState) -> FastAPI:
                         }
                     ],
                     "usage": _usage_payload(generated),
-                    "mtplx_stats": generated["stats"],
+                    "mtplx_stats": _public_mtplx_stats(generated),
                 }
                 yield f"data: {json.dumps(done)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -2630,7 +2714,7 @@ def create_app(state: ServerState) -> FastAPI:
                     }
                 ],
                 "usage": _usage_payload(generated),
-                "mtplx_stats": generated["stats"],
+                "mtplx_stats": _public_mtplx_stats(generated),
             }
         )
 
@@ -2701,7 +2785,7 @@ def create_app(state: ServerState) -> FastAPI:
                 "model": model,
                 "choices": [{"index": 0, "text": display_text, "finish_reason": "stop"}],
                 "usage": _usage_payload(generated),
-                "mtplx_stats": generated["stats"],
+                "mtplx_stats": _public_mtplx_stats(generated),
             }
         )
 

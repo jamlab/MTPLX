@@ -21,6 +21,7 @@ from mtplx.server.openai import (
     _normalize_thinking_tags,
     _online_hidden_config,
     _policy_fingerprint,
+    _public_mtplx_stats,
     _repair_streamed_generation_stats,
     _request_is_authorized,
     _strip_assistant_history_baggage,
@@ -165,6 +166,42 @@ def test_anthropic_payload_from_openai_response():
     assert payload["content"] == [{"type": "text", "text": "hello"}]
     assert payload["usage"] == {"input_tokens": 12, "output_tokens": 3}
     assert payload["mtplx_stats"] == {"tok_s": 42.0}
+
+
+def test_public_mtplx_stats_excludes_internal_trace_fields():
+    stats = _public_mtplx_stats(
+        {
+            "stats": {
+                "generated_tokens": 4,
+                "decode_tok_s": 18.25,
+                "session_cache_hit": True,
+                "cached_tokens": 128,
+                "session_restore_mode": "reference_lease",
+                "events": [{"step": 0, "drafts": [{"token": 1}]}],
+                "owned_attn_kv": {"bytes": 1024},
+                "graphbank": {"debug": "internal"},
+                "session_postcommit_snapshot": {
+                    "stored": True,
+                    "prefix_len": 64,
+                    "nbytes": 1234,
+                    "token_hash": "internal",
+                },
+            }
+        }
+    )
+
+    assert stats["generated_tokens"] == 4
+    assert stats["decode_tok_s"] == 18.25
+    assert stats["session_cache_hit"] is True
+    assert stats["cached_tokens"] == 128
+    assert "events" not in stats
+    assert "owned_attn_kv" not in stats
+    assert "graphbank" not in stats
+    assert stats["session_postcommit_snapshot"] == {
+        "stored": True,
+        "prefix_len": 64,
+        "nbytes": 1234,
+    }
 
 
 def test_anthropic_stream_translates_openai_sse_events():
