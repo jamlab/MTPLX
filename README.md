@@ -28,11 +28,11 @@ This is **not** DFlash, DDTree, llama-spec, or an external-drafter system. It's 
 Install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/youssofal/MTPLX/main/scripts/install_macos.sh | bash
+brew install --verbose --display-times youssofal/mtplx/mtplx
 mtplx start            # interactive: pick model → mode → web/CLI, then chat
 ```
 
-The Mac installer uses `python3`, installs MTPLX from PyPI into `~/.mtplx/venv`, and creates a durable `mtplx` launcher in `~/.local/bin` plus `/opt/homebrew/bin` when writable. Python users can also run `python3 -m pip install -U mtplx`.
+The Homebrew installer sets up the `mtplx` command in `/opt/homebrew/bin` and bootstraps the Python runtime under `/opt/homebrew/var/mtplx`. Use `--verbose --display-times` if you want visible download progress and install timing. Python users can also run `python3 -m pip install --pre mtplx`.
 
 That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`), runtime mode, and surface (browser chat at `127.0.0.1:8000/` or terminal chat) on first run. On every subsequent run it asks "same as last time?" so you're one keypress from chatting.
 
@@ -66,7 +66,7 @@ That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MT
 
 ```bash
 # 1. Install on macOS
-curl -fsSL https://raw.githubusercontent.com/youssofal/MTPLX/main/scripts/install_macos.sh | bash
+brew install --verbose --display-times youssofal/mtplx/mtplx
 
 # 2. Verify the install
 mtplx help
@@ -95,13 +95,13 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"mtplx","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-The installer writes a durable launcher so `mtplx` works from a normal new Terminal tab. For Python-only installs, PyPI is also available:
+Homebrew writes a durable launcher so `mtplx` works from a normal new Terminal tab. The older script installer remains available if you prefer a user-local venv:
 
 ```bash
-python3 -m pip install -U mtplx
+curl -fsSL https://raw.githubusercontent.com/youssofal/MTPLX/main/scripts/install_macos.sh | bash
 ```
 
-Preview 1 is packaged as `0.1.0rc1`. Plain `pip install mtplx` works from a clean PyPI install; if your pip is configured to reject prereleases, use:
+For Python-only installs, PyPI is also available. Preview 1 is packaged as `0.1.0rc1`, so use:
 
 ```bash
 python3 -m pip install --pre mtplx
