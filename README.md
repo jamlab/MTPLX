@@ -16,6 +16,7 @@
 <sub>Multiplier is hardware-independent. Absolute tok/s scales with memory bandwidth — current public record on M5 Max: **63.056 / 62.886 tok/s** D3, [`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`](https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed).</sub>
 
 [![CI](https://github.com/youssofal/mtplx/actions/workflows/ci.yml/badge.svg)](https://github.com/youssofal/mtplx/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/mtplx?label=PyPI)](https://pypi.org/project/mtplx/)
 [![Python](https://img.shields.io/badge/python-3.11%E2%80%933.13-blue)](https://www.python.org/)
 [![macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-black?logo=apple)](https://developer.apple.com/metal/)
 [![Status](https://img.shields.io/badge/status-v0.1.0--preview.1-orange)](CHANGELOG.md)
@@ -29,10 +30,14 @@ MTPLX runs **the model's own built-in MTP heads** as a speculative drafter, with
 
 This is **not** DFlash, DDTree, llama-spec, or an external-drafter system. It's a native-MTP runtime built around MLX, Apple Silicon, and a real OpenAI/Anthropic-compatible serving surface.
 
+Install:
+
 ```bash
-python3 -m pip install -U mtplx
+pip install mtplx
 mtplx start            # interactive: pick model → mode → web/CLI, then chat
 ```
+
+If `pip` points at the wrong Python, use `python3 -m pip install -U mtplx`.
 
 That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`), runtime mode, and surface (browser chat at `127.0.0.1:8000/` or terminal chat) on first run. On every subsequent run it asks "same as last time?" so you're one keypress from chatting.
 
@@ -66,7 +71,7 @@ That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MT
 
 ```bash
 # 1. Install from PyPI
-python3 -m pip install -U mtplx
+pip install mtplx
 
 # 2. Verify the install
 mtplx help
@@ -101,6 +106,12 @@ The GitHub release wheel remains available for reproducible Preview 1 installs, 
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -U pip mtplx
+```
+
+Preview 1 is packaged as `0.1.0rc1`. Plain `pip install mtplx` works from a clean PyPI install; if your pip is configured to reject prereleases, use:
+
+```bash
+python3 -m pip install --pre mtplx
 ```
 
 ---
