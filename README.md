@@ -26,6 +26,8 @@
 
 ---
 
+**Permissive open source.** MTPLX is Apache-2.0: you can use it, modify it, and ship it commercially. If you redistribute MTPLX, keep the license and NOTICE attribution; for public projects and research, visible credit or citation is strongly appreciated.
+
 MTPLX runs **the model's own built-in MTP heads** as a speculative drafter, with **exact probability-ratio acceptance + residual correction** — not the greedy-argmax trick most fast-decode tools use at T>0. That means real coding settings (`temperature=0.6`, `top_p=0.95`, `top_k=20`) actually get the speculative speedup *and* keep the target model's distribution.
 
 This is **not** DFlash, DDTree, llama-spec, or an external-drafter system. It's a native-MTP runtime built around MLX, Apple Silicon, and a real OpenAI/Anthropic-compatible serving surface.
@@ -366,7 +368,7 @@ The kernel-ladder direction is grounded in a six-agent deep-research synthesis (
 
 MTPLX builds on [MLX](https://github.com/ml-explore/mlx) and the Qwen3-Next model family. The speculative-sampling math follows Leviathan & Chen 2023 ("Fast Inference from Transformers via Speculative Decoding") and the MTP heads ship with Qwen. Design and diagnostics are informed by vLLM speculative decoding, vLLM-Metal (issues #188 and #281), DFlash-MLX, DDTree-MLX, and DeepSeek V3.2's `mx.depends` precedent. Optional fan control via [ThermalForge](https://github.com/ProducerGuy/ThermalForge). Model weights and licenses remain governed by their upstream model cards.
 
-MTPLX is released under the [Apache License 2.0](LICENSE). If you redistribute MTPLX or derivative works, preserve the Apache license and the attribution notices from [NOTICE](NOTICE) as required by Apache-2.0.
+MTPLX is released under the [Apache License 2.0](LICENSE): you can use it, modify it, and ship it commercially. If you redistribute MTPLX or derivative works, preserve the Apache license and the attribution notices from [NOTICE](NOTICE) as required by Apache-2.0.
 
 If MTPLX powers a public project, product, benchmark, article, or research result, please include clear credit in your README, docs, paper, or public writeup:
 
