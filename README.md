@@ -35,11 +35,11 @@ This is **not** DFlash, DDTree, llama-spec, or an external-drafter system. It's 
 Install:
 
 ```bash
-pip install mtplx
+curl -fsSL https://raw.githubusercontent.com/youssofal/MTPLX/main/scripts/install_macos.sh | bash
 mtplx start            # interactive: pick model → mode → web/CLI, then chat
 ```
 
-If `pip` points at the wrong Python, use `python3 -m pip install -U mtplx`.
+The Mac installer uses `python3`, installs MTPLX from PyPI into `~/.mtplx/venv`, and creates a durable `mtplx` launcher in `~/.local/bin` plus `/opt/homebrew/bin` when writable. Python users can also run `python3 -m pip install -U mtplx`.
 
 That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`), runtime mode, and surface (browser chat at `127.0.0.1:8000/` or terminal chat) on first run. On every subsequent run it asks "same as last time?" so you're one keypress from chatting.
 
@@ -72,8 +72,8 @@ That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MT
 ## Quick start (full)
 
 ```bash
-# 1. Install from PyPI
-pip install mtplx
+# 1. Install on macOS
+curl -fsSL https://raw.githubusercontent.com/youssofal/MTPLX/main/scripts/install_macos.sh | bash
 
 # 2. Verify the install
 mtplx help
@@ -102,12 +102,10 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"mtplx","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-The GitHub release wheel remains available for reproducible Preview 1 installs, but PyPI is the primary public path. If your Python blocks global installs, create and activate a virtual environment first:
+The installer writes a durable launcher so `mtplx` works from a normal new Terminal tab. For Python-only installs, PyPI is also available:
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -U pip mtplx
+python3 -m pip install -U mtplx
 ```
 
 Preview 1 is packaged as `0.1.0rc1`. Plain `pip install mtplx` works from a clean PyPI install; if your pip is configured to reject prereleases, use:
