@@ -2401,8 +2401,9 @@ def _chat_ui_html(
       display: grid; grid-template-rows: 1fr auto;
       position: relative; overflow: hidden;
     }
-    #messages { overflow-y: auto; scroll-behavior: smooth; padding: 24px 24px 8px; }
+    #messages { overflow-y: auto; scroll-behavior: auto; padding: 24px 24px 8px; }
     .messages-inner { max-width: 760px; margin: 0 auto; }
+    #messages-bottom { height: 1px; }
 
     /* Turns — borderless, ChatGPT/Open-WebUI style */
     .turn { padding: 14px 0; }
@@ -2695,6 +2696,7 @@ def _chat_ui_html(
           </div>
         </div>
       </div>
+      <div id="messages-bottom" aria-hidden="true"></div>
     </section>
     <button id="jump-pill" class="jump-pill" type="button" aria-label="Jump to latest">Jump to latest ↓</button>
     <div class="composer-wrap">
@@ -2721,6 +2723,7 @@ def _chat_ui_html(
     const MODEL_ID = __MODEL_JSON__;
     const messagesEl = document.getElementById("messages");
     const messagesInner = messagesEl.querySelector(".messages-inner");
+    const messagesBottom = document.getElementById("messages-bottom");
     const form = document.getElementById("chat-form");
     const promptEl = document.getElementById("prompt");
     const sendBtn = document.getElementById("send");
@@ -2734,6 +2737,7 @@ def _chat_ui_html(
     const history = [];
     let activeAbort = null;
     let pinnedToBottom = true;
+    let scrollFrame = null;
 
     const SVG_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>';
     const SVG_STOP = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
@@ -2937,24 +2941,47 @@ def _chat_ui_html(
     }
 
     // ---------- scroll handling ----------------------------------------------
-    const SCROLL_PIN_THRESHOLD = 24;
+    const SCROLL_PIN_THRESHOLD = 96;
     function isPinned() {
       const remaining = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
       return remaining <= SCROLL_PIN_THRESHOLD;
     }
+    function updateJumpPill() {
+      jumpPill.classList.toggle("show", !pinnedToBottom);
+    }
     messagesEl.addEventListener("scroll", () => {
       pinnedToBottom = isPinned();
-      jumpPill.classList.toggle("show", !pinnedToBottom);
+      updateJumpPill();
     });
     jumpPill.addEventListener("click", () => {
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      scrollToBottom({force: true, behavior: "smooth"});
       pinnedToBottom = true;
-      jumpPill.classList.remove("show");
+      updateJumpPill();
     });
-    function maybeScrollToBottom() {
-      if (pinnedToBottom) {
-        messagesEl.scrollTop = messagesEl.scrollHeight;
+    function scrollToBottom(opts) {
+      const options = opts || {};
+      if (!options.force && !pinnedToBottom) return;
+      messagesEl.scrollTo({top: messagesEl.scrollHeight, behavior: options.behavior || "auto"});
+      if (messagesBottom && messagesBottom.scrollIntoView) {
+        messagesBottom.scrollIntoView({block: "end", behavior: options.behavior || "auto"});
       }
+      pinnedToBottom = true;
+      updateJumpPill();
+    }
+    function maybeScrollToBottom() {
+      if (!pinnedToBottom || scrollFrame !== null) return;
+      scrollFrame = requestAnimationFrame(() => {
+        scrollFrame = null;
+        scrollToBottom({behavior: "auto"});
+        // Some streamed updates change height after layout settles (markdown,
+        // code blocks, stats, and reasoning collapse). One extra frame keeps
+        // the viewport glued to the true bottom without fighting manual scroll.
+        requestAnimationFrame(() => scrollToBottom({behavior: "auto"}));
+      });
+    }
+    if (window.ResizeObserver) {
+      const scrollObserver = new ResizeObserver(() => maybeScrollToBottom());
+      scrollObserver.observe(messagesInner);
     }
 
     // ---------- DOM helpers ---------------------------------------------------
@@ -3106,10 +3133,10 @@ def _chat_ui_html(
       const greeting = messagesInner.querySelector(".turn-greeting");
       if (greeting) greeting.remove();
 
+      pinnedToBottom = true;
       appendUser(text);
       history.push({role: "user", content: text});
       const turn = appendAssistantTurn();
-      pinnedToBottom = true;
       maybeScrollToBottom();
       setSendButton("stop");
       promptEl.disabled = false;
@@ -3309,11 +3336,12 @@ def _chat_ui_html(
       history.length = 0;
       messagesInner.innerHTML = '<div class="turn turn-assistant turn-greeting"><div class="avatar">M</div><div class="turn-body"><div class="answer"><p>New conversation. Settings on the left are unchanged.</p></div></div></div>';
       pinnedToBottom = true;
-      jumpPill.classList.remove("show");
+      updateJumpPill();
       setStatus("Ready", "ready");
       renderLiveStats({tokens: 0, elapsed: 0});
       promptEl.focus();
       autoResizePrompt();
+      maybeScrollToBottom();
     });
 
     setSendButton("send");

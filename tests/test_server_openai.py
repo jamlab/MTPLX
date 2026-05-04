@@ -78,6 +78,10 @@ def test_openai_server_health_metrics_and_models_fake_state():
     assert "reasoning-block" in root.text
     # Auto-scroll, stop, new-chat, persistence
     assert 'id="jump-pill"' in root.text
+    assert 'id="messages-bottom"' in root.text
+    assert "ResizeObserver" in root.text
+    assert "scrollIntoView" in root.text
+    assert "SCROLL_PIN_THRESHOLD = 96" in root.text
     assert 'id="new-chat-btn"' in root.text
     assert "AbortController" in root.text
     # SETTINGS_KEY bumped to v3 when context-window auto-detect landed; bumping
