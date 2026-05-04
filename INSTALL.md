@@ -11,27 +11,24 @@ MTPLX is preview software for Apple Silicon Macs.
 
 ## Install
 
-Public install, after PyPI publication:
+Public install:
+
+```bash
+python3 -m pip install -U mtplx
+mtplx help
+```
+
+If your Python blocks global installs, use a virtual environment:
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -U pip
-python -m pip install mtplx
+python -m pip install -U pip mtplx
+mtplx help
 ```
 
-Private preview install, while the GitHub repository is private:
-
-```bash
-gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl' --pattern 'install_preview_global.sh'
-bash install_preview_global.sh ./mtplx-0.1.0rc1-py3-none-any.whl
-```
-
-The preview installer writes a durable launcher at `~/.local/bin/mtplx`, adds
-`~/.local/bin` to zsh startup files when needed, and writes
-`/opt/homebrew/bin/mtplx` on Apple Silicon Homebrew installs when that directory
-is writable. That means `mtplx help` works from a normal new Terminal tab
-without activating a project venv.
+The GitHub release wheel remains available for reproducible Preview 1 installs,
+but PyPI is the primary public path.
 
 For local development:
 

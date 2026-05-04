@@ -30,11 +30,7 @@ MTPLX runs **the model's own built-in MTP heads** as a speculative drafter, with
 This is **not** DFlash, DDTree, llama-spec, or an external-drafter system. It's a native-MTP runtime built around MLX, Apple Silicon, and a real OpenAI/Anthropic-compatible serving surface.
 
 ```bash
-gh release download v0.1.0-preview.1 --repo youssofal/mtplx \
-  --pattern 'mtplx-0.1.0rc1-py3-none-any.whl' \
-  --pattern 'install_preview_global.sh'
-bash install_preview_global.sh ./mtplx-0.1.0rc1-py3-none-any.whl
-
+python3 -m pip install -U mtplx
 mtplx start            # interactive: pick model → mode → web/CLI, then chat
 ```
 
@@ -69,11 +65,8 @@ That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MT
 ## Quick start (full)
 
 ```bash
-# 1. Install (preview wheel from GitHub release)
-gh release download v0.1.0-preview.1 --repo youssofal/mtplx \
-  --pattern 'mtplx-0.1.0rc1-py3-none-any.whl' \
-  --pattern 'install_preview_global.sh'
-bash install_preview_global.sh ./mtplx-0.1.0rc1-py3-none-any.whl
+# 1. Install from PyPI
+python3 -m pip install -U mtplx
 
 # 2. Verify the install
 mtplx help
@@ -102,7 +95,13 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"mtplx","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-Public `pip install mtplx` is the Stage C target after PyPI Trusted Publishing is configured. The preview installer writes a durable launcher at `~/.local/bin/mtplx` (and `/opt/homebrew/bin/mtplx` when writable), so `mtplx` works from any new terminal without activating a venv.
+The GitHub release wheel remains available for reproducible Preview 1 installs, but PyPI is the primary public path. If your Python blocks global installs, create and activate a virtual environment first:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -U pip mtplx
+```
 
 ---
 
@@ -336,7 +335,7 @@ The CLI (`mtplx start` / `pull` / `doctor` / `inspect` / `max`) is the on-ramp t
 
 **v0.2 — sustained throughput.** Diagnostic-gated kernel ladder targeting `last64/first64 ≥ 0.90` no-fan on 10k generations while preserving the **~2.24× multiplier** lane. Mechanism-driven: lazy-graph severance + output narrowing if graph history is the bottleneck; MLX-primitive-registered cache-update + `mx.compile` if dispatch tax dominates; an owned GDN+MLP verify-cycle kernel via `mx.fast.metal_kernel` only if the cheaper paths don't close the gap.
 
-**v0.3 — broader fleet.** DeepSeek V3 / V3.2 MTP backend (registered, runtime pending), GLM-4 MoE backend, MiMo backend, generic MTP backend behind `mtplx_runtime.json`. PyPI public release. Optional Homebrew tap. Multi-session server concurrency.
+**v0.3 — broader fleet.** DeepSeek V3 / V3.2 MTP backend (registered, runtime pending), GLM-4 MoE backend, MiMo backend, generic MTP backend behind `mtplx_runtime.json`. Optional Homebrew tap. Multi-session server concurrency.
 
 The kernel-ladder direction is grounded in a six-agent deep-research synthesis (Compass / GPT Pro / Gemini ×2 / Claude ×2 / final validation pass) plus a closed-branch failure ledger that's already 35+ entries deep. We don't ship benchmark theater.
 
