@@ -2535,26 +2535,6 @@ def _chat_ui_html(
     .stats .stat-tps { color: var(--ok); font-weight: 600; }
     .stats .stat-ttft { color: var(--muted); }
 
-    /* Jump-to-latest pill */
-    .jump-pill {
-      position: absolute;
-      bottom: 96px; left: 50%;
-      transform: translate(-50%, 8px);
-      background: var(--surface-2);
-      color: var(--text);
-      padding: 7px 13px;
-      border: 1px solid var(--line-strong);
-      border-radius: 999px;
-      cursor: pointer; font: inherit;
-      font-size: 12px; font-weight: 500;
-      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
-      opacity: 0; pointer-events: none;
-      transition: opacity 0.15s, transform 0.15s;
-      z-index: 10;
-    }
-    .jump-pill.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
-    .jump-pill:hover { background: var(--surface); }
-
     /* Composer */
     .composer-wrap {
       padding: 12px 24px 18px;
@@ -2698,7 +2678,6 @@ def _chat_ui_html(
       </div>
       <div id="messages-bottom" aria-hidden="true"></div>
     </section>
-    <button id="jump-pill" class="jump-pill" type="button" aria-label="Jump to latest">Jump to latest ↓</button>
     <div class="composer-wrap">
       <div class="composer">
         <div id="status-row" class="ready" role="status">
@@ -2730,14 +2709,15 @@ def _chat_ui_html(
     const statusRow = document.getElementById("status-row");
     const statusText = document.getElementById("status-text");
     const liveStatsEl = document.getElementById("live-stats");
-    const jumpPill = document.getElementById("jump-pill");
     const newChatBtn = document.getElementById("new-chat-btn");
     const sidebarToggleBtn = document.getElementById("sidebar-toggle");
     const sidebarEl = document.getElementById("sidebar");
     const history = [];
     let activeAbort = null;
     let pinnedToBottom = true;
+    let forceAutoScroll = false;
     let scrollFrame = null;
+    let postLayoutScrollTimer = null;
 
     const SVG_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>';
     const SVG_STOP = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
@@ -2941,46 +2921,49 @@ def _chat_ui_html(
     }
 
     // ---------- scroll handling ----------------------------------------------
-    const SCROLL_PIN_THRESHOLD = 96;
+    const SCROLL_PIN_THRESHOLD = 160;
     function isPinned() {
       const remaining = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
       return remaining <= SCROLL_PIN_THRESHOLD;
     }
-    function updateJumpPill() {
-      jumpPill.classList.toggle("show", !pinnedToBottom);
-    }
     messagesEl.addEventListener("scroll", () => {
+      if (forceAutoScroll) return;
       pinnedToBottom = isPinned();
-      updateJumpPill();
-    });
-    jumpPill.addEventListener("click", () => {
-      scrollToBottom({force: true, behavior: "smooth"});
-      pinnedToBottom = true;
-      updateJumpPill();
     });
     function scrollToBottom(opts) {
       const options = opts || {};
-      if (!options.force && !pinnedToBottom) return;
-      messagesEl.scrollTo({top: messagesEl.scrollHeight, behavior: options.behavior || "auto"});
+      if (!options.force && !forceAutoScroll && !pinnedToBottom) return;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
       if (messagesBottom && messagesBottom.scrollIntoView) {
-        messagesBottom.scrollIntoView({block: "end", behavior: options.behavior || "auto"});
+        messagesBottom.scrollIntoView({block: "end", inline: "nearest", behavior: "auto"});
       }
+      messagesEl.scrollTop = messagesEl.scrollHeight;
       pinnedToBottom = true;
-      updateJumpPill();
     }
-    function maybeScrollToBottom() {
-      if (!pinnedToBottom || scrollFrame !== null) return;
+    function scheduleScrollToBottom(opts) {
+      const options = opts || {};
+      if (!options.force && !forceAutoScroll && !pinnedToBottom) return;
+      if (options.force) pinnedToBottom = true;
+      if (postLayoutScrollTimer) {
+        clearTimeout(postLayoutScrollTimer);
+        postLayoutScrollTimer = null;
+      }
+      if (scrollFrame !== null) return;
       scrollFrame = requestAnimationFrame(() => {
         scrollFrame = null;
-        scrollToBottom({behavior: "auto"});
-        // Some streamed updates change height after layout settles (markdown,
-        // code blocks, stats, and reasoning collapse). One extra frame keeps
-        // the viewport glued to the true bottom without fighting manual scroll.
-        requestAnimationFrame(() => scrollToBottom({behavior: "auto"}));
+        scrollToBottom({force: options.force});
+        // Streamed code blocks and final markdown can grow after the text node
+        // update that triggered this scroll. Recheck on the next frame and
+        // once more after layout settles so coding output keeps following.
+        requestAnimationFrame(() => scrollToBottom({force: options.force}));
+        postLayoutScrollTimer = setTimeout(() => {
+          postLayoutScrollTimer = null;
+          scrollToBottom({force: options.force});
+        }, 40);
       });
     }
     if (window.ResizeObserver) {
-      const scrollObserver = new ResizeObserver(() => maybeScrollToBottom());
+      const scrollObserver = new ResizeObserver(() => scheduleScrollToBottom());
       scrollObserver.observe(messagesInner);
     }
 
@@ -2997,7 +2980,7 @@ def _chat_ui_html(
       body.textContent = text;
       node.appendChild(body);
       messagesInner.appendChild(node);
-      maybeScrollToBottom();
+      scheduleScrollToBottom();
     }
     function appendAssistantTurn() {
       const node = document.createElement("div");
@@ -3036,7 +3019,7 @@ def _chat_ui_html(
       node.appendChild(avatar);
       node.appendChild(body);
       messagesInner.appendChild(node);
-      maybeScrollToBottom();
+      scheduleScrollToBottom();
       return {node, reasoningBlock, reasoningSummary, reasoningBody, answerBody, stats};
     }
     function setReasoningMeta(turn, text) {
@@ -3134,10 +3117,11 @@ def _chat_ui_html(
       if (greeting) greeting.remove();
 
       pinnedToBottom = true;
+      forceAutoScroll = true;
       appendUser(text);
       history.push({role: "user", content: text});
       const turn = appendAssistantTurn();
-      maybeScrollToBottom();
+      scheduleScrollToBottom({force: true});
       setSendButton("stop");
       promptEl.disabled = false;
       setStatus("Thinking", "streaming");
@@ -3253,7 +3237,7 @@ def _chat_ui_html(
                 setReasoningMeta(turn, "click to expand");
               }
             }
-            maybeScrollToBottom();
+            scheduleScrollToBottom({force: true});
           });
         }
         const separated = splitFallbackReasoning(reasoningText, assistantText);
@@ -3301,7 +3285,8 @@ def _chat_ui_html(
         promptEl.disabled = false;
         promptEl.focus();
         autoResizePrompt();
-        maybeScrollToBottom();
+        scheduleScrollToBottom({force: true});
+        forceAutoScroll = false;
       }
     }
 
@@ -3336,12 +3321,12 @@ def _chat_ui_html(
       history.length = 0;
       messagesInner.innerHTML = '<div class="turn turn-assistant turn-greeting"><div class="avatar">M</div><div class="turn-body"><div class="answer"><p>New conversation. Settings on the left are unchanged.</p></div></div></div>';
       pinnedToBottom = true;
-      updateJumpPill();
+      forceAutoScroll = false;
       setStatus("Ready", "ready");
       renderLiveStats({tokens: 0, elapsed: 0});
       promptEl.focus();
       autoResizePrompt();
-      maybeScrollToBottom();
+      scheduleScrollToBottom({force: true});
     });
 
     setSendButton("send");
