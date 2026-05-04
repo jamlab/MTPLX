@@ -35,6 +35,7 @@ from mtplx.kpi import (
     EXIT_EXACTNESS,
     EXIT_QUALITY,
     EXIT_STRICT_GATE,
+    EXIT_TELEMETRY,
     EXIT_UNSUPPORTED_MODEL,
     build_benchmark_envelope,
     default_output_path,
@@ -62,7 +63,7 @@ from mtplx.profiles import (
 )
 
 
-DEFAULT_CHAMPION = DEFAULT_HF_MODEL_ID
+DEFAULT_CHAMPION = "models/Qwen3.6-27B-MTPLX-Flat4-CyanKiwiMTP"
 QUICKSTART_SPEED_MIN_TOKENS = 64
 QUICKSTART_SPEED_MAX_TOKENS = 192
 QUICKSTART_SPEED_PROMPT = (
@@ -92,6 +93,7 @@ EXTERNAL_RUNTIME_ENV_KEYS = (
     "MTPLX_EXPORT_VERIFY_DOT_INCLUDE_CAPTURES",
 )
 LOCALHOST_BINDS = {"", "127.0.0.1", "::1", "localhost"}
+MAX_PUBLIC_SPECULATIVE_DEPTH = 3
 
 
 def _print(value: Any) -> None:
@@ -159,6 +161,13 @@ def _model_gate(
     tier = compatibility.get("tier")
     exit_code = int(compatibility.get("exit_code", EXIT_UNSUPPORTED_MODEL))
     if exit_code == 0 and compatibility.get("can_run"):
+        if compatibility.get("unverified_model"):
+            print(
+                "WARNING: running a family-compatible MTPLX model without a "
+                "recorded mtplx_runtime.json exactness baseline; stats will be "
+                "marked unverified until this artifact is smoke-verified.",
+                file=sys.stderr,
+            )
         return inspection, None
     if (
         unsafe_force_unverified
@@ -278,6 +287,59 @@ def _print_model_gate_error(
         printer(line)
 
 
+def _print_command_error(
+    payload: dict[str, Any],
+    *,
+    command: str,
+    json_output: bool = False,
+) -> None:
+    if json_output:
+        _print(payload)
+        return
+    model = payload.get("model")
+    if isinstance(model, dict):
+        _print_model_gate_error(model, json_output=False)
+        return
+    error = str(payload.get("error") or "model is not available locally")
+    print(f"error: {error}")
+    if model:
+        print(f"model: {model}")
+    detail = payload.get("detail")
+    if detail:
+        print(f"detail: {detail}")
+    if error == "model is not available locally":
+        print(f"try: mtplx {command} --download --model {model}")
+        print("try: mtplx models")
+
+
+def _validate_public_depth(args: Any, *, printer=print) -> int | None:
+    try:
+        depth = int(getattr(args, "depth", 3))
+    except (TypeError, ValueError):
+        printer("error: --depth must be an integer")
+        return 2
+    if depth < 1 or depth > MAX_PUBLIC_SPECULATIVE_DEPTH:
+        printer(
+            "error: --depth must be between "
+            f"1 and {MAX_PUBLIC_SPECULATIVE_DEPTH} for the current MTPLX runtime"
+        )
+        printer("hint: the shipped speed path is tuned for depth 3")
+        return 2
+    args.depth = depth
+    return None
+
+
+def _format_bytes(size_bytes: int | float | None) -> str:
+    if not isinstance(size_bytes, (int, float)):
+        return "unknown size"
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(size) < 1000.0 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1000.0
+    return f"{size:.1f} TB"
+
+
 def _profile_draft_lm_head_spec(profile: Any) -> dict[str, Any] | None:
     draft = getattr(profile, "draft_lm_head", None)
     if draft is None:
@@ -305,7 +367,6 @@ def _model_draft_lm_head_spec(
     profile: Any,
 ) -> dict[str, Any] | None:
     """Use model contract draft-head metadata when present, else profile default."""
-
     fallback = _profile_draft_lm_head_spec(profile)
     try:
         from mtplx.draft_lm_head import draft_lm_head_spec_from_runtime_contract
@@ -322,7 +383,6 @@ def _model_draft_sampler_spec(
     profile: Any,
 ) -> dict[str, Any] | None:
     """Use model contract draft-sampler metadata when present, else profile default."""
-
     fallback = _profile_draft_sampler_spec(profile)
     try:
         from mtplx.draft_sampling import draft_sampler_spec_from_runtime_contract
@@ -332,6 +392,18 @@ def _model_draft_sampler_spec(
         return draft_sampler_spec_from_runtime_contract(contract, fallback=fallback)
     except ImportError:
         return fallback
+
+
+def _draft_sampler_from_spec(spec: dict[str, Any] | None) -> Any | None:
+    if spec is None:
+        return None
+    from mtplx.sampling import SamplerConfig
+
+    return SamplerConfig(
+        temperature=float(spec["temperature"]),
+        top_p=float(spec["top_p"]),
+        top_k=int(spec["top_k"]),
+    )
 
 
 def _resolve_model_context_window(tokenizer: Any, model_path: str | Path) -> int:
@@ -433,7 +505,7 @@ def _deep_doctor_report(args: Any, base: dict[str, Any]) -> dict[str, Any]:
     from mtplx.config import load_user_config
 
     config = load_user_config()
-    default_model = config.model or DEFAULT_HF_MODEL_ID
+    default_model = config.model or DEFAULT_CHAMPION
     model_report: dict[str, Any]
     try:
         model_report = _compact_model_summary(inspect_model(default_model).to_dict())
@@ -443,9 +515,6 @@ def _deep_doctor_report(args: Any, base: dict[str, Any]) -> dict[str, Any]:
             "ok": False,
             "error": str(exc),
         }
-    release_repo = repo_root()
-    staging_dir = Path("hf-staging/Qwen3.6-27B-MTPLX-Optimized-Speed")
-    manifest = staging_dir / "MTPLX_PUBLISH_MANIFEST.json"
     server_deps = {
         name: importlib.util.find_spec(name) is not None
         for name in ("fastapi", "uvicorn")
@@ -466,38 +535,15 @@ def _deep_doctor_report(args: Any, base: dict[str, Any]) -> dict[str, Any]:
         "default_model": model_report,
         "server_dependencies": server_deps,
         "launchers": launchers,
-        "release_repo": {
-            "path": str(release_repo),
-            "exists": release_repo.exists(),
-            "git_head": _git_value(["rev-parse", "--short", "HEAD"], cwd=release_repo)
-            if release_repo.exists()
-            else None,
-            "git_status": _git_value(["status", "--short"], cwd=release_repo)
-            if release_repo.exists()
-            else None,
-        },
-        "hf_staging": {
-            "path": str(staging_dir),
-            "exists": staging_dir.exists(),
-            "manifest": str(manifest),
-            "manifest_exists": manifest.exists(),
-            "symlink_count": len(list(staging_dir.iterdir())) if staging_dir.exists() else None,
-        },
         "integrations": {
             "openwebui": "mtplx integrate openwebui --port 8000",
             "claude_code": "mtplx integrate claude-code --port 8000",
         },
         "product_policy": {
             "fanmax_counts_for_product_gate": False,
-            "default_hf_model_id": DEFAULT_HF_MODEL_ID,
-            "default_profile": DEFAULT_PROFILE_NAME,
             "safe_mode_drops_per_cycle_events": os.environ.get("MTPLX_DROP_EVENTS") == "1",
         },
     }
-    if staging_dir.exists():
-        base["deep"]["hf_staging"]["symlink_count"] = sum(
-            1 for item in staging_dir.iterdir() if item.is_symlink()
-        )
     return base
 
 
@@ -524,17 +570,10 @@ def _resolve_runtime_model_path(model: str, *, cache_dir: str | None = None) -> 
     try:
         return str(resolve_model_path(model, cache_dir=cache_dir)), None
     except Exception as exc:
-        from mtplx.hf_loader import repo_id_from_model_ref
-
-        repo_id = repo_id_from_model_ref(model)
-        command = f"mtplx pull {repo_id}" if repo_id else None
         return model, {
             "error": "model is not available locally",
             "model": model,
             "detail": str(exc),
-            "exit_code": 6,
-            "fix": "Download the model or choose an existing local model folder.",
-            "command": command,
         }
 
 
@@ -560,10 +599,17 @@ def _depth_sweep_native60(
     max_tokens: int,
     limit: int | None,
     seed: int,
+    draft_lm_head: dict[str, Any] | None = None,
+    draft_sampler: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from mtplx.benchmarks.runners.mtp_depth_sweep import run_mtp_depth_sweep
 
     apply_profile_env("performance-cold")
+    draft_lm_head = draft_lm_head or {
+        "bits": 4,
+        "group_size": 64,
+        "mode": "affine",
+    }
     return run_mtp_depth_sweep(
         model,
         prompt_suite,
@@ -582,9 +628,14 @@ def _depth_sweep_native60(
         min_speculative_depth=1,
         verify_strategy="capture_commit",
         verify_core="linear-gdn-from-conv-tape",
-        draft_lm_head_bits=4,
-        draft_lm_head_group_size=64,
-        draft_lm_head_mode="affine",
+        draft_lm_head_bits=int(draft_lm_head["bits"]),
+        draft_lm_head_group_size=int(draft_lm_head["group_size"]),
+        draft_lm_head_mode=str(draft_lm_head["mode"]),
+        draft_temperature=(
+            None if draft_sampler is None else float(draft_sampler["temperature"])
+        ),
+        draft_top_p=None if draft_sampler is None else float(draft_sampler["top_p"]),
+        draft_top_k=None if draft_sampler is None else int(draft_sampler["top_k"]),
     )
 
 
@@ -620,6 +671,7 @@ def cmd_doctor(args: Any) -> int:
         name: importlib.util.find_spec(name) is not None
         for name in ("fastapi", "uvicorn")
     }
+
     report = {
         "environment": env,
         "huggingface": hf_cache_report(cache_dir=getattr(args, "model_cache", None)),
@@ -667,7 +719,27 @@ def cmd_doctor(args: Any) -> int:
             print(f"bundle: {report['bundle']['bundle_dir']}")
             print(f"zip: {report['bundle']['bundle_zip']}")
     else:
-        _print(report)
+        env_info = report.get("environment") or {}
+        hf = report.get("huggingface") or {}
+        thermal = report.get("thermal_control") or {}
+        selected = thermal.get("selected") or {}
+        tools = report.get("tools") or {}
+        print("MTPLX status")
+        print(f"python: {tools.get('python') or sys.executable}")
+        print(f"platform: {env_info.get('platform') or env_info.get('system') or 'unknown'}")
+        print(f"project: {env_info.get('project_root') or os.getcwd()}")
+        print(f"model cache: {hf.get('cache_dir') or 'default'}")
+        print(f"cached models: {hf.get('cached_models', 'unknown')}")
+        print(
+            "thermal: "
+            f"{'available' if thermal.get('available') else 'not configured'}"
+            f" ({selected.get('kind') or 'none'})"
+        )
+        if getattr(args, "deep", False):
+            launchers = report.get("launchers") or {}
+            config = report.get("config") or {}
+            print(f"launcher: {launchers.get('global_launcher') or launchers.get('global') or 'unknown'}")
+            print(f"config: {config.get('path') or 'default'}")
     return 0
 
 
@@ -754,10 +826,25 @@ def cmd_pull_public(args: Any) -> int:
 
     try:
         result = pull_model(args.model, cache_dir=args.cache_dir, revision=args.revision)
+    except KeyboardInterrupt:
+        print("download cancelled")
+        return 130
     except Exception as exc:
-        _print({"error": "pull failed", "model": args.model, "detail": str(exc)})
+        if getattr(args, "json", False):
+            _print({"error": "pull failed", "model": args.model, "detail": str(exc)})
+        else:
+            print("error: pull failed")
+            print(f"model: {args.model}")
+            print(f"detail: {exc}")
         return 1
-    _print(result)
+    if getattr(args, "json", False):
+        _print(result)
+    else:
+        print("MTPLX pull")
+        print(f"model: {result.get('repo_id')}")
+        print(f"path: {result.get('path')}")
+        print(f"size: {_format_bytes(result.get('size_bytes'))}")
+        print(f"runtime contract: {str(bool(result.get('has_runtime_contract'))).lower()}")
     return 0
 
 
@@ -765,7 +852,21 @@ def cmd_list_public(args: Any) -> int:
     from mtplx.hf_loader import list_cached_models, model_cache_dir
 
     models = [row.to_dict() for row in list_cached_models(cache_dir=args.cache_dir)]
-    _print({"cache_dir": str(model_cache_dir(args.cache_dir)), "models": models})
+    payload = {"cache_dir": str(model_cache_dir(args.cache_dir)), "models": models}
+    if getattr(args, "json", False):
+        _print(payload)
+    else:
+        print("MTPLX models")
+        print(f"cache: {payload['cache_dir']}")
+        if not models:
+            print("no cached models")
+        for row in models:
+            print(
+                f"- {row.get('repo_id')}  "
+                f"{_format_bytes(row.get('size_bytes'))}  "
+                f"contract={str(bool(row.get('has_runtime_contract'))).lower()}"
+            )
+            print(f"  {row.get('path')}")
     return 0
 
 
@@ -773,7 +874,16 @@ def cmd_remove_public(args: Any) -> int:
     from mtplx.hf_loader import remove_cached_model
 
     result = remove_cached_model(args.model, cache_dir=args.cache_dir)
-    _print(result)
+    if getattr(args, "json", False):
+        _print(result)
+    else:
+        print("MTPLX remove")
+        print(f"model: {result.get('repo_id')}")
+        print(f"path: {result.get('path')}")
+        if result.get("removed"):
+            print(f"removed: {_format_bytes(result.get('size_bytes_removed'))}")
+        else:
+            print("removed: false")
     return 0 if result["removed"] or args.missing_ok else 1
 
 
@@ -790,7 +900,7 @@ def _cmd_bench_run(args: Any) -> int:
     exact_paged_env = _exact_paged_env_from_args(args)
     runtime_profile = selected_profile.runtime_profile
     runtime_env = selected_profile.env_dict()
-    if selected_profile.name in {"stable", "exact", "max-diagnostic"}:
+    if selected_profile.name in {"safe", "exact", "max-diagnostic"}:
         runtime_env.update(exact_paged_env)
     runtime_env = _runtime_env_with_external_overrides(runtime_env)
     harness = getattr(args, "harness", "auto")
@@ -838,7 +948,7 @@ def _cmd_bench_run(args: Any) -> int:
     )
     if resolve_error is not None:
         _print(resolve_error)
-        return int(resolve_error.get("exit_code", 1))
+        return 1
     inspection, gate_exit = _model_gate(
         runtime_model,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
@@ -847,6 +957,8 @@ def _cmd_bench_run(args: Any) -> int:
     if gate_exit is not None:
         _print({"error": "model failed MTP primary gate", "model": inspection})
         return gate_exit
+    draft_lm_head = _model_draft_lm_head_spec(inspection, selected_profile)
+    draft_sampler = _model_draft_sampler_spec(inspection, selected_profile)
 
     from mtplx.benchmarks.runners.preflight import run_preflight
 
@@ -896,6 +1008,8 @@ def _cmd_bench_run(args: Any) -> int:
             max_tokens=args.max_tokens,
             limit=args.limit,
             seed=benchmark_seed,
+            draft_lm_head=draft_lm_head,
+            draft_sampler=draft_sampler,
         )
     output.parent.mkdir(parents=True, exist_ok=True)
     write_depth_sweep(output, result)
@@ -2191,8 +2305,33 @@ def _cmd_qa_exactness(args: Any) -> int:
     if args.prompt_suite:
         cmd.extend(["--prompt-suite", args.prompt_suite])
     proc = _run_exactness_command(cmd)
-    print(proc.stdout, end="")
-    return 0 if proc.returncode == 0 else EXIT_EXACTNESS
+    if proc.returncode == 0:
+        print(proc.stdout, end="")
+        return 0
+    output_text = proc.stdout or ""
+    print("error: exactness check failed")
+    if "float_to_fp8_e4m3" in output_text:
+        print(
+            "detail: the selected paged-attention exactness path failed to "
+            "compile in the Metal backend on this machine."
+        )
+    else:
+        candidate_lines = [
+            line.strip()
+            for line in output_text.splitlines()
+            if any(
+                marker in line.lower()
+                for marker in ("runtimeerror:", "error:", "failed", "undeclared identifier")
+            )
+        ]
+        for line in reversed(candidate_lines or output_text.splitlines()):
+            stripped = line.strip()
+            if stripped:
+                print(f"detail: {stripped[:240]}")
+                break
+    print(f"output: {output}")
+    print("try: mtplx qa exactness --exactness-attention-impl mlx_vector_paged")
+    return EXIT_EXACTNESS
 
 
 def _cmd_qa_distribution(args: Any) -> int:
@@ -2557,7 +2696,10 @@ def cmd_max_public(args: Any) -> int:
                 print(f"ok: {str(bool(payload.get('ok'))).lower()}")
             if payload.get("message"):
                 print(payload["message"])
-            elif (payload.get("detection") or {}).get("instructions"):
+            elif (
+                not bool((payload.get("detection") or {}).get("available"))
+                and (payload.get("detection") or {}).get("instructions")
+            ):
                 print((payload.get("detection") or {})["instructions"])
     return code
 
@@ -2565,10 +2707,6 @@ def cmd_max_public(args: Any) -> int:
 def _server_url(host: str, port: int) -> str:
     display_host = "127.0.0.1" if str(host).strip() in {"", "0.0.0.0", "::"} else str(host)
     return f"http://{display_host}:{int(port)}"
-
-
-def _api_base_url(host: str, port: int) -> str:
-    return _server_url(host, port).rstrip("/") + "/v1"
 
 
 def _chat_url(host: str, port: int) -> str:
@@ -2695,7 +2833,7 @@ def _print_serve_start_line(text: str = "") -> None:
 
 
 _PROFILE_SHORT_SUMMARIES = {
-    "stable": "Stable: exact/staged long-reply path, no fan control",
+    "safe": "Stable: exact/staged long-reply path, no fan control",
     "performance-cold": "Medium: native-MTP speed path, ~2.2x burst (not sustained)",
     "exact": "QA-only exact paged verifier",
     "max-diagnostic": "Max: Medium path with fan control",
@@ -2757,13 +2895,21 @@ def _server_command_name(args: Any) -> str:
 def cmd_serve_public(args: Any) -> int:
     api_key = getattr(args, "api_key", None)
     if not _is_localhost_bind(getattr(args, "host", None)) and not api_key:
-        _print(
-            {
-                "error": "--api-key is required when --host is not localhost",
-                "host": getattr(args, "host", None),
-            }
-        )
+        payload = {
+            "error": "--api-key is required when --host is not localhost",
+            "host": getattr(args, "host", None),
+        }
+        if getattr(args, "json", False):
+            _print(payload)
+        else:
+            print("error: --api-key is required when --host is not localhost")
+            print(f"host: {getattr(args, 'host', None)}")
+            print("try: mtplx quickstart --host 127.0.0.1")
+            print("try: mtplx quickstart --host 0.0.0.0 --api-key $MTPLX_AUTH")
         return 2
+    depth_error = _validate_public_depth(args, printer=_print_serve_start_line)
+    if depth_error is not None:
+        return depth_error
     _print_serve_start_banner(args)
     if _port_is_busy(str(getattr(args, "host", "127.0.0.1")), int(getattr(args, "port", 8000))):
         if bool(getattr(args, "quickstart_openwebui", False)):
@@ -2774,7 +2920,7 @@ def cmd_serve_public(args: Any) -> int:
                 chat_url = _chat_url(str(getattr(args, "host", "127.0.0.1")), int(getattr(args, "port", 8000)))
                 _print_serve_start_line("MTPLX is already running.")
                 _print_serve_start_line(f"Chat URL: {chat_url}")
-                _print_serve_start_line(f"OpenAI API Base URL: {_api_base_url(str(getattr(args, 'host', '127.0.0.1')), int(getattr(args, 'port', 8000)))}")
+                _print_serve_start_line(f"OpenAI API Base URL: {base}/v1")
                 _print_serve_start_line(f"Model: {model_id}")
                 _print_serve_start_line("API key: leave blank for localhost")
                 _print_serve_start_line("Opening chat UI in your browser...")
@@ -2793,8 +2939,12 @@ def cmd_serve_public(args: Any) -> int:
         cache_dir=getattr(args, "cache_dir", None),
     )
     if resolve_error is not None:
-        _print(resolve_error)
-        return int(resolve_error.get("exit_code", 1))
+        _print_command_error(
+            resolve_error,
+            command="quickstart",
+            json_output=bool(getattr(args, "json", False)),
+        )
+        return 1
     inspection, gate_exit = _model_gate(
         runtime_model,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
@@ -2826,7 +2976,7 @@ def cmd_serve_public(args: Any) -> int:
                 observed = fork_status.get("path") or fork_status.get("error") or "unknown"
                 _print_serve_start_line(f"      Found: {observed}")
                 server_command = _server_command_name(args)
-                _print_serve_start_line(f"try: mtplx {server_command} --profile stable")
+                _print_serve_start_line(f"try: mtplx {server_command} --profile safe")
                 _print_serve_start_line(f"try: mtplx {server_command} --profile performance-cold")
                 _print_serve_start_line("     (without --strict-fast-path, MTPLX starts in stock-MLX compatibility)")
                 return 2
@@ -2915,7 +3065,7 @@ def cmd_serve_public(args: Any) -> int:
             actionable = verified.get("actionable")
             if actionable:
                 _emit(f"[max]   action: {actionable}")
-            _emit("[max] continuing the server WITHOUT fan boost (Max behaves like Fast).")
+            _emit("[max] continuing the server WITHOUT fan boost (Max behaves like Medium).")
             _emit("")
             args.max = False  # don't lie to the watchdog about fan state
         # Only spin up the idle watchdog when verification confirmed fans
@@ -3018,12 +3168,21 @@ def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str
     prompt = getattr(args, "prompt", None) or getattr(args, "prompt_arg", None)
     if not prompt:
         raise SystemExit(f"mtplx {command} requires a prompt")
+    depth_error = _validate_public_depth(args, printer=lambda _line: None)
+    if depth_error is not None:
+        return depth_error, {
+            "error": "invalid depth",
+            "detail": (
+                "--depth must be between "
+                f"1 and {MAX_PUBLIC_SPECULATIVE_DEPTH} for the current MTPLX runtime"
+            ),
+        }, []
     runtime_model, resolve_error = _resolve_runtime_model_path(
         args.model,
         cache_dir=getattr(args, "cache_dir", None),
     )
     if resolve_error is not None:
-        return int(resolve_error.get("exit_code", 1)), resolve_error, []
+        return EXIT_TELEMETRY, resolve_error, []
     inspection, gate_exit = _model_gate(
         runtime_model,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
@@ -3033,6 +3192,8 @@ def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str
         return gate_exit, {"error": "model failed MTP primary gate", "model": inspection}, []
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
+    draft_lm_head = _model_draft_lm_head_spec(inspection, profile)
+    draft_sampler = _model_draft_sampler_spec(inspection, profile)
 
     max_session: Any | None = None
     thermal: dict[str, Any] | None = None
@@ -3062,6 +3223,20 @@ def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str
 
     try:
         rt = load(runtime_model, mtp=True)
+        draft_report = None
+        if (
+            draft_lm_head is not None
+            and hasattr(rt, "model")
+            and bool(getattr(rt, "mtp_enabled", True))
+        ):
+            from mtplx.draft_lm_head import _install_draft_lm_head
+
+            draft_report = _install_draft_lm_head(
+                rt,
+                bits=int(draft_lm_head["bits"]),
+                group_size=int(draft_lm_head["group_size"]),
+                mode=str(draft_lm_head["mode"]),
+            )
         messages = None
         system = getattr(args, "system", None)
         if system:
@@ -3097,6 +3272,7 @@ def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str
             prompt_ids,
             max_tokens=max_tokens_value,
             sampler=SamplerConfig(temperature=args.temperature, top_p=args.top_p, top_k=args.top_k),
+            draft_sampler=_draft_sampler_from_spec(draft_sampler),
             speculative_depth=args.depth,
             seed=args.seed,
             mtp_hidden_variant="post_norm",
@@ -3119,6 +3295,8 @@ def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str
         "text": out.text,
         "model": _compact_model_summary(inspection),
         "profile": profile.to_dict(),
+        "draft_lm_head": draft_report,
+        "draft_sampler": draft_sampler,
         "stats": {
             "generated_tokens": out.stats.generated_tokens,
             "max_tokens": max_tokens_value,
@@ -3144,7 +3322,11 @@ def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str
 def cmd_run_public(args: Any) -> int:
     code, payload, _validations = _generate_one_shot_public(args, command="run")
     if "error" in payload:
-        _print(payload)
+        _print_command_error(
+            payload,
+            command="run",
+            json_output=bool(getattr(args, "json", False)),
+        )
         return code
     if getattr(args, "json", False):
         _print(payload)
@@ -3165,7 +3347,18 @@ def cmd_run_public(args: Any) -> int:
 def cmd_chat_public(args: Any) -> int:
     # Still a one-shot smoke path until the interactive REPL lands in Phase 5.
     code, payload, _validations = _generate_one_shot_public(args, command="chat")
-    _print(payload)
+    if "error" in payload:
+        _print_command_error(
+            payload,
+            command="chat",
+            json_output=bool(getattr(args, "json", False)),
+        )
+        return code
+    if getattr(args, "json", False):
+        _print(payload)
+    else:
+        text = payload["text"]
+        print(text, end="" if text.endswith("\n") else "\n")
     return code
 
 
@@ -3362,11 +3555,52 @@ def _quickstart_resolve_model(model: str, *, cache_dir: str | None, download: bo
             "error": resolve_error,
         }
 
+    download_ref = _quickstart_download_ref(model)
+    try:
+        inspection = inspect_model(download_ref).to_dict()
+    except Exception as exc:
+        return None, {
+            "model": model,
+            "runtime_model": None,
+            "downloaded": False,
+            "download_ref": download_ref,
+            "error": {
+                "error": "model failed Hugging Face preflight",
+                "model": download_ref,
+                "detail": str(exc),
+            },
+        }
+    compatibility = inspection.get("compatibility") or {}
+    if not bool(compatibility.get("can_run")):
+        return None, {
+            "model": model,
+            "runtime_model": None,
+            "downloaded": False,
+            "download_ref": download_ref,
+            "gate_inspection": inspection,
+            "error": {
+                "error": "model failed MTPLX compatibility gate",
+                "model": inspection,
+            },
+        }
+
     from mtplx.hf_loader import pull_model
 
-    download_ref = _quickstart_download_ref(model)
     _quickstart_line(f"[1/4] Downloading model: {download_ref}")
-    result = pull_model(download_ref, cache_dir=cache_dir)
+    try:
+        result = pull_model(download_ref, cache_dir=cache_dir)
+    except KeyboardInterrupt:
+        return None, {
+            "model": model,
+            "runtime_model": None,
+            "downloaded": False,
+            "download_ref": download_ref,
+            "cancelled": True,
+            "error": {
+                "error": "download cancelled",
+                "model": download_ref,
+            },
+        }
     runtime_model, resolve_error = _resolve_runtime_model_path(download_ref, cache_dir=cache_dir)
     if resolve_error is not None:
         return None, {
@@ -3545,8 +3779,8 @@ def _quickstart_stats_line(payload: dict[str, Any]) -> str:
             speed_text = f"{speed_text} | live_window={stream_tok_s:.2f}"
         if total_tok_s is not None and abs(decode_tok_s - total_tok_s) >= 0.1:
             speed_text = f"{speed_text} | total={total_tok_s:.2f}"
-    elif stream_tok_s is not None and generated_tokens >= 8:
-        speed_text = f"{stream_tok_s:.2f} live-window tok/s"
+    elif stream_tok_s is not None:
+        speed_text = f"{stream_tok_s:.2f} tok/s"
         if total_tok_s is not None and abs(stream_tok_s - total_tok_s) >= 0.1:
             speed_text = f"{speed_text} | total={total_tok_s:.2f}"
     elif total_tok_s is not None:
@@ -3649,15 +3883,7 @@ def _quickstart_generate(
                 top_p=float(getattr(args, "top_p", 0.95)),
                 top_k=int(getattr(args, "top_k", 20)),
             ),
-            draft_sampler=(
-                None
-                if draft_sampler is None
-                else SamplerConfig(
-                    temperature=float(draft_sampler["temperature"]),
-                    top_p=float(draft_sampler["top_p"]),
-                    top_k=int(draft_sampler["top_k"]),
-                )
-            ),
+            draft_sampler=_draft_sampler_from_spec(draft_sampler),
             speculative_depth=int(getattr(args, "depth", 3)),
             seed=int(getattr(args, "seed", 0)) + turn_index,
             mtp_hidden_variant="post_norm",
@@ -3720,14 +3946,13 @@ def _quickstart_openwebui_payload(args: Any) -> dict[str, Any]:
     host = str(getattr(args, "host", "127.0.0.1"))
     port = int(getattr(args, "port", 8000))
     model_id = str(getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID)
-    server_url = f"http://{_connect_host_for_bind(host)}:{port}"
-    api_base_url = server_url + "/v1"
+    base = f"http://{_connect_host_for_bind(host)}:{port}"
     return {
         "integration": "openwebui",
-        "server_url": server_url,
-        "base_url": api_base_url,
-        "api_base_url": api_base_url,
-        "chat_url": server_url + "/",
+        "server_url": base,
+        "base_url": base + "/v1",
+        "api_base_url": base + "/v1",
+        "chat_url": base + "/",
         "model_id": model_id,
         "api_key": "not required for localhost",
         "server_command": (
@@ -3736,8 +3961,8 @@ def _quickstart_openwebui_payload(args: Any) -> dict[str, Any]:
             "--no-stats-footer --open-browser"
         ),
         "openwebui_steps": [
-            f"Open chat UI: {server_url}/",
-            f"OpenAI-compatible API base URL: {api_base_url}",
+            f"Open chat UI: {base}/",
+            f"OpenAI-compatible API base URL: {base}/v1",
             f"Model: {model_id}",
         ],
     }
@@ -4035,14 +4260,17 @@ def cmd_quickstart_public(args: Any) -> int:
         chosen_model = choice.get("model")
         if chosen_model:
             args.model = chosen_model
-            # The user deliberately picked this model in onboarding. If it is
-            # an HF repo and missing locally, fetch without another prompt.
+            # Auto-pull policy: the user has explicitly picked this model in
+            # the onboarding wizard; if it isn't on disk we fetch it without
+            # re-prompting. The legacy "Model is missing. Download? [Y/n]"
+            # fallback below is reserved for non-onboarded shortcuts.
             try:
                 from mtplx.hf_loader import repo_id_from_model_ref
 
                 if repo_id_from_model_ref(chosen_model):
                     args.download = True
             except Exception:
+                # Best-effort: never let an import problem break the wizard.
                 pass
         chosen_profile = choice.get("profile")
         if chosen_profile:
@@ -4075,7 +4303,7 @@ def cmd_quickstart_public(args: Any) -> int:
                     args.max = False
 
     if raw_target is None:
-        raw_target = "web"
+        raw_target = "cli" if has_prompt else "web"
     raw_target = str(raw_target).lower()
     if raw_target in {"open-webui", "openwebui", "web"}:
         target = "openwebui"
@@ -4088,6 +4316,9 @@ def cmd_quickstart_public(args: Any) -> int:
         _quickstart_line(f"try: {_start_invocation(args)}")
         _quickstart_line(f"try: {_start_invocation(args, ' cli')}")
         return 2
+    depth_error = _validate_public_depth(args, printer=_quickstart_line)
+    if depth_error is not None:
+        return depth_error
     model, download = _quickstart_choose_model(args, target=target)
     cache_dir = getattr(args, "cache_dir", None)
     if getattr(args, "dry_run", False):
@@ -4098,6 +4329,7 @@ def cmd_quickstart_public(args: Any) -> int:
             "model": model,
             "cache_dir": cache_dir,
             "profile": getattr(args, "profile", DEFAULT_PROFILE_NAME),
+            "max": bool(getattr(args, "max", False)),
             "download_if_missing": download,
             "terminal_chat": target == "terminal",
             "openwebui": openwebui,
@@ -4110,6 +4342,10 @@ def cmd_quickstart_public(args: Any) -> int:
             _quickstart_line(f"MTPLX {_start_command_name(args)}")
             _quickstart_line(f"model: {model}")
             _quickstart_line(f"profile: {payload['profile']}")
+            _quickstart_line(
+                "mode: "
+                + ("Max (Medium path + fan boost)" if payload["max"] else "Medium")
+            )
             _quickstart_line(f"download if missing: {str(download).lower()}")
             if target == "openwebui":
                 _quickstart_line(f"then: start local server -> open browser chat at {openwebui['chat_url']}")
@@ -4121,10 +4357,36 @@ def cmd_quickstart_public(args: Any) -> int:
     _quickstart_line(f"[1/4] Checking model: {model}")
     try:
         runtime_model, resolution = _quickstart_resolve_model(model, cache_dir=cache_dir, download=download)
+    except KeyboardInterrupt:
+        _quickstart_line("download cancelled")
+        return 130
     except Exception as exc:
         _quickstart_line(f"error: {exc}")
         return 1
     if runtime_model is None:
+        if resolution.get("cancelled"):
+            _quickstart_line("download cancelled")
+            return 130
+        gate_inspection = resolution.get("gate_inspection")
+        if isinstance(gate_inspection, dict):
+            _print_model_gate_error(
+                gate_inspection,
+                printer=_quickstart_line,
+                json_output=bool(getattr(args, "json", False)),
+            )
+            compatibility = gate_inspection.get("compatibility") or {}
+            return int(compatibility.get("exit_code") or 1)
+        resolution_error = resolution.get("error")
+        if (
+            isinstance(resolution_error, dict)
+            and resolution_error.get("error") not in {None, "model is not available locally"}
+        ):
+            _print_command_error(
+                resolution_error,
+                command="start",
+                json_output=bool(getattr(args, "json", False)),
+            )
+            return 1
         if sys.stdin.isatty() and not getattr(args, "prompt", None):
             try:
                 download_model = _quickstart_download_ref(model)
@@ -4136,9 +4398,36 @@ def cmd_quickstart_public(args: Any) -> int:
             if answer in {"", "y", "yes"}:
                 try:
                     runtime_model, resolution = _quickstart_resolve_model(download_model, cache_dir=cache_dir, download=True)
+                except KeyboardInterrupt:
+                    _quickstart_line("download cancelled")
+                    return 130
                 except Exception as exc:
                     _quickstart_line(f"error: {exc}")
                     return 1
+        if runtime_model is None and resolution.get("cancelled"):
+            _quickstart_line("download cancelled")
+            return 130
+        gate_inspection = resolution.get("gate_inspection")
+        if runtime_model is None and isinstance(gate_inspection, dict):
+            _print_model_gate_error(
+                gate_inspection,
+                printer=_quickstart_line,
+                json_output=bool(getattr(args, "json", False)),
+            )
+            compatibility = gate_inspection.get("compatibility") or {}
+            return int(compatibility.get("exit_code") or 1)
+        resolution_error = resolution.get("error")
+        if (
+            runtime_model is None
+            and isinstance(resolution_error, dict)
+            and resolution_error.get("error") not in {None, "model is not available locally"}
+        ):
+            _print_command_error(
+                resolution_error,
+                command="start",
+                json_output=bool(getattr(args, "json", False)),
+            )
+            return 1
         if runtime_model is not None:
             _quickstart_line(f"model ready: {runtime_model}")
             if resolution.get("downloaded"):
@@ -4164,6 +4453,11 @@ def cmd_quickstart_public(args: Any) -> int:
         if detail:
             _quickstart_line(f"detail: {detail}")
         _quickstart_line(f"try: {_start_invocation(args, ' --download')}")
+        _quickstart_line(
+            "try: "
+            f"{_start_invocation(args, ' cli' if target == 'terminal' else '')} "
+            f"--model {shlex.quote(str(model))} --download"
+        )
         _quickstart_line(f"try: {_start_invocation(args, ' --model /path/to/model')}")
         return 1
 
@@ -4206,7 +4500,11 @@ def cmd_metrics_public(args: Any) -> int:
         if getattr(args, "json", False):
             print(json.dumps(row, sort_keys=True))
         else:
-            if latest:
+            if not row["ok"]:
+                print(f"metrics: cannot reach {base}/metrics")
+                if isinstance(payload, dict) and payload.get("detail"):
+                    print(f"detail: {payload.get('detail')}")
+            elif latest:
                 tok_s = latest.get("tok_s") or latest.get("decode_tok_s") or latest.get("server_tok_s")
                 generated = latest.get("completion_tokens") or latest.get("generated_tokens")
                 verify_ms = latest.get("verify_ms_per_call") or latest.get("late_verify_ms")
@@ -4225,7 +4523,7 @@ def cmd_metrics_public(args: Any) -> int:
         if count and seen >= count:
             break
         time.sleep(interval)
-    return 0
+    return 0 if row.get("ok") else 1
 
 
 def cmd_integrate_public(args: Any) -> int:
@@ -4248,7 +4546,7 @@ def cmd_integrate_public(args: Any) -> int:
             "docker_api_base_url": _openwebui_docker_api_base_url(int(args.port)),
             "model_id": model_id,
             "server_command": (
-                f"mtplx serve --host {args.host} --port {args.port} "
+                f"mtplx quickstart --host {args.host} --port {args.port} "
                 "--no-stats-footer"
             ),
             "docker_command": _shell_join(docker_command),
@@ -4279,7 +4577,7 @@ def cmd_integrate_public(args: Any) -> int:
                 "ANTHROPIC_API_KEY": f"${args.api_key_env}",
             },
             "server_command": (
-                f"mtplx serve --host {args.host} --port {args.port} "
+                f"mtplx quickstart --host {args.host} --port {args.port} "
                 "--no-stats-footer"
             ),
             "smoke": {
@@ -4297,8 +4595,36 @@ def cmd_integrate_public(args: Any) -> int:
     if getattr(args, "json", False):
         _print(payload)
     else:
-        for key, value in payload.items():
-            print(f"{key}: {value}")
+        print(f"MTPLX connect: {action}")
+        print(f"base URL: {api_base_url if action == 'openwebui' else server_url}")
+        print(f"model: {model_id}")
+        print(f"start server: {payload.get('server_command')}")
+        if action == "openwebui":
+            print("Open WebUI:")
+            print("  Settings -> Connections -> OpenAI API")
+            print(f"  API base URL: {api_base_url}")
+            print("  API key: leave blank for localhost")
+            if getattr(args, "docker", False):
+                print("Docker:")
+                print(f"  {_shell_join(payload['docker_command_argv'])}")
+        else:
+            env = payload.get("environment") or {}
+            print("Claude Code environment:")
+            for key, value in env.items():
+                print(f"  {key}={value}")
+        smoke = payload.get("smoke_result")
+        if isinstance(smoke, dict):
+            health = smoke.get("health") if isinstance(smoke.get("health"), dict) else {}
+            models = smoke.get("models") if isinstance(smoke.get("models"), dict) else {}
+            print("smoke:")
+            print(f"  health: {'ok' if health.get('ok') else 'failed'}")
+            data = models.get("data") if isinstance(models, dict) else None
+            if isinstance(data, list):
+                print(f"  models endpoint: ok ({len(data)} model(s))")
+            elif models.get("error"):
+                print(f"  models endpoint: failed ({models.get('error')})")
+            else:
+                print("  models endpoint: unknown")
     return 0
 
 
@@ -4395,7 +4721,12 @@ def _architecture_qa_fixtures() -> list[dict[str, Any]]:
                 "num_hidden_layers": 61,
             },
             "contract": "deepseek-v3-mtp",
-            "safetensors": {"model.safetensors": ["model.layers.61.enorm.weight"]},
+            "safetensors": {
+                "model.safetensors": [
+                    "model.layers.61.enorm.weight",
+                    "model.layers.62.enorm.weight",
+                ]
+            },
             "expect": {
                 "tier": "verified",
                 "arch_id": "deepseek-v3-mtp",
@@ -4413,7 +4744,12 @@ def _architecture_qa_fixtures() -> list[dict[str, Any]]:
                 "num_hidden_layers": 61,
             },
             "contract": "deepseek-v3-mtp",
-            "safetensors": {"model.safetensors": ["model.layers.61.enorm.weight"]},
+            "safetensors": {
+                "model.safetensors": [
+                    "model.layers.61.enorm.weight",
+                    "model.layers.62.enorm.weight",
+                ]
+            },
             "expect": {
                 "tier": "verified",
                 "arch_id": "deepseek-v3-mtp",
@@ -4431,7 +4767,12 @@ def _architecture_qa_fixtures() -> list[dict[str, Any]]:
                 "num_hidden_layers": 61,
             },
             "contract": "glm-moe-dsa-mtp",
-            "safetensors": {"model.safetensors": ["model.layers.61.enorm.weight"]},
+            "safetensors": {
+                "model.safetensors": [
+                    "model.layers.61.enorm.weight",
+                    "model.layers.62.enorm.weight",
+                ]
+            },
             "expect": {
                 "tier": "verified",
                 "arch_id": "glm-moe-dsa-mtp",
@@ -4459,6 +4800,23 @@ def _architecture_qa_fixtures() -> list[dict[str, Any]]:
             },
         },
         {
+            "label": "glm4-moe-family-gated",
+            "config": {
+                "architectures": ["Glm4MoeForCausalLM"],
+                "model_type": "glm4_moe",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 47,
+            },
+            "safetensors": {"model.safetensors": ["model.layers.47.hnorm.weight"]},
+            "expect": {
+                "tier": "family-compatible-unverified",
+                "arch_id": "glm4-moe-mtp",
+                "can_run": True,
+                "recommended_backend": "glm_mtp",
+                "runtime_compatibility": "native-family-gated",
+            },
+        },
+        {
             "label": "glm4-moe-lite-contract-gated",
             "config": {
                 "architectures": ["Glm4MoeLiteForCausalLM"],
@@ -4474,6 +4832,23 @@ def _architecture_qa_fixtures() -> list[dict[str, Any]]:
                 "can_run": True,
                 "recommended_backend": "glm_mtp",
                 "runtime_compatibility": "native-contract-gated",
+            },
+        },
+        {
+            "label": "glm4-moe-lite-family-gated",
+            "config": {
+                "architectures": ["Glm4MoeLiteForCausalLM"],
+                "model_type": "glm4_moe_lite",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 47,
+            },
+            "safetensors": {"model.safetensors": ["model.layers.47.eh_proj.weight"]},
+            "expect": {
+                "tier": "family-compatible-unverified",
+                "arch_id": "glm4-moe-lite-mtp",
+                "can_run": True,
+                "recommended_backend": "glm_mtp",
+                "runtime_compatibility": "native-family-gated",
             },
         },
         {
@@ -4497,6 +4872,25 @@ def _architecture_qa_fixtures() -> list[dict[str, Any]]:
             },
         },
         {
+            "label": "mimo-family-gated",
+            "config": {
+                "architectures": ["MiMoForCausalLM"],
+                "model_type": "mimo",
+                "num_nextn_predict_layers": 2,
+                "num_hidden_layers": 46,
+            },
+            "safetensors": {
+                "model.safetensors": ["model.mtp_layers.0.hidden_layernorm.weight"]
+            },
+            "expect": {
+                "tier": "family-compatible-unverified",
+                "arch_id": "mimo-mtp",
+                "can_run": True,
+                "recommended_backend": "mimo_mtp",
+                "runtime_compatibility": "native-family-gated",
+            },
+        },
+        {
             "label": "minimax-m2-num-mtp-modules-recognized-pending",
             "config": {
                 "architectures": ["MiniMaxM2ForCausalLM"],
@@ -4508,6 +4902,65 @@ def _architecture_qa_fixtures() -> list[dict[str, Any]]:
                 "arch_id": "minimax-m2-mtp",
                 "can_run": False,
                 "runtime_compatibility": "recognized-backend-pending",
+            },
+        },
+        {
+            "label": "nemotron-h-contract-gated",
+            "config": {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 52,
+                "mtp_hybrid_override_pattern": "*E",
+            },
+            "contract": "nemotron-h-mtp",
+            "safetensors": {
+                "mtp.safetensors": [
+                    "mtp.layers.0.enorm.weight",
+                    "mtp.layers.0.hnorm.weight",
+                    "mtp.layers.0.eh_proj.weight",
+                    "mtp.layers.0.norm.weight",
+                    "mtp.layers.0.mixer.q_proj.weight",
+                    "mtp.layers.1.norm.weight",
+                    "mtp.layers.1.mixer.gate.weight",
+                    "mtp.layers.1.final_layernorm.weight",
+                ]
+            },
+            "expect": {
+                "tier": "verified",
+                "arch_id": "nemotron-h-mtp",
+                "can_run": True,
+                "recommended_backend": "nemotron_h_mtp",
+                "runtime_compatibility": "native-contract-gated",
+            },
+        },
+        {
+            "label": "nemotron-h-family-gated",
+            "config": {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 52,
+                "mtp_hybrid_override_pattern": "*E",
+            },
+            "safetensors": {
+                "mtp.safetensors": [
+                    "mtp.layers.0.enorm.weight",
+                    "mtp.layers.0.hnorm.weight",
+                    "mtp.layers.0.eh_proj.weight",
+                    "mtp.layers.0.norm.weight",
+                    "mtp.layers.0.mixer.q_proj.weight",
+                    "mtp.layers.1.norm.weight",
+                    "mtp.layers.1.mixer.gate.weight",
+                    "mtp.layers.1.final_layernorm.weight",
+                ]
+            },
+            "expect": {
+                "tier": "family-compatible-unverified",
+                "arch_id": "nemotron-h-mtp",
+                "can_run": True,
+                "recommended_backend": "nemotron_h_mtp",
+                "runtime_compatibility": "native-family-gated",
             },
         },
         {
@@ -4602,6 +5055,7 @@ def _run_runtime_import_smoke() -> list[dict[str, Any]]:
         ("mtplx.backends.deepseek_mtp", "DeepSeekMTPBackend"),
         ("mtplx.backends.glm_mtp", "GLMMTPBackend"),
         ("mtplx.backends.mimo_mtp", "MiMoMTPBackend"),
+        ("mtplx.backends.nemotron_h_mtp", "NemotronHMTPBackend"),
     ):
         try:
             module = importlib.import_module(module_name)
@@ -4637,6 +5091,7 @@ def _cmd_model_qa_architectures(args: Any) -> int:
         "glm4-moe-mtp",
         "glm4-moe-lite-mtp",
         "mimo-mtp",
+        "nemotron-h-mtp",
         "minimax-m2-mtp",
         "gemma-mtp",
     }
@@ -4647,6 +5102,7 @@ def _cmd_model_qa_architectures(args: Any) -> int:
         "glm4-moe-mtp",
         "glm4-moe-lite-mtp",
         "mimo-mtp",
+        "nemotron-h-mtp",
     }
     verified_ids = {row["arch_id"] for row in catalog if row.get("can_run_verified")}
     fixture_rows = _run_architecture_fixture_qa()
@@ -4965,8 +5421,6 @@ def cmd_debug_public(args: Any) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     doctor_args = type("DoctorArgs", (), vars(args).copy())()
     doctor_args.project_root = getattr(args, "project_root", ".")
-    doctor_args.smc_path = getattr(args, "smc_path", None) or shutil.which("smc") or ""
-    doctor_args.sovereign_path = getattr(args, "sovereign_path", None) or shutil.which("sovereign") or ""
     doctor_args.model_cache = getattr(args, "model_cache", None)
     doctor_args.deep = True
     env = collect_environment(doctor_args.project_root).to_dict()

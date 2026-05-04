@@ -250,7 +250,13 @@ def test_deepseek_mtp_with_runtime_contract_and_model_file_is_verified(tmp_path)
         ),
         encoding="utf-8",
     )
-    save_file({"model.layers.61.enorm.weight": np.ones((1,), dtype=np.float32)}, tmp_path / "model.safetensors")
+    save_file(
+        {
+            "model.layers.61.enorm.weight": np.ones((1,), dtype=np.float32),
+            "model.layers.62.enorm.weight": np.ones((1,), dtype=np.float32),
+        },
+        tmp_path / "model.safetensors",
+    )
     _write_runtime_contract(tmp_path, arch_id="deepseek-v3-mtp")
 
     result = inspect_model(tmp_path)
@@ -362,7 +368,13 @@ def test_glm_moe_dsa_mtp_with_runtime_contract_and_model_file_is_verified(tmp_pa
         ),
         encoding="utf-8",
     )
-    save_file({"model.layers.61.enorm.weight": np.ones((1,), dtype=np.float32)}, tmp_path / "model.safetensors")
+    save_file(
+        {
+            "model.layers.61.enorm.weight": np.ones((1,), dtype=np.float32),
+            "model.layers.62.enorm.weight": np.ones((1,), dtype=np.float32),
+        },
+        tmp_path / "model.safetensors",
+    )
     _write_runtime_contract(tmp_path, arch_id="glm-moe-dsa-mtp")
 
     result = inspect_model(tmp_path)
@@ -517,10 +529,11 @@ def test_big_mtp_architecture_markers_are_recognized_backend_pending(
         in {
             "deepseek-v3-mtp",
             "glm-moe-dsa-mtp",
-            "glm4-moe-mtp",
-            "glm4-moe-lite-mtp",
-            "mimo-mtp",
-        }
+                "glm4-moe-mtp",
+                "glm4-moe-lite-mtp",
+                "mimo-mtp",
+                "nemotron-h-mtp",
+            }
         else "recognized-backend-pending"
     )
     assert result.compatibility["runtime_compatibility"] == expected_runtime

@@ -20,6 +20,57 @@ from .constants import (
     MULTIMODAL_SIDECARS,
 )
 
+MTP_KEY_PREFIXES = ("mtp.", "language_model.mtp.")
+
+
+def normalize_mtp_key(key: str) -> str:
+    text = str(key)
+    for prefix in MTP_KEY_PREFIXES:
+        if text.startswith(prefix):
+            return "mtp." + text[len(prefix) :]
+    return text
+
+
+def is_mtp_key(key: str) -> bool:
+    text = str(key)
+    return any(text.startswith(prefix) for prefix in MTP_KEY_PREFIXES)
+
+
+def _mtp_expected_key_set(
+    config: dict[str, Any],
+    *,
+    keys: tuple[str, ...] = (),
+) -> tuple[set[str], int, str]:
+    mtp_quant = config.get("mtplx_mtp_quantization", {})
+    prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
+    quant_policy = str(mtp_quant.get("policy") or "") if isinstance(mtp_quant, dict) else ""
+    normalized = {normalize_mtp_key(key) for key in keys}
+    if prequantized and quant_policy == "all":
+        return (
+            set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS),
+            EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT,
+            "prequantized-mlx-affine",
+        )
+    if prequantized:
+        return (
+            set(EXPECTED_PREQUANTIZED_MTP_KEYS),
+            EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT,
+            "prequantized-mlx-affine",
+        )
+    if normalized == set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS):
+        return (
+            set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS),
+            EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT,
+            "prequantized-mlx-affine",
+        )
+    if normalized == set(EXPECTED_PREQUANTIZED_MTP_KEYS):
+        return (
+            set(EXPECTED_PREQUANTIZED_MTP_KEYS),
+            EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT,
+            "prequantized-mlx-affine",
+        )
+    return set(EXPECTED_MTP_KEYS), EXPECTED_MTP_TENSOR_COUNT, "bf16"
+
 
 def load_config(model_dir: Path | str) -> dict[str, Any]:
     path = Path(model_dir) / "config.json"
@@ -113,10 +164,12 @@ class ModelInspection:
     hidden_size: int | None
     num_hidden_layers: int | None
     vocab_size: int | None
+    mtp_pattern: str | None = None
     source: str = "local"
     quantization: dict[str, Any] = field(default_factory=dict)
     sidecars: dict[str, bool] = field(default_factory=dict)
     model_files: tuple[str, ...] = ()
+    weight_keys: tuple[str, ...] = field(default_factory=tuple, repr=False)
     mtp: MTPInspection | None = None
     runtime_contract_data: dict[str, Any] | None = None
     runtime_contract_error: str | None = None
@@ -136,6 +189,10 @@ class ModelInspection:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        runtime_contract_path = (
+            self.runtime_contract_path
+            or self.compatibility.get("runtime_contract_path")
+        )
         return {
             "model_dir": self.model_dir,
             "source": self.source,
@@ -143,6 +200,7 @@ class ModelInspection:
             "architecture": self.architecture,
             "model_type": self.model_type,
             "mtp_num_hidden_layers": self.mtp_num_hidden_layers,
+            "mtp_pattern": self.mtp_pattern,
             "hidden_size": self.hidden_size,
             "num_hidden_layers": self.num_hidden_layers,
             "vocab_size": self.vocab_size,
@@ -151,7 +209,7 @@ class ModelInspection:
             "model_files": list(self.model_files),
             "passes_primary_gate": self.passes_primary_gate,
             "mtp": self.mtp.to_dict() if self.mtp else None,
-            "runtime_contract_path": self.runtime_contract_path,
+            "runtime_contract_path": runtime_contract_path,
             "compatibility": self.compatibility,
             "mtp_supported": self.compatibility.get("mtp_supported"),
             "mtp_arch": self.compatibility.get("arch_id"),
@@ -170,19 +228,7 @@ class ModelInspection:
 
 def inspect_mtp_tensors(model_dir: Path | str, config: dict[str, Any] | None = None) -> MTPInspection:
     mtp_path = expected_mtp_file(model_dir, config)
-    mtp_quant = (config or {}).get("mtplx_mtp_quantization", {})
-    prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
-    quant_policy = str(mtp_quant.get("policy") or "") if isinstance(mtp_quant, dict) else ""
-    if prequantized and quant_policy == "all":
-        expected_keys = set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS)
-        expected_count = EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT
-    elif prequantized:
-        expected_keys = set(EXPECTED_PREQUANTIZED_MTP_KEYS)
-        expected_count = EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT
-    else:
-        expected_keys = set(EXPECTED_MTP_KEYS)
-        expected_count = EXPECTED_MTP_TENSOR_COUNT
-    sidecar_format = "prequantized-mlx-affine" if prequantized else "bf16"
+    expected_keys, expected_count, sidecar_format = _mtp_expected_key_set(config or {})
     if not mtp_path.exists():
         return MTPInspection(
             mtp_file=str(mtp_path),
@@ -206,7 +252,11 @@ def inspect_mtp_tensors(model_dir: Path | str, config: dict[str, Any] | None = N
                 )
             )
 
-    key_set = {t.key for t in tensors}
+    key_set = {normalize_mtp_key(t.key) for t in tensors}
+    expected_keys, expected_count, sidecar_format = _mtp_expected_key_set(
+        config or {},
+        keys=tuple(key_set),
+    )
     return MTPInspection(
         mtp_file=str(mtp_path),
         exists=True,
@@ -358,6 +408,76 @@ def _remote_safetensors_keys(repo_id: str, filename: str) -> tuple[tuple[str, ..
         return (), str(exc)
 
 
+def _safetensors_header_keys(path: Path) -> tuple[tuple[str, ...], str | None]:
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(8)
+            if len(prefix) < 8:
+                return (), "safetensors header is shorter than 8 bytes"
+            header_len = int.from_bytes(prefix, "little")
+            if header_len > 1_000_000:
+                return (), f"safetensors header too large for metadata-only inspect: {header_len + 8} bytes"
+            header = json.loads(handle.read(header_len).decode("utf-8"))
+        return tuple(sorted(key for key in header if key != "__metadata__")), None
+    except Exception as exc:
+        return (), str(exc)
+
+
+def _weight_keys_from_index_payload(payload: dict[str, Any] | None) -> tuple[str, ...]:
+    if not isinstance(payload, dict):
+        return ()
+    weight_map = payload.get("weight_map")
+    if not isinstance(weight_map, dict):
+        return ()
+    return tuple(sorted(str(key) for key in weight_map))
+
+
+def _local_model_weight_keys(model_path: Path) -> tuple[tuple[str, ...], str | None]:
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            return _weight_keys_from_index_payload(
+                json.loads(index_path.read_text(encoding="utf-8"))
+            ), None
+        except Exception as exc:
+            return (), str(exc)
+
+    keys: set[str] = set()
+    errors: list[str] = []
+    for shard in sorted(model_path.glob("model*.safetensors")):
+        shard_keys, error = _safetensors_header_keys(shard)
+        keys.update(shard_keys)
+        if error:
+            errors.append(f"{shard.name}: {error}")
+    return tuple(sorted(keys)), "; ".join(errors) if errors else None
+
+
+def _hf_model_weight_keys(repo_id: str, files: set[str]) -> tuple[tuple[str, ...], str | None]:
+    if "model.safetensors.index.json" in files:
+        index, _path, error = _hf_download_json(repo_id, "model.safetensors.index.json")
+        if index is not None:
+            return _weight_keys_from_index_payload(index), None
+        if error:
+            return (), error
+
+    keys: set[str] = set()
+    errors: list[str] = []
+    for filename in sorted(
+        name
+        for name in files
+        if Path(name).name.startswith("model") and name.endswith(".safetensors")
+    ):
+        shard_keys, error = _remote_safetensors_keys(repo_id, filename)
+        keys.update(shard_keys)
+        if error:
+            errors.append(f"{filename}: {error}")
+    return tuple(sorted(keys)), "; ".join(errors) if errors else None
+
+
+def _embedded_mtp_keys(weight_keys: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(sorted(normalize_mtp_key(key) for key in weight_keys if is_mtp_key(key)))
+
+
 def _inspect_mtp_tensors_from_keys(
     mtp_file: str,
     *,
@@ -365,24 +485,45 @@ def _inspect_mtp_tensors_from_keys(
     exists: bool,
     keys: tuple[str, ...] = (),
 ) -> MTPInspection:
-    mtp_quant = config.get("mtplx_mtp_quantization", {})
-    prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
-    expected_keys = set(EXPECTED_PREQUANTIZED_MTP_KEYS if prequantized else EXPECTED_MTP_KEYS)
-    expected_count = (
-        EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT if prequantized else EXPECTED_MTP_TENSOR_COUNT
+    normalized_keys = tuple(sorted(normalize_mtp_key(key) for key in keys))
+    expected_keys, expected_count, sidecar_format = _mtp_expected_key_set(
+        config,
+        keys=normalized_keys,
     )
-    sidecar_format = "prequantized-mlx-affine" if prequantized else "bf16"
-    key_set = set(keys)
+    key_set = set(normalized_keys)
     return MTPInspection(
         mtp_file=mtp_file,
         exists=exists,
-        tensor_count=len(keys),
+        tensor_count=len(normalized_keys),
         sidecar_format=sidecar_format,
         expected_tensor_count=expected_count,
         metadata_only=True,
         missing_expected_keys=tuple(sorted(expected_keys - key_set)) if keys else (),
         extra_keys=tuple(sorted(key_set - expected_keys)) if keys else (),
     )
+
+
+def _mtp_pattern_from_config(config: dict[str, Any]) -> str | None:
+    tcfg = text_config(config)
+    raw = (
+        tcfg.get("mtp_hybrid_override_pattern")
+        or config.get("mtp_hybrid_override_pattern")
+        or tcfg.get("hybrid_override_pattern")
+        or config.get("hybrid_override_pattern")
+        or tcfg.get("layers_block_type")
+        or config.get("layers_block_type")
+    )
+    if raw is None:
+        return None
+    mapping = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
+    if isinstance(raw, str):
+        if "," in raw:
+            parts = [part.strip().lower() for part in raw.split(",") if part.strip()]
+            return "".join(mapping.get(part, part) for part in parts)
+        return raw
+    if isinstance(raw, list):
+        return "".join(mapping.get(str(part).lower(), str(part)) for part in raw)
+    return str(raw)
 
 
 def _inspect_hf_model(repo_id: str) -> ModelInspection:
@@ -408,21 +549,50 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
     quant = config.get("quantization_config") or config.get("quantization") or {}
     if not quant:
         quant = tcfg.get("quantization_config") or tcfg.get("quantization") or {}
+    model_files = tuple(
+        sorted(
+            name
+            for name in files
+            if Path(name).name.startswith("model") and name.endswith(".safetensors")
+        )
+    )
     mtp_file = str(expected_mtp_file(Path("."), config))
     if mtp_file.startswith("./"):
         mtp_file = mtp_file[2:]
     mtp_file = mtp_file.lstrip("/")
     mtp_exists = mtp_file in files if files else False
+    weight_keys: tuple[str, ...] = ()
+    config_declares_mtp = bool(
+        tcfg.get("mtp_num_hidden_layers")
+        or tcfg.get("num_nextn_predict_layers")
+        or tcfg.get("num_mtp_modules")
+        or config.get("num_nextn_predict_layers")
+        or config.get("num_mtp_modules")
+        or "mtp" in str(architecture or "").lower()
+        or "nextn" in str(architecture or "").lower()
+    )
+    if not mtp_exists and config_declares_mtp:
+        weight_keys, _weight_keys_error = _hf_model_weight_keys(repo_id, files)
     mtp_keys: tuple[str, ...] = ()
     mtp_error = None
     if mtp_exists and mtp_file.endswith(".safetensors"):
         mtp_keys, mtp_error = _remote_safetensors_keys(repo_id, mtp_file)
-    mtp = _inspect_mtp_tensors_from_keys(
-        mtp_file,
-        config=config,
-        exists=mtp_exists,
-        keys=mtp_keys,
-    )
+    combined_weight_keys = tuple(sorted(set(weight_keys).union(mtp_keys)))
+    if mtp_exists:
+        mtp = _inspect_mtp_tensors_from_keys(
+            mtp_file,
+            config=config,
+            exists=True,
+            keys=mtp_keys,
+        )
+    else:
+        embedded = _embedded_mtp_keys(weight_keys)
+        mtp = _inspect_mtp_tensors_from_keys(
+            "model.safetensors.index.json::embedded",
+            config=config,
+            exists=bool(embedded),
+            keys=embedded,
+        )
     if mtp_error and not mtp_keys:
         mtp = MTPInspection(
             mtp_file=mtp_file,
@@ -448,15 +618,11 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         hidden_size=tcfg.get("hidden_size"),
         num_hidden_layers=tcfg.get("num_hidden_layers"),
         vocab_size=tcfg.get("vocab_size"),
+        mtp_pattern=_mtp_pattern_from_config(config),
         quantization=quant,
         sidecars={name: name in files for name in MULTIMODAL_SIDECARS},
-        model_files=tuple(
-            sorted(
-                name
-                for name in files
-                if Path(name).name.startswith("model") and name.endswith(".safetensors")
-            )
-        ),
+        model_files=model_files,
+        weight_keys=combined_weight_keys,
         mtp=mtp,
         runtime_contract_data=runtime_contract_data,
         runtime_contract_error=runtime_contract_error,
@@ -477,9 +643,11 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         hidden_size=inspection.hidden_size,
         num_hidden_layers=inspection.num_hidden_layers,
         vocab_size=inspection.vocab_size,
+        mtp_pattern=inspection.mtp_pattern,
         quantization=inspection.quantization,
         sidecars=inspection.sidecars,
         model_files=inspection.model_files,
+        weight_keys=inspection.weight_keys,
         mtp=inspection.mtp,
         runtime_contract_data=inspection.runtime_contract_data,
         runtime_contract_error=inspection.runtime_contract_error,
@@ -503,7 +671,26 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
     if not quant:
         quant = tcfg.get("quantization_config") or tcfg.get("quantization") or {}
 
-    mtp = inspect_mtp_tensors(model_path, config) if config_exists else None
+    weight_keys, _weight_keys_error = (
+        _local_model_weight_keys(model_path) if config_exists else ((), None)
+    )
+    if config_exists:
+        sidecar_mtp = inspect_mtp_tensors(model_path, config)
+        if sidecar_mtp.exists:
+            mtp = sidecar_mtp
+            weight_keys = tuple(
+                sorted(set(weight_keys).union(tensor.key for tensor in sidecar_mtp.tensors))
+            )
+        else:
+            embedded = _embedded_mtp_keys(weight_keys)
+            mtp = _inspect_mtp_tensors_from_keys(
+                "model.safetensors.index.json::embedded",
+                config=config,
+                exists=bool(embedded),
+                keys=embedded,
+            )
+    else:
+        mtp = None
     inspection = ModelInspection(
         model_dir=str(model_path),
         source="local",
@@ -521,9 +708,11 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         hidden_size=tcfg.get("hidden_size"),
         num_hidden_layers=tcfg.get("num_hidden_layers"),
         vocab_size=tcfg.get("vocab_size"),
+        mtp_pattern=_mtp_pattern_from_config(config),
         quantization=quant,
         sidecars={name: (model_path / name).exists() for name in MULTIMODAL_SIDECARS},
         model_files=tuple(sorted(p.name for p in model_path.glob("model*.safetensors"))),
+        weight_keys=weight_keys,
         mtp=mtp,
     )
     from mtplx.backends.registry import compatibility_for_inspection
@@ -539,9 +728,11 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         hidden_size=inspection.hidden_size,
         num_hidden_layers=inspection.num_hidden_layers,
         vocab_size=inspection.vocab_size,
+        mtp_pattern=inspection.mtp_pattern,
         quantization=inspection.quantization,
         sidecars=inspection.sidecars,
         model_files=inspection.model_files,
+        weight_keys=inspection.weight_keys,
         mtp=inspection.mtp,
         runtime_contract_data=inspection.runtime_contract_data,
         runtime_contract_error=inspection.runtime_contract_error,

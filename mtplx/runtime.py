@@ -165,8 +165,11 @@ def load(
         from .deepseek_mtp_patch import inject_deepseek_mtp_support, is_deepseek_mtp_config
         from .glm_mtp_patch import inject_glm_mtp_support, is_glm_mtp_config
         from .mimo_mtp_patch import inject_mimo_mtp_support, is_mimo_mtp_config
+        from .nemotron_h_mtp_patch import inject_nemotron_h_mtp_support, is_nemotron_h_mtp_config
 
-        if is_mimo_mtp_config(config):
+        if is_nemotron_h_mtp_config(config):
+            mtp_enabled = inject_nemotron_h_mtp_support(model, path, config, contract)
+        elif is_mimo_mtp_config(config):
             mtp_enabled = inject_mimo_mtp_support(model, path, config, contract)
         elif is_glm_mtp_config(config):
             mtp_enabled = inject_glm_mtp_support(model, path, config, contract)

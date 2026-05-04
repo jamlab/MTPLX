@@ -178,7 +178,7 @@ def test_server_state_emits_startup_progress(monkeypatch, capsys):
     state = openai.ServerState(args)
 
     captured = capsys.readouterr().out
-    assert "[4/6] Preparing Fast MTP runtime" in captured
+    assert "[4/6] Preparing Medium MTP runtime" in captured
     assert "[5/6] Loading model weights: models/example" in captured
     assert "This is the long step" in captured
     assert "Model load in progress (this may take a minute)" in captured

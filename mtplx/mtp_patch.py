@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .artifacts import expected_mtp_file, text_config
+from .artifacts import expected_mtp_file, is_mtp_key, normalize_mtp_key, text_config
+from .constants import EXPECTED_ALL_PREQUANTIZED_MTP_KEYS, EXPECTED_PREQUANTIZED_MTP_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -111,13 +113,16 @@ def _quantize_mtp_module(mtp: Any, contract: MTPContract) -> None:
     nn.quantize(mtp, class_predicate=predicate)
 
 
-def _load_mtp_weights(
-    mtp_file: Path,
+def _finalize_mtp_weights(
+    raw_mtp: dict[str, Any],
     config: dict[str, Any],
     *,
     prequantized: bool = False,
 ) -> dict[str, Any]:
-    import mlx.core as mx
+    try:
+        import mlx.core as mx
+    except Exception:
+        mx = None
 
     tcfg = text_config(config)
     quant_config = tcfg.get("quantization") or tcfg.get("quantization_config") or {}
@@ -125,10 +130,6 @@ def _load_mtp_weights(
         quant_config = config.get("quantization") or config.get("quantization_config") or {}
     bits = int(quant_config.get("bits", 4)) if quant_config else 4
     group_size = int(quant_config.get("group_size", 64)) if quant_config else 64
-
-    raw = mx.load(str(mtp_file))
-    raw_mtp = {k.removeprefix("mtp."): v for k, v in raw.items() if k.startswith("mtp.")}
-    del raw
 
     if prequantized:
         weights = dict(raw_mtp)
@@ -146,6 +147,8 @@ def _load_mtp_weights(
         scales_key = key.replace(".weight", ".scales")
         biases_key = key.replace(".weight", ".biases")
         if scales_key != key and scales_key in raw_mtp and biases_key in raw_mtp:
+            if mx is None:
+                raise RuntimeError("MLX is required to dequantize embedded MTP weights")
             weights[key] = mx.dequantize(
                 raw_mtp[key],
                 raw_mtp[scales_key],
@@ -163,6 +166,134 @@ def _load_mtp_weights(
             if float(value.mean().item()) < 0.5:
                 weights[key] = value + 1.0
     return weights
+
+
+def _strip_mtp_namespace(key: str) -> str:
+    return normalize_mtp_key(key).removeprefix("mtp.")
+
+
+def _mtp_contract_for_weight_keys(
+    contract: MTPContract,
+    keys: tuple[str, ...],
+    config: dict[str, Any],
+) -> MTPContract:
+    normalized = {normalize_mtp_key(key) for key in keys}
+    if contract.mtp_prequantized:
+        return contract
+    if normalized == set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS):
+        policy = "all"
+    elif normalized == set(EXPECTED_PREQUANTIZED_MTP_KEYS):
+        policy = "cyankiwi"
+    else:
+        return contract
+
+    tcfg = text_config(config)
+    quant_config = tcfg.get("quantization") or tcfg.get("quantization_config") or {}
+    if not quant_config:
+        quant_config = config.get("quantization") or config.get("quantization_config") or {}
+    updates: dict[str, Any] = {
+        "mtp_prequantized": True,
+        "mtp_quant_policy": contract.mtp_quant_policy or policy,
+    }
+    if contract.mtp_quant_bits is None:
+        updates["mtp_quant_bits"] = int((quant_config or {}).get("bits", 4))
+    if contract.mtp_quant_group_size == 64:
+        updates["mtp_quant_group_size"] = int((quant_config or {}).get("group_size", 64))
+    if contract.mtp_quant_mode == "affine":
+        updates["mtp_quant_mode"] = str((quant_config or {}).get("mode", "affine"))
+    return replace(contract, **updates)
+
+
+def _load_mtp_weights(
+    mtp_file: Path,
+    config: dict[str, Any],
+    *,
+    prequantized: bool = False,
+) -> dict[str, Any]:
+    import mlx.core as mx
+
+    raw = mx.load(str(mtp_file))
+    raw_mtp = {_strip_mtp_namespace(k): v for k, v in raw.items() if is_mtp_key(k)}
+    del raw
+    return _finalize_mtp_weights(raw_mtp, config, prequantized=prequantized)
+
+
+def _safetensors_runtime_framework() -> str:
+    try:
+        import mlx.core  # noqa: F401 - registers mlx.core for safetensors.
+
+        return "mlx"
+    except Exception:
+        return "np"
+
+
+def _mtp_file_keys(mtp_file: Path) -> tuple[str, ...]:
+    try:
+        from safetensors import safe_open
+
+        with safe_open(str(mtp_file), framework=_safetensors_runtime_framework()) as handle:
+            return tuple(sorted(str(key) for key in handle.keys()))
+    except Exception:
+        try:
+            import mlx.core as mx
+
+            raw = mx.load(str(mtp_file))
+            keys = tuple(sorted(str(key) for key in raw.keys()))
+            del raw
+            return keys
+        except Exception:
+            return ()
+
+
+def _embedded_mtp_weight_map(model_path: Path) -> dict[str, Path]:
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            weight_map = json.loads(index_path.read_text(encoding="utf-8")).get("weight_map", {})
+        except Exception:
+            weight_map = {}
+        return {
+            str(key): model_path / str(rel)
+            for key, rel in weight_map.items()
+            if is_mtp_key(str(key))
+        }
+
+    from safetensors import safe_open
+
+    result: dict[str, Path] = {}
+    framework = _safetensors_runtime_framework()
+    for shard in sorted(model_path.glob("model*.safetensors")):
+        with safe_open(str(shard), framework=framework) as handle:
+            for key in handle.offset_keys():
+                if is_mtp_key(str(key)):
+                    result[str(key)] = shard
+    return result
+
+
+def _load_embedded_mtp_weights(
+    model_path: Path,
+    config: dict[str, Any],
+    *,
+    prequantized: bool = False,
+) -> dict[str, Any]:
+    from safetensors import safe_open
+
+    key_to_file = _embedded_mtp_weight_map(model_path)
+    if not key_to_file:
+        return {}
+
+    raw_mtp: dict[str, Any] = {}
+    files: dict[Path, list[str]] = {}
+    for key, shard in key_to_file.items():
+        files.setdefault(shard, []).append(key)
+
+    framework = _safetensors_runtime_framework()
+    for shard, keys in files.items():
+        with safe_open(str(shard), framework=framework) as handle:
+            for key in sorted(keys):
+                raw_mtp[_strip_mtp_namespace(key)] = handle.get_tensor(key)
+
+    return _finalize_mtp_weights(raw_mtp, config, prequantized=prequantized)
 
 
 def inject_mtp_support(
@@ -187,9 +318,31 @@ def inject_mtp_support(
 
     model_path = Path(model_path)
     mtp_file = expected_mtp_file(model_path, config)
-    if not mtp_file.exists():
-        logger.warning("[MTP inject] MTP weights not found: %s", mtp_file)
-        return False
+    mtp_weights: dict[str, Any] | None = None
+    mtp_source = mtp_file
+    if mtp_file.exists():
+        contract = _mtp_contract_for_weight_keys(contract, _mtp_file_keys(mtp_file), config)
+        mtp_weights = _load_mtp_weights(
+            mtp_file,
+            config,
+            prequantized=contract.mtp_prequantized,
+        )
+    else:
+        embedded_weight_map = _embedded_mtp_weight_map(model_path)
+        contract = _mtp_contract_for_weight_keys(
+            contract,
+            tuple(embedded_weight_map),
+            config,
+        )
+        mtp_weights = _load_embedded_mtp_weights(
+            model_path,
+            config,
+            prequantized=contract.mtp_prequantized,
+        )
+        mtp_source = model_path / "model*.safetensors::embedded-mtp"
+        if not mtp_weights:
+            logger.warning("[MTP inject] MTP weights not found: %s", mtp_file)
+            return False
 
     tcfg = text_config(config)
     text_model = _text_model(model)
@@ -211,11 +364,6 @@ def inject_mtp_support(
     mtp = _MTPModule(args, n_layers)
     if contract.mtp_prequantized:
         _quantize_mtp_module(mtp, contract)
-    mtp_weights = _load_mtp_weights(
-        mtp_file,
-        config,
-        prequantized=contract.mtp_prequantized,
-    )
     mtp.load_weights(list(mtp_weights.items()), strict=False)
     if not contract.mtp_prequantized:
         _quantize_mtp_module(mtp, contract)
@@ -501,7 +649,7 @@ def inject_mtp_support(
 
         model.__class__ = _MTPLXOuterModel
 
-    logger.info("[MTP inject] Loaded %d tensors from %s", len(mtp_weights), mtp_file)
+    logger.info("[MTP inject] Loaded %d tensors from %s", len(mtp_weights), mtp_source)
     return True
 
 

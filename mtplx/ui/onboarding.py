@@ -19,13 +19,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from mtplx.profiles import DEFAULT_HF_MODEL_ID
+from mtplx.constants import (
+    EXPECTED_ALL_PREQUANTIZED_MTP_KEYS,
+    EXPECTED_MTP_KEYS,
+    EXPECTED_PREQUANTIZED_MTP_KEYS,
+)
+from mtplx.profiles import DEFAULT_HF_MODEL_ID, DEFAULT_MODEL_ID
 
 DEFAULT_HF_MODEL = DEFAULT_HF_MODEL_ID
+DEFAULT_LOCAL_MODEL = DEFAULT_MODEL_ID
 STATE_PATH = Path("~/.mtplx/quickstart.json").expanduser()
-LOCAL_SCAN_TIMEOUT_S = 3.0
-LOCAL_SCAN_CLASSIFY_TIMEOUT_S = 4.0
-_HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+# Tier ranks for sorting scanned-model lists. Lower = surfaced higher in the
+# picker. The intent is "verified first, runnable next, blocked last" so the
+# user never has to scroll past unsupported entries to find a launchable one.
 _TIER_RANK: dict[str, int] = {
     "verified": 0,
     "arch-compatible": 1,
@@ -37,24 +44,67 @@ _TIER_RANK: dict[str, int] = {
     "incompatible": 7,
     "unknown": 8,
 }
+LOCAL_SCAN_TIMEOUT_S = 3.0
+LOCAL_SCAN_CLASSIFY_TIMEOUT_S = 4.0
+_HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 def _pretty_path(value: str | Path | None) -> str:
-    """Render a filesystem path with the user's home directory collapsed."""
+    """Render a filesystem path with the user's home directory collapsed to ``~``.
+
+    Returns the input unchanged when it isn't path-shaped (HF refs like
+    ``namespace/name``) or when it doesn't live under ``$HOME``. The point is
+    to stop the UI from screaming ``/Users/<me>/...`` at users who reasonably
+    expect a portable product.
+    """
 
     if value is None:
         return ""
     text = str(value)
     if not text:
         return ""
-    if "://" in text:
+    # Heuristic: an HF repo ref is exactly ``namespace/name`` with no leading
+    # path indicator. Don't try to munge those.
+    if not text.startswith(("/", "~", "./", "../")):
         return text
     try:
         path = Path(text).expanduser()
         home = Path.home()
-        return "~/" + str(path.relative_to(home)) if path.is_absolute() else text
+        try:
+            rel = path.relative_to(home)
+        except ValueError:
+            return text
+        rel_str = str(rel)
+        if rel_str in {"", "."}:
+            return "~"
+        return f"~/{rel_str}"
     except Exception:
         return text
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _default_local_model_path() -> Path:
+    local = Path(DEFAULT_LOCAL_MODEL).expanduser()
+    if local.is_absolute():
+        return local
+    return (_repo_root() / local).resolve()
+
+
+def _verified_default_model() -> str:
+    local = _default_local_model_path()
+    if _is_model_dir(local):
+        return str(local)
+    return DEFAULT_HF_MODEL
+
+
+def _verified_default_label() -> str:
+    model = _verified_default_model()
+    if model == DEFAULT_HF_MODEL:
+        return f"{DEFAULT_HF_MODEL}  ·  cold-speed champion"
+    return f"{_pretty_path(model)}  ·  local speed champion"
 
 
 # ---------- state file ------------------------------------------------------
@@ -94,6 +144,15 @@ def save_state(state: dict) -> None:
 # ---------- local-folder scanning ------------------------------------------
 @dataclass(frozen=True)
 class ScannedModel:
+    """A model directory found while walking a user-supplied folder.
+
+    ``tier`` is the normalized compatibility verdict, one of
+    ``verified`` / ``arch-compatible`` / ``needs-verification`` /
+    ``mtp-invalid`` / ``mtp-missing`` / ``backend-pending`` / ``no-mtp`` /
+    ``incompatible`` / ``unknown``. The display layer turns it into a coloured
+    badge. ``arch-compatible`` means launchable, not merely recognized.
+    """
+
     path: Path
     tier: str
     arch_id: str | None
@@ -105,6 +164,10 @@ def _is_model_dir(path: Path) -> bool:
     return (path / "config.json").is_file()
 
 
+# Folder names that are known to be internal/auxiliary and not worth recursing
+# into. ``blobs`` and ``refs`` are part of the HuggingFace cache layout where
+# only ``snapshots/<commit>/`` contains model files; the rest are common
+# project clutter.
 _SKIP_DIRS: frozenset[str] = frozenset(
     {
         ".git",
@@ -125,6 +188,24 @@ def _scan_for_models(
     cap: int = 200,
     timeout_s: float = LOCAL_SCAN_TIMEOUT_S,
 ) -> list[Path]:
+    """Walk ``root`` and return all directories containing ``config.json``.
+
+    The user can point us at three kinds of paths:
+
+    * A single model directory (e.g. ``~/models/Qwen-7B/``) — returns
+      ``[root]`` immediately.
+    * A flat parent of model directories (e.g. ``~/models/``) — returns each
+      child that has a ``config.json``.
+    * A nested layout like LM Studio (``<root>/<publisher>/<model>/``) or the
+      HuggingFace cache (``<root>/models--*/snapshots/<hash>/``). We descend
+      up to ``max_depth`` levels and stop at the first ``config.json`` on each
+      branch so we don't double-count.
+
+    ``cap`` bounds the result list so a misdirected scan into ``$HOME`` can't
+    produce a 10k-line picker. ``timeout_s`` keeps parent-folder scans from
+    making first-run setup feel dead on slow external/cloud-backed folders.
+    """
+
     if _is_model_dir(root):
         return [root]
 
@@ -149,6 +230,9 @@ def _scan_for_models(
             name = child.name
             if name in _SKIP_DIRS:
                 continue
+            # Hidden directories below the root are noise (``.DS_Store``,
+            # ``.huggingface``). The root itself is allowed to be hidden — that
+            # is how ``~/.lmstudio/models`` works.
             if name.startswith(".") and depth >= 0:
                 continue
             if _is_model_dir(child):
@@ -158,6 +242,29 @@ def _scan_for_models(
 
     _walk(root, 0)
     return results
+
+
+def _expected_embedded_mtp_keys(config: dict[str, Any]) -> set[str]:
+    mtp_quant = config.get("mtplx_mtp_quantization", {})
+    prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
+    quant_policy = str(mtp_quant.get("policy") or "") if isinstance(mtp_quant, dict) else ""
+    if prequantized and quant_policy == "all":
+        return set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS)
+    if prequantized:
+        return set(EXPECTED_PREQUANTIZED_MTP_KEYS)
+    return set(EXPECTED_MTP_KEYS)
+
+
+def _is_mtp_weight_key(key: str) -> bool:
+    text = str(key)
+    return text.startswith("mtp.") or text.startswith("language_model.mtp.")
+
+
+def _normalize_mtp_weight_key(key: str) -> str:
+    text = str(key)
+    if text.startswith("language_model.mtp."):
+        return "mtp." + text[len("language_model.mtp.") :]
+    return text
 
 
 def _scan_mtp_sidecar_exists(model_dir: Path, config: dict[str, Any]) -> bool:
@@ -186,17 +293,48 @@ def _scan_embedded_mtp_keys(model_dir: Path) -> tuple[str, ...]:
     weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
     if not isinstance(weight_map, dict):
         return ()
-    return tuple(sorted(str(key) for key in weight_map if str(key).startswith("mtp.")))
+    return tuple(
+        sorted(_normalize_mtp_weight_key(str(key)) for key in weight_map if _is_mtp_weight_key(str(key)))
+    )
 
 
 def _classify_scanned_model(model_dir: Path) -> ScannedModel:
+    """Bucket a model directory into our four-tier compatibility model from
+    config.json alone — never mmap any safetensors file.
+
+    The scanner runs over arbitrary user folders (LM Studio caches, HF caches,
+    half-downloaded directories) and at least one of those models is allowed
+    to be partially evicted, broken, or APFS-dataless without crashing the
+    whole picker. ``inspect_model`` mmaps ``mtp.safetensors`` to count tensors
+    — a SIGBUS on that mmap kills the Python process and there is nothing
+    Python-level can catch. So for the picker we synthesize a minimal stub
+    inspection and run it through the same ``compatibility_for_inspection``
+    verdict logic the rest of the runtime uses. The runtime layer does the
+    full mmap when the user actually picks a model and produces a precise
+    error there if the artifact is broken.
+    """
+
     config_path = model_dir / "config.json"
     if not config_path.is_file():
-        return ScannedModel(model_dir, "incompatible", None, None, "missing config.json")
+        return ScannedModel(
+            path=model_dir,
+            tier="incompatible",
+            arch_id=None,
+            architecture=None,
+            error="missing config.json",
+        )
+
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        raw = config_path.read_text(encoding="utf-8")
+        config = json.loads(raw)
     except Exception as exc:
-        return ScannedModel(model_dir, "unknown", None, None, str(exc)[:80])
+        return ScannedModel(
+            path=model_dir,
+            tier="unknown",
+            arch_id=None,
+            architecture=None,
+            error=str(exc)[:80],
+        )
 
     tcfg = config.get("text_config", config) if isinstance(config, dict) else {}
     archs = (
@@ -209,9 +347,9 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
         config.get("model_type") if isinstance(config, dict) else None
     )
 
-    def _maybe_int(value: Any) -> int:
+    def _maybe_int(v: Any) -> int:
         try:
-            return int(value or 0)
+            return int(v or 0)
         except (TypeError, ValueError):
             return 0
 
@@ -223,6 +361,7 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
         _maybe_int(config.get("num_mtp_modules")) if isinstance(config, dict) else 0,
     )
 
+    # Runtime contract is a small JSON file — safe to read.
     contract_path = model_dir / "mtplx_runtime.json"
     runtime_contract_data: dict | None = None
     runtime_contract_error: str | None = None
@@ -232,19 +371,25 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
         except Exception as exc:
             runtime_contract_error = str(exc)[:80]
 
+    # List ``model*.safetensors`` filenames without reading tensor data, so the
+    # non-Qwen verified-runtime gate has the file presence it expects.
     try:
         model_files = tuple(sorted(p.name for p in model_dir.glob("model*.safetensors")))
     except OSError:
         model_files = ()
     sidecar_exists = _scan_mtp_sidecar_exists(model_dir, config if isinstance(config, dict) else {})
     embedded_mtp_keys = _scan_embedded_mtp_keys(model_dir)
+    expected_embedded = _expected_embedded_mtp_keys(config if isinstance(config, dict) else {})
+    embedded_gate = bool(embedded_mtp_keys) and set(embedded_mtp_keys) == expected_embedded
     mtp_artifact_exists = sidecar_exists or bool(embedded_mtp_keys)
+    mtp_tensor_gate = sidecar_exists or embedded_gate
 
     class _StubMTP:
-        # Picker-level evidence only. The runtime still validates the sidecar
-        # header and exact key layout before loading.
+        # Never mmap safetensors here. Sidecar presence or complete embedded
+        # ``mtp.*`` keys are enough for picker-level "can try this" UX; the
+        # runtime still performs the full tensor gate before loading.
         exists = mtp_artifact_exists
-        passes_tensor_gate = mtp_artifact_exists
+        passes_tensor_gate = mtp_tensor_gate
 
     class _StubInspection:
         pass
@@ -261,11 +406,33 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
     stub.runtime_contract_path = str(contract_path) if contract_path.is_file() else None
 
     try:
-        from mtplx.backends.registry import SUPPORTED_ARCH_IDS, compatibility_for_inspection
+        from mtplx.backends.registry import compatibility_for_inspection
+    except Exception as exc:
+        return ScannedModel(
+            path=model_dir,
+            tier="unknown",
+            arch_id=None,
+            architecture=architecture,
+            error=str(exc)[:80],
+        )
 
+    try:
         verdict = compatibility_for_inspection(stub)
     except Exception as exc:
-        return ScannedModel(model_dir, "unknown", None, architecture, str(exc)[:80])
+        return ScannedModel(
+            path=model_dir,
+            tier="unknown",
+            arch_id=None,
+            architecture=architecture,
+            error=str(exc)[:80],
+        )
+
+    # Resolve the supported-arch set lazily so missing the import doesn't
+    # crash the picker — the unknown bucket is fine in that pathological case.
+    try:
+        from mtplx.backends.registry import SUPPORTED_ARCH_IDS as _SUPPORTED
+    except Exception:
+        _SUPPORTED = set()
 
     raw_tier = verdict.tier
     runtime_status = verdict.runtime_compatibility
@@ -275,10 +442,17 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
     elif verdict.can_run or raw_tier == "family-compatible-unverified":
         tier = "arch-compatible"
     elif raw_tier == "architecture-compatible-but-unverified":
+        # The picker's safety pass deliberately skips the safetensors mmap
+        # that the runtime's verified gate needs for ``qwen3-next-mtp``. To
+        # avoid showing the flagship as "Compatible (unverified)" in the
+        # picker when it has a blessed ``mtplx_runtime.json`` we trust the
+        # contract: contract present + parsed cleanly + arch in our supported
+        # set ⇒ label as verified. The runtime layer still runs the full
+        # tensor check before any model actually loads.
         if (
             verdict.runtime_contract is not None
             and verdict.arch_id is not None
-            and verdict.arch_id in SUPPORTED_ARCH_IDS
+            and verdict.arch_id in _SUPPORTED
             and runtime_contract_error is None
         ):
             tier = "verified"
@@ -301,10 +475,17 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
     else:
         tier = "unknown"
 
-    return ScannedModel(model_dir, tier, verdict.arch_id, architecture)
+    return ScannedModel(
+        path=model_dir,
+        tier=tier,
+        arch_id=verdict.arch_id,
+        architecture=architecture,
+    )
 
 
 def _tier_badge(tier: str) -> tuple[str, str]:
+    """Return ``(label, rich_style)`` for a compatibility tier."""
+
     if tier == "verified":
         return ("Verified", "bold green")
     if tier == "arch-compatible":
@@ -328,6 +509,13 @@ def _scanned_model_options(
     models: list[ScannedModel],
     root: Path,
 ) -> list[tuple[str, str, str]]:
+    """Convert scanned-model entries into ``(key, headline, subline)`` tuples
+    suitable for ``_choice_panel``.
+
+    Display path is rendered relative to ``root`` so the panel doesn't show
+    the whole ``/Users/<me>/...`` prefix on every line.
+    """
+
     options: list[tuple[str, str, str]] = []
     for index, model in enumerate(models, start=1):
         try:
@@ -336,7 +524,10 @@ def _scanned_model_options(
             display_name = _pretty_path(model.path)
         badge, _ = _tier_badge(model.tier)
         arch = model.architecture or model.arch_id or "unknown architecture"
-        subline = f"{badge}  ·  {model.error[:80]}" if model.error else f"{badge}  ·  {arch}"
+        if model.error:
+            subline = f"{badge}  ·  {model.error[:80]}"
+        else:
+            subline = f"{badge}  ·  {arch}"
         options.append((str(index), display_name, subline))
     return options
 
@@ -566,6 +757,7 @@ def _print_welcome() -> None:
 
 
 def _print_summary(state: dict) -> None:
+    model_display = _pretty_path(state.get("model")) or "?"
     try:
         from rich.panel import Panel
         from rich.table import Table
@@ -573,18 +765,27 @@ def _print_summary(state: dict) -> None:
     except ImportError:
         print()
         print("  Your quickstart configuration:")
-        print(f"    Model:     {state.get('model', '?')}")
+        print(f"    Model:     {model_display}")
         print(f"    Mode:      {mode_label(state)}")
         print(f"    Interface: {interface_label(state.get('target'))}")
         print()
         return
     console = _console()
     if console is None:
+        # Don't silently swallow the summary when rich is installed but
+        # ``Console()`` couldn't initialize (no tty, weird stdout, etc.) —
+        # fall back to the same plain-stdout layout as the import-fail path.
+        print()
+        print("  Your quickstart configuration:")
+        print(f"    Model:     {model_display}")
+        print(f"    Mode:      {mode_label(state)}")
+        print(f"    Interface: {interface_label(state.get('target'))}")
+        print()
         return
     table = Table.grid(padding=(0, 2))
     table.add_column(style="dim", justify="right", no_wrap=True)
     table.add_column(no_wrap=False)
-    table.add_row("Model", str(state.get("model", "?")))
+    table.add_row("Model", model_display)
     table.add_row("Mode", mode_label(state))
     table.add_row("Interface", interface_label(state.get("target")))
     panel = Panel(
@@ -605,11 +806,17 @@ def screen_model(*, configured: str | None = None) -> str:
     """Render screen 1 and return the user's choice.
 
     If ``configured`` is set and differs from the canonical default, it is
-    surfaced as the first option (so accepting the default reuses the user's
-    already-resolved local path instead of forcing a re-download).
+    surfaced as the first option for deliberate reuse. Pressing Enter still
+    picks the current verified default, so stale saved configs cannot silently
+    keep an old model as the speed lane.
     """
 
-    show_configured = bool(configured) and configured != DEFAULT_HF_MODEL
+    verified_default = _verified_default_model()
+    verified_label = _verified_default_label()
+    show_configured = bool(configured) and str(configured) not in {
+        DEFAULT_HF_MODEL,
+        verified_default,
+    }
 
     options: list[tuple[str, str, str]] = []
     if show_configured:
@@ -617,14 +824,14 @@ def screen_model(*, configured: str | None = None) -> str:
             (
                 "1",
                 "Use your configured model",
-                str(configured),
+                _pretty_path(configured),
             )
         )
         options.append(
             (
                 "2",
                 "Verified default",
-                f"{DEFAULT_HF_MODEL} · cold-speed champion",
+                verified_label,
             )
         )
         options.append(
@@ -646,7 +853,7 @@ def screen_model(*, configured: str | None = None) -> str:
             (
                 "1",
                 "Verified default",
-                f"{DEFAULT_HF_MODEL} · cold-speed champion",
+                verified_label,
             )
         )
         options.append(
@@ -666,20 +873,20 @@ def screen_model(*, configured: str | None = None) -> str:
 
     _step_panel(step=1, total=3, title="Choose your model", options=options)
     valid_choices = [opt[0] for opt in options]
-    choice = _prompt_choice("Select", valid_choices, default="1")
+    choice = _prompt_choice("Select", valid_choices, default="2" if show_configured else "1")
 
     if show_configured:
         if choice == "1":
             return str(configured)
         if choice == "2":
-            return DEFAULT_HF_MODEL
+            return verified_default
         if choice == "3":
             return _prompt_hf_repo_id(default=DEFAULT_HF_MODEL)
         # choice == "4"
         return _pick_local_model(default=str(configured))
 
     if choice == "1":
-        return DEFAULT_HF_MODEL
+        return verified_default
     if choice == "2":
         return _prompt_hf_repo_id(default=DEFAULT_HF_MODEL)
     # choice == "3"
@@ -687,12 +894,20 @@ def screen_model(*, configured: str | None = None) -> str:
 
 
 def _pick_local_model(*, default: str | None) -> str:
+    """Ask for a local folder. If it isn't a model directory itself, scan
+    inside it and present a numbered list of candidate models with their
+    four-tier compatibility verdict.
+
+    Loops until the user either picks a model, types Ctrl-C, or falls back
+    to the canonical HF default. Always returns a usable identifier.
+    """
+
     pretty_default = _pretty_path(default) if default else None
     while True:
         entered = _prompt_text("Local folder path", default=pretty_default)
         if not entered:
             print("  Path is required. Falling back to verified default.")
-            return DEFAULT_HF_MODEL
+            return _verified_default_model()
 
         root = Path(entered).expanduser().resolve()
         if not root.exists():
@@ -704,16 +919,22 @@ def _pick_local_model(*, default: str | None) -> str:
             print()
             continue
 
+        # Single-model case: no scanning needed, just return.
         if _is_model_dir(root):
             return str(root)
 
         chosen = _scan_and_pick(root)
         if chosen is None:
+            # User asked to retype the path — loop again.
             continue
         return chosen
 
 
 def _scan_and_pick(root: Path) -> str | None:
+    """Walk ``root`` for models, render the picker, and return the chosen
+    absolute path. ``None`` means the user wants to type a different folder.
+    """
+
     print(f"  Scanning {_pretty_path(root)} for model folders...")
     found = _scan_for_models(root)
     if found:
@@ -743,6 +964,7 @@ def _scan_and_pick(root: Path) -> str | None:
     cap = 24
     visible = classified[:cap]
     hidden = len(classified) - cap
+
     options = _scanned_model_options(visible, root)
     options.append(
         (
@@ -775,7 +997,9 @@ def _scan_and_pick(root: Path) -> str | None:
     )
 
     valid = [opt[0] for opt in options]
-    choice = _prompt_choice("Select", valid, default="1")
+    default_choice = "1" if visible else None
+    choice = _prompt_choice("Select", valid, default=default_choice)
+
     idx = int(choice) - 1
     if idx == len(visible):
         return None
@@ -785,12 +1009,13 @@ def _scan_and_pick(root: Path) -> str | None:
 def screen_mode() -> tuple[str, bool]:
     """Return (profile_name, max_mode_flag).
 
-    The consumer onboarding is speed-first:
+    Quickstart exposes the two speed-first product choices:
 
-      Medium : native-MTP speed path, Apple fan curve, burst not sustained
-      Max    : same path, ThermalForge pins fans at 100% for sustained speed
+      Medium : native-MTP speed path, no fan control, burst only
+      Max    : same native-MTP speed path, fans pinned 100% while running
 
-    Stable remains available through ``--profile stable`` / ``--profile safe``.
+    The Stable/safe profile remains available through explicit flags, but it
+    is no longer part of the default onboarding path.
     """
 
     _step_panel(
@@ -800,20 +1025,20 @@ def screen_mode() -> tuple[str, bool]:
         options=[
             (
                 "1",
-                "Medium  ·  native-MTP speed path, about 2.2x burst (not sustained)",
-                "Fast speculative path with Apple's default fan curve; snappy on short replies, slower on long hot runs.",
+                "Medium  ·  native-MTP speed path, ~2.2x burst (not sustained)",
+                "Uses the performance-cold profile: depth-3 speculative decode, capture-commit verify, linear-GDN tape verifier, optimized draft head/sampler when the model contract provides them. Fans stay on Apple's default curve.",
             ),
             (
                 "2",
-                "Max  ·  Medium path plus fans pinned at 100%, about 2.24x (loud)",
-                "Same runtime path as Medium, plus ThermalForge fan control to reduce long-reply slowdown.",
+                "Max  ·  Medium + fans pinned at 100%, ~2.24x (loud)",
+                "Same decoding path as Medium, plus ThermalForge pins the fans while MTPLX runs and restores them after shutdown. Needs ThermalForge installed.",
             ),
         ],
     )
     choice = _prompt_choice("Select", ["1", "2"], default="1")
-    if choice == "1":
-        return "performance-cold", False
-    return "performance-cold", True
+    if choice == "2":
+        return "performance-cold", True
+    return "performance-cold", False
 
 
 def screen_interface() -> str:
@@ -979,9 +1204,35 @@ def _print_install_result(result: dict) -> None:
 
 
 # ---------- top-level flow --------------------------------------------------
+def _quickstart_state_is_reusable(last: dict) -> bool:
+    """Return whether a saved state should be offered by Quickstart.
+
+    Stable/safe remains a supported explicit profile, but Quickstart no longer
+    advertises or reuses it as the default consumer path.
+    """
+
+    model = str(last.get("model") or "").strip()
+    target = str(last.get("target") or "")
+    if last.get("profile") != "performance-cold":
+        return False
+    if target not in {"openwebui", "open-webui", "web", "terminal", "cli"}:
+        return False
+    if not model or "\n" in model or "\r" in model:
+        return False
+    if model.startswith(("Last login:", "╭", "│", "╰")) or "Use the same configuration?" in model:
+        return False
+    if _hf_repo_id_error(model) is None:
+        return True
+    expanded = Path(model).expanduser()
+    if expanded.exists():
+        return True
+    return model.startswith(("/", "~", "./", "../", "models/"))
+
+
 def confirm_same_as_last(last: dict) -> bool:
     """Ask the user whether to reuse the last configuration."""
 
+    model_display = _pretty_path(last.get("model")) or "?"
     try:
         from rich.panel import Panel
         from rich.table import Table
@@ -989,7 +1240,7 @@ def confirm_same_as_last(last: dict) -> bool:
     except ImportError:
         print()
         print("  Last time you used:")
-        print(f"    Model:     {last.get('model', '?')}")
+        print(f"    Model:     {model_display}")
         print(f"    Mode:      {mode_label(last)}")
         print(f"    Interface: {interface_label(last.get('target'))}")
         print()
@@ -1000,7 +1251,7 @@ def confirm_same_as_last(last: dict) -> bool:
     if console is None:
         print()
         print("  Last time you used:")
-        print(f"    Model:     {last.get('model', '?')}")
+        print(f"    Model:     {model_display}")
         print(f"    Mode:      {mode_label(last)}")
         print(f"    Interface: {interface_label(last.get('target'))}")
         print()
@@ -1010,7 +1261,7 @@ def confirm_same_as_last(last: dict) -> bool:
     table = Table.grid(padding=(0, 2))
     table.add_column(style="dim", justify="right", no_wrap=True)
     table.add_column(no_wrap=False)
-    table.add_row("Model", str(last.get("model", "?")))
+    table.add_row("Model", model_display)
     table.add_row("Mode", mode_label(last))
     table.add_row("Interface", interface_label(last.get("target")))
     panel = Panel(
@@ -1026,14 +1277,6 @@ def confirm_same_as_last(last: dict) -> bool:
     console.print()
     answer = input("  Use the same configuration? [Y/n] ").strip().lower()
     return answer in {"", "y", "yes", "same"}
-
-
-def _quickstart_state_is_reusable(last: dict | None) -> bool:
-    if not isinstance(last, dict):
-        return False
-    # Stable/safe remains available by explicit flag, but old saved states
-    # should not keep showing it in the speed-first onboarding path.
-    return str(last.get("profile") or "") == "performance-cold"
 
 
 def run_quickstart_flow(
@@ -1053,7 +1296,7 @@ def run_quickstart_flow(
     """
 
     last = None if fresh else load_state()
-    if not _quickstart_state_is_reusable(last):
+    if last is not None and not _quickstart_state_is_reusable(last):
         last = None
     try:
         if last and not fresh:
@@ -1082,13 +1325,13 @@ def run_quickstart_flow(
 
 # ---------- label helpers ---------------------------------------------------
 def mode_label(state: dict) -> str:
-    profile = state.get("profile", "performance-cold")
+    profile = state.get("profile", "safe")
     if state.get("max"):
-        return "Max  ·  Medium path plus fans pinned at 100%, ~2.24x"
+        return "Max  ·  Medium path + fans pinned at 100%  ·  ~2.24x"
     if profile == "performance-cold":
-        return "Medium  ·  native-MTP speed path, ~2.2x burst (not sustained)"
-    if profile == "stable":
-        return "Stable  ·  exact/staged long-reply path"
+        return "Medium  ·  native-MTP speed path  ·  ~2.2x burst (not sustained)"
+    if profile in {"safe", "stable"}:
+        return "Stable  ·  long-reply exact/staged path  ·  no fan control"
     return str(profile)
 
 
