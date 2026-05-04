@@ -48,6 +48,8 @@ That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MT
 - **Real serving surface.** OpenAI-compatible `/v1/chat/completions` + `/v1/completions` + `/v1/models`, Anthropic-compatible `/v1/messages` (streaming SSE), `/health`, `/metrics`. Plug it into Open WebUI, Claude Code, Cline, Continue, or anything that speaks OpenAI.
 - **In-browser chat UI** with auto-detected model context (256k for Qwen3.6), live tokens-per-second, markdown rendering, code-block copy buttons, a stop button, and a settings sidebar that persists per-machine.
 - **Interactive start wizard.** Pick model, mode, and surface in three numbered prompts. Returning users get "same as last time?". No flag-soup required.
+- **Local-folder model picker.** Point the wizard at any parent directory — your `~/models/`, the LM Studio cache, the HuggingFace cache — and it walks the tree, classifies each model into the four-tier compatibility contract, and presents a numbered picker. Config-only classification, never mmaps a tensor file, so a single APFS-dataless or partial download in the tree can't crash the picker.
+- **One-line live download progress.** Single rich-rendered line with bar / percent / GB / speed / ETA, streamed at 8 fps. HuggingFace's tqdm bars are suppressed during the download so they don't fight the MTPLX UI for terminal real estate.
 - **Honest profile names that tell you what they do.**
   - `Medium` — default native-MTP speed path (`performance-cold`), about 2.2× burst over the same model with MTP off, not sustained without fan control.
   - `Max` — Medium + ThermalForge fans pinned at 100%, about 2.24× in the measured speed lane, loud by design.
@@ -56,7 +58,7 @@ That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MT
 - **Idle-aware Max mode.** Server tracks request activity; after 15 minutes of no chat, fans drop to auto, then ramp back up on the next message.
 - **Four-tier model compatibility contract.** `mtplx inspect <model>` reports: verified / arch-compatible-unverified / incompatible-architecture / no-MTP. No silent garbage runs.
 - **Lazy imports.** `mtplx --help`, `doctor`, `inspect`, `init`, `setup` work on a fresh venv *without MLX installed*. Generation and serving pull in MLX only when needed.
-- **Preview status: 354-test suite green**, including end-to-end onboarding, fan-control crash safety, OpenAI server fake-state, lazy-import survival, exactness gates.
+- **Preview status: 562-test suite green**, including end-to-end onboarding, local-folder picker, live download progress, fan-control crash safety, OpenAI server fake-state, lazy-import survival, exactness gates.
 
 > **Preview honesty.** The cold path is verified at 60+ tok/s. *Sustained* no-fan long-context throughput is currently ~37 tok/s on Flappy 10k versus a ≥50 tok/s target — the v0.1 release ships with this gap explicit. Closing it is the v0.2 deliverable; see [Roadmap](#roadmap).
 
@@ -208,35 +210,77 @@ Every command has `--json` for machine-readable output and `--help` for context-
 
 ## Architecture
 
+The architectural achievement is **a single-model native-MTP runtime that's mathematically exact at temperature**, with a real serving surface bolted on. There is no second drafter, no greedy hack, and no "drop in a fast-decode library" wrapper. Three layers, drawn the way they actually run.
+
+### 1. Single-model runtime
+
+The target model and the drafter are the **same checkpoint**. Qwen3.6-27B ships native MTP heads; MTPLX uses them as the speculative drafter. Zero RAM cost for a second model, zero distillation, zero "we trained a drafter" handoff. The trunk's KV cache obeys a **committed-history contract** (verified against the vLLM CUDA reference at cosine > 0.9998 through D5) so recursive draft depth holds together — that's what lets D2/D3/D4 acceptance reach the 90s instead of collapsing.
+
+```mermaid
+flowchart LR
+    subgraph TGT["Target model · Qwen3.6-27B (single checkpoint)"]
+        TRUNK["Trunk · 64 layers (48 GDN + 16 full-attn)<br/>committed-history KV cache"]
+        HEAD["Built-in MTP heads · recursive depth K=3 default"]
+        TRUNK -.shares hidden states.-> HEAD
+    end
+```
+
+### 2. Speculative cycle (the hot loop)
+
+Per cycle: the MTP head drafts K tokens, the target verifies all K in parallel via one batched forward, **probability-ratio acceptance** (Leviathan–Chen) decides per-position, **residual correction `(p − q)+`** emits a clean replacement on rejection, and a **bonus token** falls out for free when all K accept. Verify cost is paid by `capture_commit` + the `linear-gdn-from-conv-tape` GDN kernel + a **GraphBank** of compiled verify shapes; the math is exact at any temperature.
+
+```mermaid
+flowchart LR
+    DRAFT["MTP head drafts q₁..q_K<br/>+ proposal probabilities"] --> VERIFY
+    VERIFY["Target batched verify forward<br/>capture-commit · linear-gdn-from-conv-tape · GraphBank"] --> ACCEPT
+    ACCEPT["Probability-ratio acceptance<br/>(Leviathan–Chen at any T)"] -->|all K accepted| BONUS
+    ACCEPT -->|rejected at i| CORR
+    BONUS["Bonus token at K+1 (free)"] --> COMMIT
+    CORR["Residual (p − q)+ token at i"] --> COMMIT
+    COMMIT["Committed-history KV writeback"] -->|next cycle| DRAFT
+```
+
+### 3. Serving stack
+
+The runtime is wrapped in a real serving surface so you can point Open WebUI / Claude Code / Cline / Continue / `curl` / `openai-python` / `anthropic-python` at it. **Engine sessions** keep per-chat state; the **Session Bank** preserves warm-prefix exact state across turns (verified `logits_max_abs_diff = 0.0` against fresh forwards) so multi-turn TTFT doesn't collapse the way a stateless shim would.
+
 ```mermaid
 flowchart TB
-    cli["CLI surface<br/>start · quickstart · run · chat · serve · bench · inspect · init · setup · max"]
-    onboarding["Onboarding wizard<br/>~/.mtplx/quickstart.json"]
-    profiles["Profiles<br/>stable/safe · performance-cold · exact · max-diagnostic"]
-    speculative["Speculative sampling<br/>p/q acceptance + residual correction"]
-    registry["Architecture registry<br/>4-tier compatibility contract"]
-    backends["MTP backends<br/>Qwen3-Next (verified) · DeepSeek V3 · GLM · MiMo (registered)"]
-    servers["OpenAI-compatible server<br/>+ Anthropic /v1/messages translator"]
-    sessions["Session bank<br/>cache reuse across turns"]
-    webui["In-browser chat UI<br/>auto-context, live TPS, markdown"]
-    thermal["Thermal control<br/>ThermalForge auto-install + crash-safe sidecar"]
-
-    cli --> onboarding
-    cli --> profiles
-    profiles --> speculative
-    speculative --> registry
-    registry --> backends
-    cli --> servers
-    servers --> sessions
-    servers --> webui
-    cli --> thermal
+    subgraph CLIENTS["Clients"]
+        BR["Browser chat<br/>127.0.0.1:8000"]
+        OW["Open WebUI · Cline · Claude Code · Continue"]
+        CURL["curl · openai-python · anthropic-python"]
+        TERM["Terminal chat (mtplx start cli)"]
+    end
+    subgraph API["FastAPI server"]
+        OAI["/v1/chat/completions · /v1/completions · /v1/models"]
+        ANT["/v1/messages (Anthropic SSE translator)"]
+        OBS["/health · /metrics"]
+    end
+    subgraph ENG["Engine layer"]
+        SESS["Engine sessions (per-chat context + cache)"]
+        BANK["Session bank · warm-prefix exact-state reuse"]
+    end
+    BR --> OAI
+    OW --> OAI
+    OW --> ANT
+    CURL --> OAI
+    CURL --> ANT
+    TERM --> ENG
+    OAI --> SESS
+    ANT --> SESS
+    SESS --> BANK
+    BANK -->|drives| RUNTIME["Native-MTP runtime (cycle above)"]
+    OBS --- ENG
 ```
+
+The CLI (`mtplx start` / `pull` / `doctor` / `inspect` / `max`) is the on-ramp to all of the above and not the architectural story — it lazy-imports MLX so `--help`, `doctor`, `inspect`, `init`, `setup` work on a fresh venv with no GPU/Apple-Silicon stack installed.
 
 ---
 
 ## Roadmap
 
-**v0.1.0-preview.1 (today).** Verified Qwen3-Next-MTP cold path, OpenAI/Anthropic-compatible serving, in-browser chat, interactive `mtplx start` wizard, four-tier compatibility, crash-safe Max mode, lazy-import CLI surface, 354-test suite green.
+**v0.1.0-preview.1 (today).** Verified Qwen3-Next-MTP cold path, OpenAI/Anthropic-compatible serving, in-browser chat, interactive `mtplx start` wizard with local-folder model picker and one-line live download progress, four-tier compatibility, crash-safe Max mode, lazy-import CLI surface, 562-test suite green.
 
 **v0.2 — sustained throughput.** Diagnostic-gated kernel ladder targeting `last64/first64 ≥ 0.90` no-fan on 10k generations while preserving the 60 tok/s class. Mechanism-driven: lazy-graph severance + output narrowing if graph history is the bottleneck; MLX-primitive-registered cache-update + `mx.compile` if dispatch tax dominates; an owned GDN+MLP verify-cycle kernel via `mx.fast.metal_kernel` only if the cheaper paths don't close the gap.
 
