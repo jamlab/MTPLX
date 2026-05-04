@@ -5,16 +5,18 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from mtplx.artifacts import _hf_repo_id_from_ref
 from mtplx.profiles import DEFAULT_PROFILE_NAME
 
 
 DEFAULT_MODEL_CACHE = Path("~/.mtplx/models").expanduser()
+DownloadProgressCallback = Callable[[dict[str, Any]], None]
 REQUIRED_MTPLX_MODEL_FILES = (
     "config.json",
     "tokenizer.json",
@@ -150,6 +152,53 @@ def directory_size_bytes(path: Path) -> int:
     return total
 
 
+def _emit_download_progress(callback: DownloadProgressCallback | None, payload: dict[str, Any]) -> None:
+    if callback is None:
+        return
+    try:
+        callback(payload)
+    except Exception:
+        # Progress reporting must never break a model download.
+        return
+
+
+def _start_download_heartbeat(
+    destination: Path,
+    *,
+    callback: DownloadProgressCallback | None,
+    interval_s: float,
+) -> tuple[threading.Event | None, threading.Thread | None]:
+    if callback is None or interval_s <= 0:
+        return None, None
+
+    stop = threading.Event()
+    started_at = time.monotonic()
+    last_at = started_at
+    last_size = directory_size_bytes(destination)
+
+    def run() -> None:
+        nonlocal last_at, last_size
+        while not stop.wait(interval_s):
+            now = time.monotonic()
+            current_size = directory_size_bytes(destination)
+            delta = current_size - last_size
+            payload = {
+                "event": "progress",
+                "path": str(destination),
+                "size_bytes": current_size,
+                "delta_bytes": delta,
+                "elapsed_s": now - started_at,
+                "interval_s": now - last_at,
+            }
+            last_at = now
+            last_size = current_size
+            _emit_download_progress(callback, payload)
+
+    thread = threading.Thread(target=run, name="mtplx-download-heartbeat", daemon=True)
+    thread.start()
+    return stop, thread
+
+
 @dataclass(frozen=True)
 class CachedModel:
     repo_id: str
@@ -200,6 +249,8 @@ def pull_model(
     *,
     cache_dir: str | Path | None = None,
     revision: str | None = None,
+    progress_callback: DownloadProgressCallback | None = None,
+    progress_interval_s: float = 10.0,
 ) -> dict[str, Any]:
     repo_id = repo_id_from_model_ref(model_ref)
     if repo_id is None:
@@ -213,9 +264,11 @@ def pull_model(
     except Exception as exc:
         raise RuntimeError(f"huggingface_hub is required for mtplx pull: {exc}") from exc
 
-    if destination.exists():
+    started_size = directory_size_bytes(destination)
+    if destination.exists() and cached_model_is_complete(destination):
         resolved = destination
         reused_existing = True
+        resumed_existing = False
         validation = validate_mtplx_model_files(resolved)
         if repo_id.lower().startswith("youssofal/qwen3.6-27b-mtplx") and not validation["ok"]:
             raise RuntimeError(
@@ -224,34 +277,64 @@ def pull_model(
             )
     else:
         reused_existing = False
-        tmp_parent = root / ".tmp"
-        tmp_parent.mkdir(parents=True, exist_ok=True)
-        tmp_dir = Path(tempfile.mkdtemp(prefix=safe_model_name(repo_id) + "-", dir=str(tmp_parent)))
+        resumed_existing = destination.exists() and started_size > 0
+        destination.mkdir(parents=True, exist_ok=True)
+        _emit_download_progress(
+            progress_callback,
+            {
+                "event": "resume" if resumed_existing else "start",
+                "repo_id": repo_id,
+                "path": str(destination),
+                "size_bytes": started_size,
+            },
+        )
+        stop, thread = _start_download_heartbeat(
+            destination,
+            callback=progress_callback,
+            interval_s=progress_interval_s,
+        )
         try:
             path = snapshot_download(
                 repo_id=repo_id,
                 repo_type="model",
                 revision=revision,
-                local_dir=str(tmp_dir),
+                local_dir=str(destination),
             )
-            resolved_tmp = Path(path)
-            validation = validate_mtplx_model_files(resolved_tmp)
+            resolved = Path(path)
+            validation = validate_mtplx_model_files(resolved)
+            if not cached_model_is_complete(resolved):
+                raise RuntimeError(
+                    "downloaded model is incomplete: weight shards are missing or still partial"
+                )
             if repo_id.lower().startswith("youssofal/qwen3.6-27b-mtplx") and not validation["ok"]:
                 raise RuntimeError(
                     "downloaded MTPLX model is incomplete: "
                     + ", ".join(validation["missing_files"] or [str(validation.get("contract_error"))])
                 )
-            resolved_tmp.replace(destination)
-            resolved = destination
-        except Exception:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise
+        finally:
+            if stop is not None:
+                stop.set()
+            if thread is not None:
+                thread.join(timeout=1.0)
+        final_size = directory_size_bytes(resolved)
+        _emit_download_progress(
+            progress_callback,
+            {
+                "event": "complete",
+                "repo_id": repo_id,
+                "path": str(resolved),
+                "size_bytes": final_size,
+                "delta_bytes": final_size - started_size,
+            },
+        )
     return {
         "repo_id": repo_id,
         "path": str(resolved),
         "cache_dir": str(root),
         "revision": revision,
         "reused_existing": reused_existing,
+        "resumed_existing": resumed_existing,
+        "started_size_bytes": started_size,
         "size_bytes": directory_size_bytes(resolved),
         "has_runtime_contract": (resolved / "mtplx_runtime.json").exists(),
         "has_config": (resolved / "config.json").exists(),

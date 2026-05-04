@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 from mtplx.hf_loader import (
@@ -7,6 +9,7 @@ from mtplx.hf_loader import (
     cached_model_path,
     hf_cache_report,
     list_cached_models,
+    pull_model,
     remove_cached_model,
     repo_id_from_model_ref,
     resolve_model_path,
@@ -48,6 +51,76 @@ def test_cached_model_is_complete_rejects_interrupted_indexed_download(tmp_path:
     )
 
     assert cached_model_is_complete(cached) is False
+
+
+def test_pull_model_reuses_complete_destination_without_redownload(
+    tmp_path: Path, monkeypatch
+):
+    cached = tmp_path / "mtplx--example"
+    cached.mkdir()
+    (cached / "config.json").write_text("{}\n", encoding="utf-8")
+    (cached / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"lm_head.weight": "model-00001-of-00001.safetensors"}}\n',
+        encoding="utf-8",
+    )
+    (cached / "model-00001-of-00001.safetensors").write_bytes(b"weights")
+
+    def fail_snapshot_download(**_kwargs):
+        raise AssertionError("complete cached model should not download again")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(snapshot_download=fail_snapshot_download),
+    )
+
+    result = pull_model("mtplx/example", cache_dir=tmp_path)
+
+    assert result["path"] == str(cached)
+    assert result["reused_existing"] is True
+    assert result["resumed_existing"] is False
+
+
+def test_pull_model_resumes_incomplete_destination(
+    tmp_path: Path, monkeypatch
+):
+    cached = tmp_path / "mtplx--example"
+    cached.mkdir()
+    (cached / "config.json").write_text("{}\n", encoding="utf-8")
+    (cached / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"lm_head.weight": "model-00001-of-00001.safetensors"}}\n',
+        encoding="utf-8",
+    )
+    download_cache = cached / ".cache" / "huggingface" / "download"
+    download_cache.mkdir(parents=True)
+    (download_cache / "model-00001-of-00001.safetensors.incomplete").write_bytes(
+        b"partial"
+    )
+
+    def fake_snapshot_download(**kwargs):
+        destination = Path(kwargs["local_dir"])
+        (destination / "model-00001-of-00001.safetensors").write_bytes(b"weights")
+        return str(destination)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+    events: list[dict] = []
+
+    result = pull_model(
+        "mtplx/example",
+        cache_dir=tmp_path,
+        progress_callback=events.append,
+        progress_interval_s=0,
+    )
+
+    assert result["path"] == str(cached)
+    assert result["reused_existing"] is False
+    assert result["resumed_existing"] is True
+    assert result["started_size_bytes"] > 0
+    assert [event["event"] for event in events] == ["resume", "complete"]
 
 
 def test_resolve_model_path_reports_missing_cache(tmp_path: Path):

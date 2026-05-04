@@ -697,7 +697,16 @@ def _cmd_init(args: argparse.Namespace) -> int:
         report["wrote_config"] = True
     if args.download and not args.dry_run:
         try:
-            report["download_result"] = pull_model(args.model, cache_dir=model_dir)
+            progress_callback = None
+            if not args.json:
+                from .commands.public import _download_progress_callback
+
+                progress_callback = _download_progress_callback()
+            report["download_result"] = pull_model(
+                args.model,
+                cache_dir=model_dir,
+                progress_callback=progress_callback,
+            )
         except Exception as exc:
             report["download_error"] = str(exc)
             if args.json:

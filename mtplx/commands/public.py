@@ -340,6 +340,36 @@ def _format_bytes(size_bytes: int | float | None) -> str:
     return f"{size:.1f} TB"
 
 
+def _download_progress_callback(*, printer=print):
+    def emit(event: dict[str, Any]) -> None:
+        kind = event.get("event")
+        size = _format_bytes(event.get("size_bytes"))
+        if kind == "start":
+            printer(f"[1/4] Download started: {event.get('repo_id')} -> {event.get('path')}")
+        elif kind == "resume":
+            printer(
+                "[1/4] Resuming partial download: "
+                f"{event.get('repo_id')} ({size} already on disk)"
+            )
+        elif kind == "progress":
+            interval = max(1, int(round(float(event.get("interval_s") or 0))))
+            delta = float(event.get("delta_bytes") or 0)
+            if delta > 0:
+                printer(
+                    "[1/4] Still downloading: "
+                    f"{size} on disk (+{_format_bytes(delta)} in {interval}s)"
+                )
+            else:
+                printer(
+                    "[1/4] Still downloading: "
+                    f"{size} on disk (no byte change in {interval}s; waiting on Hugging Face)"
+                )
+        elif kind == "complete":
+            printer(f"[1/4] Download complete: {size} on disk")
+
+    return emit
+
+
 def _profile_draft_lm_head_spec(profile: Any) -> dict[str, Any] | None:
     draft = getattr(profile, "draft_lm_head", None)
     if draft is None:
@@ -825,7 +855,14 @@ def cmd_pull_public(args: Any) -> int:
     from mtplx.hf_loader import pull_model
 
     try:
-        result = pull_model(args.model, cache_dir=args.cache_dir, revision=args.revision)
+        result = pull_model(
+            args.model,
+            cache_dir=args.cache_dir,
+            revision=args.revision,
+            progress_callback=None
+            if getattr(args, "json", False)
+            else _download_progress_callback(printer=print),
+        )
     except KeyboardInterrupt:
         print("download cancelled")
         return 130
@@ -3672,7 +3709,12 @@ def _quickstart_resolve_model(model: str, *, cache_dir: str | None, download: bo
 
     _quickstart_line(f"[1/4] Downloading model: {download_ref}")
     try:
-        result = pull_model(download_ref, cache_dir=cache_dir)
+        result = pull_model(
+            download_ref,
+            cache_dir=cache_dir,
+            progress_callback=_download_progress_callback(printer=_quickstart_line),
+            progress_interval_s=5.0,
+        )
     except KeyboardInterrupt:
         return None, {
             "model": model,
