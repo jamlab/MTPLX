@@ -2182,8 +2182,24 @@ def _display_text(
     return f"{text}{separator}{footer}"
 
 
-def _chat_ui_html(*, model_id: str, server_url: str, api_key_required: bool) -> str:
+def _chat_ui_html(
+    *,
+    model_id: str,
+    server_url: str,
+    api_key_required: bool,
+    default_settings: dict[str, Any],
+) -> str:
     api_note = "API key required" if api_key_required else "local · no API key"
+    default_depth = max(1, min(3, int(default_settings.get("depth", 3))))
+    default_settings = {
+        "temperature": float(default_settings.get("temperature", 0.6)),
+        "top_p": float(default_settings.get("top_p", 0.95)),
+        "top_k": int(default_settings.get("top_k", 20)),
+        "depth": default_depth,
+        "max_tokens": int(default_settings.get("max_tokens", 16384)),
+        "reasoning": str(default_settings.get("reasoning", "auto")),
+        "system": str(default_settings.get("system", "")),
+    }
     template = """<!doctype html>
 <html lang="en">
 <head>
@@ -2638,8 +2654,8 @@ def _chat_ui_html(*, model_id: str, server_url: str, api_key_required: bool) -> 
     <div class="sb-section">
       <p class="sb-title">Speculative</p>
       <div class="sb-row">
-        <label for="ctl-depth">Draft depth <span class="v" id="val-depth">3</span></label>
-        <input id="ctl-depth" type="range" min="1" max="3" step="1" value="3">
+        <label for="ctl-depth">Draft depth <span class="v" id="val-depth">__DEPTH_VALUE__</span></label>
+        <input id="ctl-depth" type="range" min="1" max="__DEPTH_MAX__" step="1" value="__DEPTH_VALUE__">
         <p class="help">MTP draft tokens per verify cycle.</p>
       </div>
     </div>
@@ -2724,15 +2740,7 @@ def _chat_ui_html(*, model_id: str, server_url: str, api_key_required: bool) -> 
 
     // ---------- settings ------------------------------------------------------
     const SETTINGS_KEY = "mtplx.chat.settings.v3";
-    const DEFAULTS = {
-      temperature: 0.6,
-      top_p: 0.95,
-      top_k: 20,
-      depth: 3,
-      max_tokens: 16384,
-      reasoning: "auto",
-      system: ""
-    };
+    const DEFAULTS = __DEFAULT_SETTINGS_JSON__;
     // RANGES is mutable so we can rewrite max_tokens.max after we discover
     // the model's real context window via /health. Hardcoding a 32768 cap
     // (our previous default) lied about a 256k-context model and stopped
@@ -2741,7 +2749,7 @@ def _chat_ui_html(*, model_id: str, server_url: str, api_key_required: bool) -> 
       temperature: {min: 0, max: 2},
       top_p: {min: 0, max: 1},
       top_k: {min: 0, max: 100},
-      depth: {min: 1, max: 3},
+      depth: {min: 1, max: __DEPTH_MAX__},
       max_tokens: {min: 256, max: 32768}
     };
     const maxTokensHelpEl = document.getElementById("max-tokens-help");
@@ -3319,6 +3327,9 @@ def _chat_ui_html(*, model_id: str, server_url: str, api_key_required: bool) -> 
         .replace("__API_NOTE__", html.escape(api_note))
         .replace("__SERVER_URL__", html.escape(server_url))
         .replace("__MODEL_JSON__", json.dumps(model_id))
+        .replace("__DEFAULT_SETTINGS_JSON__", json.dumps(default_settings, sort_keys=True))
+        .replace("__DEPTH_VALUE__", str(default_depth))
+        .replace("__DEPTH_MAX__", str(default_depth))
     )
 
 
@@ -3384,6 +3395,15 @@ def create_app(state: ServerState) -> FastAPI:
                 model_id=state.model_id,
                 server_url=server_url,
                 api_key_required=bool(state.args.api_key),
+                default_settings={
+                    "temperature": float(state.args.temperature),
+                    "top_p": float(state.args.top_p),
+                    "top_k": int(state.args.top_k),
+                    "depth": int(state.args.depth),
+                    "max_tokens": int(state.args.max_response_tokens or 16384),
+                    "reasoning": str(getattr(state.args, "reasoning", None) or "auto"),
+                    "system": "",
+                },
             )
         )
 

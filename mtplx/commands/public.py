@@ -323,7 +323,7 @@ def _validate_public_depth(args: Any, *, printer=print) -> int | None:
             "error: --depth must be between "
             f"1 and {MAX_PUBLIC_SPECULATIVE_DEPTH} for the current MTPLX runtime"
         )
-        printer("hint: the shipped speed path is tuned for depth 3")
+        printer("hint: omit --depth to use the model contract default")
         return 2
     args.depth = depth
     return None
@@ -341,6 +341,8 @@ def _format_bytes(size_bytes: int | float | None) -> str:
 
 
 def _download_progress_callback(*, printer=print):
+    """Plain-text download progress callback for non-interactive paths."""
+
     def emit(event: dict[str, Any]) -> None:
         kind = event.get("event")
         size = _format_bytes(event.get("size_bytes"))
@@ -368,6 +370,20 @@ def _download_progress_callback(*, printer=print):
             printer(f"[1/4] Download complete: {size} on disk")
 
     return emit
+
+
+def _rich_download_progress_callback(*, repo_id: str, total_bytes: int | None = None):
+    """Single-line live progress callback for interactive downloads."""
+
+    from mtplx.ui.download_progress import RichDownloadProgress, from_progress_event_callback
+
+    progress = RichDownloadProgress(repo_id=repo_id, total_bytes=total_bytes)
+    callback = from_progress_event_callback(progress=progress)
+
+    def finalize() -> None:
+        progress.stop()
+
+    return callback, finalize
 
 
 def _profile_draft_lm_head_spec(profile: Any) -> dict[str, Any] | None:
@@ -422,6 +438,32 @@ def _model_draft_sampler_spec(
         return draft_sampler_spec_from_runtime_contract(contract, fallback=fallback)
     except ImportError:
         return fallback
+
+
+def _model_contract_depth(inspection: dict[str, Any], *, fallback: int = 3) -> int:
+    compatibility = inspection.get("compatibility") or {}
+    contract = (
+        compatibility.get("runtime_contract")
+        if isinstance(compatibility, dict)
+        else inspection.get("runtime_contract")
+    )
+    if not isinstance(contract, dict):
+        return int(fallback)
+    try:
+        depth = int(contract.get("mtp_depth_max", fallback))
+    except (TypeError, ValueError):
+        return int(fallback)
+    return max(1, min(MAX_PUBLIC_SPECULATIVE_DEPTH, depth))
+
+
+def _apply_model_contract_depth_default(args: Any, inspection: dict[str, Any]) -> None:
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if "depth" in cli_flags:
+        return
+    args.depth = _model_contract_depth(
+        inspection,
+        fallback=int(getattr(args, "depth", 3)),
+    )
 
 
 def _draft_sampler_from_spec(spec: dict[str, Any] | None) -> Any | None:
@@ -629,6 +671,7 @@ def _depth_sweep_native60(
     max_tokens: int,
     limit: int | None,
     seed: int,
+    depth: int = 3,
     draft_lm_head: dict[str, Any] | None = None,
     draft_sampler: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -643,7 +686,7 @@ def _depth_sweep_native60(
     return run_mtp_depth_sweep(
         model,
         prompt_suite,
-        depths="3",
+        depths=str(depth),
         temperature=0.6,
         top_p=0.95,
         top_k=20,
@@ -852,29 +895,40 @@ def cmd_bench_public(args: Any) -> int:
 
 
 def cmd_pull_public(args: Any) -> int:
-    from mtplx.hf_loader import pull_model
+    from mtplx.hf_loader import pull_model, repo_id_from_model_ref
 
+    json_mode = bool(getattr(args, "json", False))
+    callback = None
+    finalize: Any = lambda: None
+    progress_interval_s = 10.0
+    if not json_mode:
+        callback, finalize = _rich_download_progress_callback(
+            repo_id=repo_id_from_model_ref(args.model) or args.model,
+        )
+        progress_interval_s = 0.4
     try:
         result = pull_model(
             args.model,
             cache_dir=args.cache_dir,
             revision=args.revision,
-            progress_callback=None
-            if getattr(args, "json", False)
-            else _download_progress_callback(printer=print),
+            progress_callback=callback,
+            progress_interval_s=progress_interval_s,
         )
     except KeyboardInterrupt:
+        finalize()
         print("download cancelled")
         return 130
     except Exception as exc:
-        if getattr(args, "json", False):
+        finalize()
+        if json_mode:
             _print({"error": "pull failed", "model": args.model, "detail": str(exc)})
         else:
             print("error: pull failed")
             print(f"model: {args.model}")
             print(f"detail: {exc}")
         return 1
-    if getattr(args, "json", False):
+    finalize()
+    if json_mode:
         _print(result)
     else:
         print("MTPLX pull")
@@ -1045,6 +1099,14 @@ def _cmd_bench_run(args: Any) -> int:
             max_tokens=args.max_tokens,
             limit=args.limit,
             seed=benchmark_seed,
+            depth=(
+                int(getattr(args, "depth", 3))
+                if "depth" in (getattr(args, "_cli_flags", set()) or set())
+                else _model_contract_depth(
+                    inspection,
+                    fallback=int(getattr(args, "depth", 3)),
+                )
+            ),
             draft_lm_head=draft_lm_head,
             draft_sampler=draft_sampler,
         )
@@ -3074,6 +3136,7 @@ def cmd_serve_public(args: Any) -> int:
     if gate_exit is not None:
         _print_model_gate_error(inspection, printer=_print_serve_start_line)
         return gate_exit
+    _apply_model_contract_depth_default(args, inspection)
     draft_lm_head = _model_draft_lm_head_spec(inspection, profile) or {
         "bits": 4,
         "group_size": 64,
@@ -3708,25 +3771,29 @@ def _quickstart_resolve_model(model: str, *, cache_dir: str | None, download: bo
     from mtplx.hf_loader import pull_model
 
     _quickstart_line(f"[1/4] Downloading model: {download_ref}")
+    callback, finalize = _rich_download_progress_callback(repo_id=download_ref)
     try:
-        result = pull_model(
-            download_ref,
-            cache_dir=cache_dir,
-            progress_callback=_download_progress_callback(printer=_quickstart_line),
-            progress_interval_s=5.0,
-        )
-    except KeyboardInterrupt:
-        return None, {
-            "model": model,
-            "runtime_model": None,
-            "downloaded": False,
-            "download_ref": download_ref,
-            "cancelled": True,
-            "error": {
-                "error": "download cancelled",
-                "model": download_ref,
-            },
-        }
+        try:
+            result = pull_model(
+                download_ref,
+                cache_dir=cache_dir,
+                progress_callback=callback,
+                progress_interval_s=0.4,
+            )
+        except KeyboardInterrupt:
+            return None, {
+                "model": model,
+                "runtime_model": None,
+                "downloaded": False,
+                "download_ref": download_ref,
+                "cancelled": True,
+                "error": {
+                    "error": "download cancelled",
+                    "model": download_ref,
+                },
+            }
+    finally:
+        finalize()
     runtime_model, resolve_error = _resolve_runtime_model_path(download_ref, cache_dir=cache_dir)
     if resolve_error is not None:
         return None, {
@@ -4570,6 +4637,7 @@ def cmd_quickstart_public(args: Any) -> int:
                     json_output=bool(getattr(args, "json", False)),
                 )
                 return gate_exit
+            _apply_model_contract_depth_default(args, inspection)
             if target == "openwebui":
                 args.model = runtime_model
                 return _quickstart_run_openwebui(args, runtime_model=runtime_model, inspection=inspection)
@@ -4599,6 +4667,7 @@ def cmd_quickstart_public(args: Any) -> int:
             json_output=bool(getattr(args, "json", False)),
         )
         return gate_exit
+    _apply_model_contract_depth_default(args, inspection)
     _quickstart_line(f"model ready: {runtime_model}")
     if resolution.get("downloaded"):
         _quickstart_line(f"downloaded: {resolution.get('download_ref')}")

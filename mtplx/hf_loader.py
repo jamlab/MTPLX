@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -9,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from mtplx.artifacts import _hf_repo_id_from_ref
 from mtplx.profiles import DEFAULT_PROFILE_NAME
@@ -24,6 +25,60 @@ REQUIRED_MTPLX_MODEL_FILES = (
     "mtp.safetensors",
     "mtplx_runtime.json",
 )
+
+
+def _query_repo_total_bytes(repo_id: str, *, revision: str | None = None) -> int | None:
+    """Best-effort estimate of the remote repo's total size."""
+
+    try:
+        from huggingface_hub import HfApi
+    except Exception:
+        return None
+    try:
+        info = HfApi().model_info(
+            repo_id=repo_id,
+            revision=revision,
+            files_metadata=True,
+        )
+    except Exception:
+        return None
+    siblings = getattr(info, "siblings", None) or []
+    total = 0
+    for sibling in siblings:
+        size = getattr(sibling, "size", None)
+        if isinstance(size, int) and size > 0:
+            total += size
+    return total or None
+
+
+@contextlib.contextmanager
+def _suppress_hf_hub_progress() -> Iterator[None]:
+    """Suppress Hugging Face tqdm bars while MTPLX owns download progress."""
+
+    previous_env = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    disabled_via_helper = False
+    try:
+        try:
+            from huggingface_hub.utils import disable_progress_bars
+
+            disable_progress_bars()
+            disabled_via_helper = True
+        except Exception:
+            pass
+        yield
+    finally:
+        if disabled_via_helper:
+            try:
+                from huggingface_hub.utils import enable_progress_bars
+
+                enable_progress_bars()
+            except Exception:
+                pass
+        if previous_env is None:
+            os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+        else:
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = previous_env
 
 
 def model_cache_dir(value: str | Path | None = None) -> Path:
@@ -279,6 +334,11 @@ def pull_model(
         reused_existing = False
         resumed_existing = destination.exists() and started_size > 0
         destination.mkdir(parents=True, exist_ok=True)
+        total_bytes = (
+            _query_repo_total_bytes(repo_id, revision=revision)
+            if progress_callback is not None
+            else None
+        )
         _emit_download_progress(
             progress_callback,
             {
@@ -286,6 +346,7 @@ def pull_model(
                 "repo_id": repo_id,
                 "path": str(destination),
                 "size_bytes": started_size,
+                "total_bytes": total_bytes,
             },
         )
         stop, thread = _start_download_heartbeat(
@@ -293,13 +354,19 @@ def pull_model(
             callback=progress_callback,
             interval_s=progress_interval_s,
         )
+        progress_suppression = (
+            _suppress_hf_hub_progress()
+            if progress_callback is not None
+            else contextlib.nullcontext()
+        )
         try:
-            path = snapshot_download(
-                repo_id=repo_id,
-                repo_type="model",
-                revision=revision,
-                local_dir=str(destination),
-            )
+            with progress_suppression:
+                path = snapshot_download(
+                    repo_id=repo_id,
+                    repo_type="model",
+                    revision=revision,
+                    local_dir=str(destination),
+                )
             resolved = Path(path)
             validation = validate_mtplx_model_files(resolved)
             if not cached_model_is_complete(resolved):
@@ -324,6 +391,7 @@ def pull_model(
                 "repo_id": repo_id,
                 "path": str(resolved),
                 "size_bytes": final_size,
+                "total_bytes": total_bytes if total_bytes else final_size,
                 "delta_bytes": final_size - started_size,
             },
         )

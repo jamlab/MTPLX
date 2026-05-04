@@ -12,25 +12,39 @@ from mtplx.backends.registry import (
     architecture_catalog,
     require_verified_or_raise,
 )
-from mtplx.constants import EXPECTED_MTP_KEYS, EXPECTED_PREQUANTIZED_MTP_KEYS
+from mtplx.constants import (
+    EXPECTED_ALL_PREQUANTIZED_MTP_KEYS,
+    EXPECTED_MTP_KEYS,
+    EXPECTED_PREQUANTIZED_MTP_KEYS,
+)
 
 
-def _write_runtime_contract(path, *, arch_id="qwen3-next-mtp", profile="stable"):
+def _write_runtime_contract(
+    path,
+    *,
+    arch_id="qwen3-next-mtp",
+    profile="stable",
+    recommended_draft_lm_head=None,
+    recommended_draft_sampler=None,
+):
+    contract = {
+        "mtplx_version": "0.1.0-preview",
+        "arch_id": arch_id,
+        "mtp_depth_max": 3,
+        "recommended_profile": profile,
+        "exactness_baseline": {"phase0h": "smoke", "max_abs_diff": 0.0},
+        "verified_on": {
+            "timestamp": "2026-05-02T00:00:00Z",
+            "hardware": "test",
+            "macos": "test",
+        },
+    }
+    if recommended_draft_lm_head is not None:
+        contract["recommended_draft_lm_head"] = recommended_draft_lm_head
+    if recommended_draft_sampler is not None:
+        contract["recommended_draft_sampler"] = recommended_draft_sampler
     (path / "mtplx_runtime.json").write_text(
-        json.dumps(
-            {
-                "mtplx_version": "0.1.0-preview",
-                "arch_id": arch_id,
-                "mtp_depth_max": 3,
-                "recommended_profile": profile,
-                "exactness_baseline": {"phase0h": "smoke", "max_abs_diff": 0.0},
-                "verified_on": {
-                    "timestamp": "2026-05-02T00:00:00Z",
-                    "hardware": "test",
-                    "macos": "test",
-                },
-            }
-        ),
+        json.dumps(contract),
         encoding="utf-8",
     )
 
@@ -108,6 +122,56 @@ def test_qwen3_5_text_subtype_can_pass_primary_gate_when_mtp_is_valid(monkeypatc
     assert inspect_model(tmp_path).passes_primary_gate is True
 
 
+def test_runtime_contract_preserves_recommended_draft_metadata(monkeypatch, tmp_path):
+    from mtplx import artifacts
+    from mtplx.artifacts import MTPInspection
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "mtp_num_hidden_layers": 1,
+                "hidden_size": 5120,
+                "num_hidden_layers": 64,
+                "vocab_size": 248320,
+                "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        artifacts,
+        "inspect_mtp_tensors",
+        lambda *_args, **_kwargs: MTPInspection(
+            mtp_file=str(tmp_path / "mtp.safetensors"),
+            exists=True,
+            tensor_count=15,
+            missing_expected_keys=(),
+        ),
+    )
+    _write_runtime_contract(
+        tmp_path,
+        profile="performance-cold",
+        recommended_draft_lm_head={"bits": "3", "group_size": "64", "mode": "affine"},
+        recommended_draft_sampler={"temperature": "0.7", "top_p": "0.95", "top_k": "20"},
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["runtime_contract"]["recommended_draft_lm_head"] == {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+    }
+    assert result.compatibility["runtime_contract"]["recommended_draft_sampler"] == {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "top_k": 20,
+    }
+    assert result.compatibility["tier"] == "verified"
+
+
 def test_prequantized_mtp_sidecar_accepts_mlx_affine_scale_bias_tensors(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -139,6 +203,42 @@ def test_prequantized_mtp_sidecar_accepts_mlx_affine_scale_bias_tensors(tmp_path
     assert result.mtp is not None
     assert result.mtp.sidecar_format == "prequantized-mlx-affine"
     assert result.mtp.tensor_count == 29
+    assert result.mtp.missing_expected_keys == ()
+    assert result.mtp.extra_keys == ()
+    assert result.passes_primary_gate is True
+
+
+def test_all_prequantized_mtp_sidecar_accepts_quantized_fc_tensors(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "mtp_num_hidden_layers": 1,
+                "hidden_size": 5120,
+                "num_hidden_layers": 64,
+                "vocab_size": 248320,
+                "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
+                "mtplx_mtp_quantization": {
+                    "policy": "all",
+                    "bits": 4,
+                    "group_size": 32,
+                    "mode": "affine",
+                    "prequantized": True,
+                },
+            }
+        )
+    )
+    save_file(
+        {key: np.ones((1,), dtype=np.float32) for key in EXPECTED_ALL_PREQUANTIZED_MTP_KEYS},
+        tmp_path / "mtp.safetensors",
+    )
+    _write_runtime_contract(tmp_path, profile="performance-cold")
+
+    result = inspect_model(tmp_path)
+    assert result.mtp is not None
+    assert result.mtp.sidecar_format == "prequantized-mlx-affine"
+    assert result.mtp.tensor_count == 31
     assert result.mtp.missing_expected_keys == ()
     assert result.mtp.extra_keys == ()
     assert result.passes_primary_gate is True
@@ -182,6 +282,43 @@ def test_qwen_mtp_without_runtime_contract_is_family_runnable(monkeypatch, tmp_p
     assert result.compatibility["exit_code"] == 0
     assert result.compatibility["unsafe_force_required"] is False
     assert result.compatibility["runtime_compatibility"] == "native-family-gated"
+
+
+def test_qwen_embedded_mtp_index_without_runtime_contract_is_family_runnable(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "mtp_num_hidden_layers": 1,
+                "hidden_size": 5120,
+                "num_hidden_layers": 64,
+                "vocab_size": 248320,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {},
+                "weight_map": {
+                    **{key: "model-00001-of-00001.safetensors" for key in EXPECTED_MTP_KEYS},
+                    "model.layers.0.mlp.down_proj.weight": "model-00001-of-00001.safetensors",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp is not None
+    assert result.mtp.exists is True
+    assert result.mtp.metadata_only is True
+    assert result.mtp.passes_tensor_gate is True
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["can_run"] is True
 
 
 def test_qwen3_next_architecture_without_mtp_sidecar_is_unverified(tmp_path):
@@ -267,6 +404,35 @@ def test_deepseek_mtp_with_runtime_contract_and_model_file_is_verified(tmp_path)
     assert result.compatibility["runtime_compatibility"] == "native-contract-gated"
 
 
+def test_deepseek_mtp_with_family_layer_weights_is_runnable_without_contract(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV3ForCausalLM"],
+                "model_type": "deepseek_v3",
+                "num_nextn_predict_layers": 2,
+                "num_hidden_layers": 61,
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "model.layers.61.enorm.weight": np.ones((1,), dtype=np.float32),
+            "model.layers.62.hnorm.weight": np.ones((1,), dtype=np.float32),
+        },
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["arch_id"] == "deepseek-v3-mtp"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["exit_code"] == 0
+    assert result.compatibility["runtime_compatibility"] == "native-family-gated"
+
+
 def test_glm4_moe_mtp_without_runtime_contract_needs_contract(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -309,6 +475,74 @@ def test_glm4_moe_mtp_with_runtime_contract_and_model_file_is_verified(tmp_path)
     assert result.compatibility["can_run"] is True
     assert result.compatibility["recommended_backend"] == "glm_mtp"
     assert result.compatibility["runtime_compatibility"] == "native-contract-gated"
+
+
+def test_glm4_moe_mtp_with_family_layer_weights_is_runnable_without_contract(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Glm4MoeForCausalLM"],
+                "model_type": "glm4_moe",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 47,
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file({"model.layers.47.hnorm.weight": np.ones((1,), dtype=np.float32)}, tmp_path / "model.safetensors")
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["arch_id"] == "glm4-moe-mtp"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["exit_code"] == 0
+    assert result.compatibility["runtime_compatibility"] == "native-family-gated"
+
+
+def test_glm4_moe_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Glm4MoeForCausalLM"],
+                "model_type": "glm4_moe",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 47,
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file({"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)}, tmp_path / "model.safetensors")
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
+    assert result.compatibility["can_run"] is False
+    assert result.compatibility["runtime_compatibility"] == "needs-contract"
+
+
+def test_glm4_moe_mtp_sidecar_layer_keys_are_family_runnable(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Glm4MoeForCausalLM"],
+                "model_type": "glm4_moe",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 47,
+                "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file({"layers.0.enorm.weight": np.ones((1,), dtype=np.float32)}, tmp_path / "mtp.safetensors")
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp is not None
+    assert result.mtp.exists is True
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["runtime_compatibility"] == "native-family-gated"
 
 
 def test_glm4_moe_lite_mtp_with_runtime_contract_and_model_file_is_verified(tmp_path):
@@ -408,6 +642,52 @@ def test_mimo_mtp_with_runtime_contract_and_model_file_is_verified(tmp_path):
     assert result.compatibility["runtime_compatibility"] == "native-contract-gated"
 
 
+def test_mimo_mtp_with_family_layer_weights_is_runnable_without_contract(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["MiMoForCausalLM"],
+                "model_type": "mimo",
+                "num_nextn_predict_layers": 2,
+                "num_hidden_layers": 46,
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.mtp_layers.0.hidden_layernorm.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["arch_id"] == "mimo-mtp"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["runtime_compatibility"] == "native-family-gated"
+
+
+def test_mimo_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["MiMoForCausalLM"],
+                "model_type": "mimo",
+                "num_nextn_predict_layers": 2,
+                "num_hidden_layers": 46,
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file({"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)}, tmp_path / "model.safetensors")
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
+    assert result.compatibility["can_run"] is False
+    assert result.compatibility["runtime_compatibility"] == "needs-contract"
+
+
 def test_minimax_m2_with_nextn_marker_is_recognized_backend_pending(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -445,6 +725,132 @@ def test_minimax_m2_with_num_mtp_modules_marker_is_recognized_backend_pending(tm
     assert result.compatibility["arch_id"] == "minimax-m2-mtp"
     assert result.compatibility["runtime_compatibility"] == "recognized-backend-pending"
     assert result.compatibility["can_run"] is False
+
+
+def test_nemotron_h_mtp_without_weights_needs_contract(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 52,
+                "mtp_hybrid_override_pattern": "*E",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp_pattern == "*E"
+    assert result.compatibility["arch_id"] == "nemotron-h-mtp"
+    assert result.compatibility["runtime_compatibility"] == "needs-contract"
+    assert result.compatibility["can_run"] is False
+
+
+def test_nemotron_h_mtp_with_runtime_contract_and_sidecar_is_verified(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 52,
+                "mtp_hybrid_override_pattern": "*E",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "mtp.layers.0.enorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.hnorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.eh_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.mixer.q_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.mixer.gate.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.final_layernorm.weight": np.ones((1,), dtype=np.float32),
+        },
+        tmp_path / "mtp.safetensors",
+    )
+    _write_runtime_contract(tmp_path, arch_id="nemotron-h-mtp")
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "verified"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["recommended_backend"] == "nemotron_h_mtp"
+    assert result.compatibility["runtime_compatibility"] == "native-contract-gated"
+
+
+def test_nemotron_h_mtp_with_family_sidecar_is_runnable_without_contract(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 52,
+                "mtp_hybrid_override_pattern": "*E",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "mtp.layers.0.enorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.hnorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.eh_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.mixer.q_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.mixer.gate.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.final_layernorm.weight": np.ones((1,), dtype=np.float32),
+        },
+        tmp_path / "mtp.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["runtime_compatibility"] == "native-family-gated"
+
+
+def test_nemotron_h_mtp_rejects_unsupported_mtp_pattern(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 52,
+                "mtp_hybrid_override_pattern": "M*",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "mtp.layers.0.enorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.hnorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.eh_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.mixer.q_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.mixer.q_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.final_layernorm.weight": np.ones((1,), dtype=np.float32),
+        },
+        tmp_path / "mtp.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] == "nemotron-h-mtp"
+    assert result.compatibility["can_run"] is False
+    assert result.compatibility["runtime_compatibility"] == "needs-contract"
 
 
 def test_gemma4_without_mtp_marker_stays_no_mtp(tmp_path):
@@ -488,6 +894,8 @@ def test_gemma4_with_mtp_marker_is_recognized_backend_pending(tmp_path):
         ("Glm4MoeLiteForCausalLM", "glm4_moe_lite", "glm4-moe-lite-mtp"),
         ("GlmOcrForCausalLM", "glm_ocr", "glm-ocr-mtp"),
         ("MiniMaxM2ForCausalLM", "minimax_m2", "minimax-m2-mtp"),
+        ("MiniMaxM25ForCausalLM", "minimax_m2_5", "minimax-m2-mtp"),
+        ("MiniMaxM26ForCausalLM", "minimax_m2_6", "minimax-m2-mtp"),
         ("MiMoForCausalLM", "mimo", "mimo-mtp"),
         ("Ernie45MoeForCausalLM", "ernie4_5_moe", "ernie-mtp"),
         ("NemotronHForCausalLM", "nemotron_h", "nemotron-h-mtp"),
@@ -529,11 +937,11 @@ def test_big_mtp_architecture_markers_are_recognized_backend_pending(
         in {
             "deepseek-v3-mtp",
             "glm-moe-dsa-mtp",
-                "glm4-moe-mtp",
-                "glm4-moe-lite-mtp",
-                "mimo-mtp",
-                "nemotron-h-mtp",
-            }
+            "glm4-moe-mtp",
+            "glm4-moe-lite-mtp",
+            "mimo-mtp",
+            "nemotron-h-mtp",
+        }
         else "recognized-backend-pending"
     )
     assert result.compatibility["runtime_compatibility"] == expected_runtime
@@ -616,6 +1024,84 @@ def test_hf_qwen_mtp_without_runtime_contract_is_family_runnable(monkeypatch):
     assert result.compatibility["can_run"] is True
     assert result.compatibility["exit_code"] == 0
     assert calls == [("Qwen/Qwen3-Next-80B-A3B-Instruct", "mtp.safetensors")]
+
+
+def test_hf_qwen_embedded_mtp_index_is_family_runnable(monkeypatch):
+    from mtplx import artifacts
+
+    def fake_files(repo_id):
+        assert repo_id == "Qwen/Qwen3.5-4B"
+        return {
+            "config.json",
+            "model.safetensors.index.json",
+            "model.safetensors-00001-of-00002.safetensors",
+            "model.safetensors-00002-of-00002.safetensors",
+        }, None
+
+    def fake_json(repo_id, filename):
+        if filename == "config.json":
+            return (
+                {
+                    "architectures": ["Qwen3_5ForConditionalGeneration"],
+                    "model_type": "qwen3_5",
+                    "text_config": {
+                        "model_type": "qwen3_5_text",
+                        "mtp_num_hidden_layers": 1,
+                    },
+                },
+                "/tmp/config.json",
+                None,
+            )
+        if filename == "model.safetensors.index.json":
+            return (
+                {
+                    "metadata": {},
+                    "weight_map": {
+                        **{key: "model.safetensors-00001-of-00002.safetensors" for key in EXPECTED_MTP_KEYS},
+                        "model.language_model.layers.0.mlp.down_proj.weight": "model.safetensors-00001-of-00002.safetensors",
+                    },
+                },
+                "/tmp/model.safetensors.index.json",
+                None,
+            )
+        if filename == "mtplx_runtime.json":
+            return None, None, "404 Client Error: entry not found"
+        raise AssertionError(filename)
+
+    monkeypatch.setattr(artifacts, "_hf_list_repo_files", fake_files)
+    monkeypatch.setattr(artifacts, "_hf_download_json", fake_json)
+
+    result = inspect_model("Qwen/Qwen3.5-4B")
+
+    assert result.source == "hf"
+    assert result.mtp is not None
+    assert result.mtp.exists is True
+    assert result.mtp.metadata_only is True
+    assert result.mtp.mtp_file == "model.safetensors.index.json::embedded"
+    assert result.mtp.passes_tensor_gate is True
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["exit_code"] == 0
+
+
+def test_qwen_runtime_loader_reads_embedded_mtp_weights(tmp_path):
+    from mtplx.mtp_patch import _load_embedded_mtp_weights
+
+    save_file(
+        {
+            **{key: np.ones((1,), dtype=np.float32) for key in EXPECTED_MTP_KEYS},
+            "model.language_model.layers.0.mlp.down_proj.weight": np.ones((1,), dtype=np.float32),
+        },
+        tmp_path / "model.safetensors",
+    )
+
+    weights = _load_embedded_mtp_weights(
+        tmp_path,
+        {"model_type": "qwen3_5", "mtp_num_hidden_layers": 1},
+    )
+
+    assert sorted(weights) == sorted(key.removeprefix("mtp.") for key in EXPECTED_MTP_KEYS)
+    assert "fc.weight" in weights
 
 
 def test_qwen_runtime_loader_reads_bf16_embedded_mtp_weights(tmp_path):

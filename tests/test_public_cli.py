@@ -1323,6 +1323,64 @@ def test_serve_dispatches_packaged_openai_server(monkeypatch, capsys):
     assert "--strict-warmup" in calls["cmd"]
 
 
+def test_serve_uses_model_contract_depth_when_depth_not_explicit(monkeypatch):
+    calls = {}
+
+    monkeypatch.setattr(public, "_resolve_runtime_model_path", lambda model, cache_dir=None: (model, None))
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda model, unsafe_force_unverified=False, yes=False: (
+            {
+                "compatibility": {
+                    "tier": "verified",
+                    "can_run": True,
+                    "exit_code": 0,
+                    "runtime_contract": {"mtp_depth_max": 2},
+                }
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(public, "_port_is_busy", lambda host, port: False)
+
+    def fake_execvpe(executable, cmd, env):
+        calls["cmd"] = cmd
+        raise SystemExit(0)
+
+    monkeypatch.setattr(public.os, "execvpe", fake_execvpe)
+    args = SimpleNamespace(
+        model="models/example",
+        cache_dir=None,
+        profile="performance-cold",
+        unsafe_force_unverified=False,
+        yes=True,
+        host="127.0.0.1",
+        port=8000,
+        depth=3,
+        api_key=None,
+        rate_limit=0,
+        stream_interval=1,
+        max_response_tokens=None,
+        temperature=0.6,
+        top_p=0.95,
+        reasoning_parser="qwen3",
+        stats_footer=True,
+        warmup_tokens=0,
+        strict_warmup=False,
+        strict_fast_path=False,
+        max=False,
+        _cli_flags=set(),
+    )
+
+    try:
+        public.cmd_serve_public(args)
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    assert calls["cmd"][calls["cmd"].index("--depth") + 1] == "2"
+
+
 def test_bare_serve_invokes_server_onboarding_in_tty(monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)

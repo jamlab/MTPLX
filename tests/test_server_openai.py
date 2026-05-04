@@ -98,6 +98,8 @@ def test_openai_server_health_metrics_and_models_fake_state():
     # Live tps element
     assert 'id="live-stats"' in root.text
     assert "tok/s" in root.text
+    assert '"depth": 3' in root.text
+    assert 'id="ctl-depth" type="range" min="1" max="3" step="1" value="3"' in root.text
     # Updated max-tokens default and cap.
     assert 'value="8192"' in root.text
     assert 'min="256" max="32768"' in root.text
@@ -151,6 +153,18 @@ def test_anthropic_messages_rejects_empty_request_before_generation():
 
     assert response.status_code == 400
     assert response.json()["detail"] == "messages must not be empty"
+
+
+def test_chat_ui_uses_server_depth_default():
+    state = _fake_state()
+    state.args.depth = 2
+    client = TestClient(create_app(state))
+
+    root = client.get("/")
+
+    assert root.status_code == 200
+    assert '"depth": 2' in root.text
+    assert 'id="ctl-depth" type="range" min="1" max="2" step="1" value="2"' in root.text
 
 
 def test_server_state_emits_startup_progress(monkeypatch, capsys):
