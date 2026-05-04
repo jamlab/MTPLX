@@ -220,9 +220,25 @@ def _model_gate_error_lines(inspection: dict[str, Any]) -> list[str]:
         f"tier: {compatibility.get('tier') or 'unknown'}",
     ]
     runtime_compatibility = compatibility.get("runtime_compatibility") or inspection.get("runtime_compatibility")
+    mtp_layers = int(inspection.get("mtp_num_hidden_layers") or 0)
+    missing_mtp_weights = (
+        mtp_layers > 0
+        and bool(mtp)
+        and not bool(mtp.get("exists"))
+        and compatibility.get("tier") != "no-MTP"
+    )
+    if missing_mtp_weights:
+        runtime_compatibility = "missing-mtp-weights"
     if runtime_compatibility:
         lines.append(f"runtime: {runtime_compatibility}")
-    message = compatibility.get("message") or inspection.get("detail")
+    if missing_mtp_weights:
+        message = (
+            "This model's config advertises MTP, but MTPLX did not find "
+            "runnable MTP weights in the folder. mtplx_runtime.json is "
+            "optional metadata; the blocker is missing MTP weights."
+        )
+    else:
+        message = compatibility.get("message") or inspection.get("detail")
     if message:
         lines.append(f"reason: {message}")
     if mtp:

@@ -1600,6 +1600,33 @@ def test_start_gate_failure_is_human_readable_for_config_only_qwen(tmp_path, cap
     assert "\"model_files\"" not in captured
 
 
+def test_start_gate_failure_is_human_readable_for_config_only_glm(tmp_path, capsys):
+    model = tmp_path / "glm-config-only"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Glm4MoeLiteForCausalLM"],
+                "model_type": "glm4_moe_lite",
+                "num_hidden_layers": 47,
+                "num_nextn_predict_layers": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = main(["start", "cli", "--model", str(model), "--yes"])
+
+    captured = capsys.readouterr().out
+    assert code == 3
+    assert "error: model cannot run with MTPLX" in captured
+    assert "runtime: missing-mtp-weights" in captured
+    assert "mtplx_runtime.json is optional metadata" in captured
+    assert "fix: choose a model with real MTP weights" in captured
+    assert "MTP MTP markers" not in captured
+    assert "\"model_files\"" not in captured
+
+
 def test_profiles_command_lists_default_without_mlx(capsys):
     code = main(["profiles", "--json"])
 

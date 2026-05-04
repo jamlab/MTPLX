@@ -805,7 +805,7 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
                 can_run=False,
                 exit_code=EXIT_UNVERIFIED,
                 message=(
-                    f"{support.display_name} MTP markers recognized and a native "
+                    f"{support.display_name} markers recognized and a native "
                     "backend exists, but no verified mtplx_runtime.json contract "
                     "is present for this artifact."
                 ),

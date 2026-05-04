@@ -613,6 +613,60 @@ def test_classify_scanned_model_qwen_sidecar_without_contract_is_arch_compatible
     assert result.arch_id == "qwen3-next-mtp"
 
 
+def test_classify_scanned_model_glm_config_only_marks_mtp_missing(tmp_path):
+    target = tmp_path / "GLM-config-only"
+    target.mkdir()
+    (target / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Glm4MoeLiteForCausalLM"],
+                "model_type": "glm4_moe_lite",
+                "num_hidden_layers": 47,
+                "num_nextn_predict_layers": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = onboarding._classify_scanned_model(target)
+
+    assert result.tier == "mtp-missing"
+    assert result.arch_id == "glm4-moe-lite-mtp"
+
+
+def test_classify_scanned_model_glm_sidecar_needs_verification(tmp_path):
+    target = tmp_path / "GLM-sidecar-unverified"
+    target.mkdir()
+    (target / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Glm4MoeLiteForCausalLM"],
+                "model_type": "glm4_moe_lite",
+                "num_hidden_layers": 47,
+                "num_nextn_predict_layers": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target / "mtp.safetensors").write_bytes(b"placeholder")
+
+    result = onboarding._classify_scanned_model(target)
+
+    assert result.tier == "needs-verification"
+    assert result.arch_id == "glm4-moe-lite-mtp"
+
+
+def test_tier_badges_distinguish_runnable_from_blocked():
+    label, _ = onboarding._tier_badge("arch-compatible")
+    assert "Runnable" in label
+    label, _ = onboarding._tier_badge("needs-verification")
+    assert "Needs MTPLX verification" in label
+    label, _ = onboarding._tier_badge("mtp-invalid")
+    assert "MTP weights invalid" in label
+    label, _ = onboarding._tier_badge("backend-pending")
+    assert "Backend not runnable yet" in label
+
+
 def test_scan_and_pick_prints_candidate_progress_before_picker(tmp_path, monkeypatch, capsys):
     target = _make_model_dir(tmp_path, "lmstudio-community/Qwen-A")
     monkeypatch.setattr(

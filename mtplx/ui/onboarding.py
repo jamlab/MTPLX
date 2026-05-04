@@ -27,10 +27,13 @@ LOCAL_SCAN_CLASSIFY_TIMEOUT_S = 4.0
 _TIER_RANK: dict[str, int] = {
     "verified": 0,
     "arch-compatible": 1,
-    "unknown": 2,
-    "mtp-missing": 3,
-    "no-mtp": 4,
-    "incompatible": 5,
+    "needs-verification": 2,
+    "mtp-invalid": 3,
+    "mtp-missing": 4,
+    "backend-pending": 5,
+    "no-mtp": 6,
+    "incompatible": 7,
+    "unknown": 8,
 }
 
 
@@ -170,6 +173,20 @@ def _scan_mtp_sidecar_exists(model_dir: Path, config: dict[str, Any]) -> bool:
     return False
 
 
+def _scan_embedded_mtp_keys(model_dir: Path) -> tuple[str, ...]:
+    index_path = model_dir / "model.safetensors.index.json"
+    if not index_path.is_file():
+        return ()
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ()
+    weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
+    if not isinstance(weight_map, dict):
+        return ()
+    return tuple(sorted(str(key) for key in weight_map if str(key).startswith("mtp.")))
+
+
 def _classify_scanned_model(model_dir: Path) -> ScannedModel:
     config_path = model_dir / "config.json"
     if not config_path.is_file():
@@ -217,7 +234,9 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
         model_files = tuple(sorted(p.name for p in model_dir.glob("model*.safetensors")))
     except OSError:
         model_files = ()
-    mtp_artifact_exists = _scan_mtp_sidecar_exists(model_dir, config if isinstance(config, dict) else {})
+    sidecar_exists = _scan_mtp_sidecar_exists(model_dir, config if isinstance(config, dict) else {})
+    embedded_mtp_keys = _scan_embedded_mtp_keys(model_dir)
+    mtp_artifact_exists = sidecar_exists or bool(embedded_mtp_keys)
 
     class _StubMTP:
         # Picker-level evidence only. The runtime still validates the sidecar
@@ -247,9 +266,11 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
         return ScannedModel(model_dir, "unknown", None, architecture, str(exc)[:80])
 
     raw_tier = verdict.tier
+    runtime_status = verdict.runtime_compatibility
+    artifact_missing = mtp_num_hidden_layers > 0 and not mtp_artifact_exists
     if raw_tier == "verified":
         tier = "verified"
-    elif raw_tier == "family-compatible-unverified":
+    elif verdict.can_run or raw_tier == "family-compatible-unverified":
         tier = "arch-compatible"
     elif raw_tier == "architecture-compatible-but-unverified":
         if (
@@ -261,12 +282,20 @@ def _classify_scanned_model(model_dir: Path) -> ScannedModel:
             tier = "verified"
         elif verdict.runtime_compatibility == "missing-mtp-weights":
             tier = "mtp-missing"
+        elif artifact_missing:
+            tier = "mtp-missing"
+        elif verdict.runtime_compatibility == "invalid-mtp-tensor-layout":
+            tier = "mtp-invalid"
+        elif verdict.runtime_compatibility in {"needs-contract", "needs-grafting"}:
+            tier = "needs-verification"
+        elif verdict.runtime_compatibility == "recognized-backend-pending":
+            tier = "backend-pending"
         else:
-            tier = "arch-compatible"
+            tier = "needs-verification"
     elif raw_tier == "no-MTP":
         tier = "no-mtp"
     elif raw_tier == "incompatible-architecture":
-        tier = "incompatible"
+        tier = "backend-pending" if runtime_status == "recognized-backend-pending" else "incompatible"
     else:
         tier = "unknown"
 
@@ -277,9 +306,15 @@ def _tier_badge(tier: str) -> tuple[str, str]:
     if tier == "verified":
         return ("Verified", "bold green")
     if tier == "arch-compatible":
-        return ("Compatible (unverified)", "yellow")
+        return ("Runnable (unverified)", "yellow")
+    if tier == "needs-verification":
+        return ("Needs MTPLX verification", "yellow")
+    if tier == "mtp-invalid":
+        return ("MTP weights invalid", "yellow")
     if tier == "mtp-missing":
         return ("MTP weights missing", "yellow")
+    if tier == "backend-pending":
+        return ("Backend not runnable yet", "dim")
     if tier == "no-mtp":
         return ("No MTP head", "dim")
     if tier == "incompatible":
@@ -625,7 +660,7 @@ def _pick_local_model(*, default: str | None) -> str:
 
 
 def _scan_and_pick(root: Path) -> str | None:
-    print(f"  Scanning {_pretty_path(root)} for MTP-compatible models...")
+    print(f"  Scanning {_pretty_path(root)} for model folders...")
     found = _scan_for_models(root)
     if found:
         print(f"  Found {len(found)} candidate model folder(s). Checking configs...")
@@ -663,13 +698,16 @@ def _scan_and_pick(root: Path) -> str | None:
         )
     )
 
-    runnable = sum(1 for m in classified if m.tier == "verified")
-    compat = sum(1 for m in classified if m.tier == "arch-compatible")
+    verified = sum(1 for m in classified if m.tier == "verified")
+    runnable = sum(1 for m in classified if m.tier == "arch-compatible")
+    needs = sum(1 for m in classified if m.tier == "needs-verification")
     missing = sum(1 for m in classified if m.tier == "mtp-missing")
     intro = (
         f"Found {len(classified)} model(s) under {_pretty_path(root)}  ·  "
-        f"{runnable} verified, {compat} compatible"
+        f"{verified} verified, {runnable} runnable unverified"
     )
+    if needs:
+        intro += f", {needs} need verification"
     if missing:
         intro += f", {missing} missing MTP weights"
     if hidden > 0:
