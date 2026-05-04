@@ -67,6 +67,10 @@ def test_inspect_model_reads_qwen_mtp_config_without_weights(tmp_path):
     assert result.mtp.exists is False
     assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
     assert result.compatibility["exit_code"] == 3
+    assert result.compatibility["runtime_compatibility"] == "missing-mtp-weights"
+    assert result.compatibility["unsafe_force_required"] is False
+    assert "mtplx_runtime.json is optional metadata" in result.compatibility["message"]
+    assert "missing MTP weights" in result.compatibility["message"]
 
 
 def test_qwen3_5_text_subtype_can_pass_primary_gate_when_mtp_is_valid(monkeypatch, tmp_path):
@@ -142,7 +146,7 @@ def test_prequantized_mtp_sidecar_accepts_mlx_affine_scale_bias_tensors(tmp_path
     assert result.compatibility["recommended_profile"] == "performance-cold"
 
 
-def test_qwen_mtp_without_runtime_contract_is_unverified(monkeypatch, tmp_path):
+def test_qwen_mtp_without_runtime_contract_is_family_runnable(monkeypatch, tmp_path):
     from mtplx import artifacts
     from mtplx.artifacts import MTPInspection
 
@@ -172,9 +176,12 @@ def test_qwen_mtp_without_runtime_contract_is_unverified(monkeypatch, tmp_path):
 
     result = inspect_model(tmp_path)
 
-    assert result.passes_primary_gate is False
-    assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
-    assert result.compatibility["unsafe_force_required"] is True
+    assert result.passes_primary_gate is True
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["exit_code"] == 0
+    assert result.compatibility["unsafe_force_required"] is False
+    assert result.compatibility["runtime_compatibility"] == "native-family-gated"
 
 
 def test_qwen3_next_architecture_without_mtp_sidecar_is_unverified(tmp_path):
@@ -192,7 +199,7 @@ def test_qwen3_next_architecture_without_mtp_sidecar_is_unverified(tmp_path):
 
     assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
     assert result.compatibility["exit_code"] == 3
-    assert result.compatibility["runtime_compatibility"] == "needs-grafting"
+    assert result.compatibility["runtime_compatibility"] == "missing-mtp-weights"
 
 
 def test_architecture_catalog_tracks_main_mtp_families():
@@ -555,7 +562,7 @@ def test_llama_without_mtp_is_no_mtp(tmp_path):
     assert result.compatibility["exit_code"] == 2
 
 
-def test_hf_qwen_mtp_without_runtime_contract_is_unverified(monkeypatch):
+def test_hf_qwen_mtp_without_runtime_contract_is_family_runnable(monkeypatch):
     from mtplx import artifacts
 
     calls = []
@@ -592,8 +599,9 @@ def test_hf_qwen_mtp_without_runtime_contract_is_unverified(monkeypatch):
     assert result.source == "hf"
     assert result.mtp is not None
     assert result.mtp.metadata_only is True
-    assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
-    assert result.compatibility["exit_code"] == 3
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["exit_code"] == 0
     assert calls == [("Qwen/Qwen3-Next-80B-A3B-Instruct", "mtp.safetensors")]
 
 

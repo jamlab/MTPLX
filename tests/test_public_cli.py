@@ -1573,6 +1573,33 @@ def test_inspect_human_output_is_default(tmp_path, capsys):
     assert "message: Model has no MTP head." in captured
 
 
+def test_start_gate_failure_is_human_readable_for_config_only_qwen(tmp_path, capsys):
+    model = tmp_path / "qwen-config-only"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "mtp_num_hidden_layers": 1,
+                "num_hidden_layers": 64,
+                "hidden_size": 5120,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = main(["start", "cli", "--model", str(model), "--yes"])
+
+    captured = capsys.readouterr().out
+    assert code == 3
+    assert "error: model cannot run with MTPLX" in captured
+    assert "runtime: missing-mtp-weights" in captured
+    assert "mtplx_runtime.json is optional metadata" in captured
+    assert "fix: choose a model with real MTP weights" in captured
+    assert "\"model_files\"" not in captured
+
+
 def test_profiles_command_lists_default_without_mlx(capsys):
     code = main(["profiles", "--json"])
 

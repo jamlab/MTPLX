@@ -126,7 +126,7 @@ class ModelInspection:
     @property
     def passes_primary_gate(self) -> bool:
         if self.compatibility:
-            return self.compatibility.get("tier") == "verified"
+            return bool(self.compatibility.get("can_run"))
         return (
             self.config_exists
             and (self.model_type or "").startswith("qwen3_5")

@@ -21,6 +21,7 @@ SUPPORTED_ARCH_IDS = {
 }
 
 TIER_VERIFIED = "verified"
+TIER_FAMILY_COMPATIBLE_UNVERIFIED = "family-compatible-unverified"
 TIER_ARCH_COMPATIBLE_UNVERIFIED = "architecture-compatible-but-unverified"
 TIER_INCOMPATIBLE_ARCHITECTURE = "incompatible-architecture"
 TIER_NO_MTP = "no-MTP"
@@ -593,7 +594,9 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
         contract_error = contract_error or local_contract_error
     detected_arch_id = _detect_arch_id(inspection)
     has_mtp = _has_mtp_markers(inspection)
-    tensor_gate = bool(getattr(getattr(inspection, "mtp", None), "passes_tensor_gate", False))
+    mtp_artifact = getattr(inspection, "mtp", None)
+    tensor_gate = bool(getattr(mtp_artifact, "passes_tensor_gate", False))
+    mtp_artifact_exists = bool(getattr(mtp_artifact, "exists", False))
     contract_path = getattr(inspection, "runtime_contract_path", None)
     if not contract_path:
         contract_path = str(_contract_path(model_dir)) if _contract_path(model_dir).exists() else None
@@ -718,6 +721,56 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             if has_mtp
             else "Qwen3-Next architecture detected"
         )
+        if (
+            support is not None
+            and tensor_gate
+            and int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0) > 0
+        ):
+            return CompatibilityVerdict(
+                tier=TIER_FAMILY_COMPATIBLE_UNVERIFIED,
+                arch_id=detected_arch_id,
+                supported=True,
+                recognized=True,
+                can_run=True,
+                exit_code=EXIT_VERIFIED,
+                message=(
+                    f"{marker_text}; native MTP tensors match the supported "
+                    "Qwen family layout. mtplx_runtime.json is optional "
+                    "verification metadata, so this run will be marked "
+                    "unverified until an exactness baseline is recorded."
+                ),
+                recommended_backend="qwen3_next",
+                recommended_profile=DEFAULT_PROFILE_NAME,
+                unsafe_force_required=False,
+                unverified_model=True,
+                mtp_supported="yes",
+                runtime_compatibility="native-family-gated",
+                support_level="native-family-auto-smoke",
+                support_notes=(support.notes if support else None),
+            )
+        if not mtp_artifact_exists:
+            return CompatibilityVerdict(
+                tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+                arch_id=detected_arch_id,
+                supported=False,
+                recognized=True,
+                can_run=False,
+                exit_code=EXIT_UNVERIFIED,
+                message=(
+                    f"{marker_text}, but this folder does not contain runnable "
+                    "Qwen MTP tensors. mtplx_runtime.json is optional metadata; "
+                    "the blocker is missing MTP weights. Use a model with "
+                    "mtp.safetensors, or graft an MTP sidecar into this base model."
+                ),
+                recommended_backend="qwen3_next",
+                recommended_profile=DEFAULT_PROFILE_NAME,
+                unsafe_force_required=False,
+                unverified_model=True,
+                mtp_supported="no",
+                runtime_compatibility="missing-mtp-weights",
+                support_level="native-backend-missing-mtp-weights",
+                support_notes=(support.notes if support else None),
+            )
         return CompatibilityVerdict(
             tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
             arch_id=detected_arch_id,
@@ -726,17 +779,18 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             can_run=False,
             exit_code=EXIT_UNVERIFIED,
             message=(
-                f"{marker_text}, but no mtplx_runtime.json "
-                "verified contract is present. Use --unsafe-force-unverified "
-                "--yes to proceed without support guarantees."
+                f"{marker_text}, and an MTP artifact is present, but its tensor "
+                "layout does not match the Qwen native MTP runtime gate. "
+                "mtplx_runtime.json is optional metadata; repair or regenerate "
+                "the MTP sidecar so the tensor gate passes."
             ),
             recommended_backend="qwen3_next",
             recommended_profile=DEFAULT_PROFILE_NAME,
-            unsafe_force_required=True,
+            unsafe_force_required=False,
             unverified_model=True,
             mtp_supported="partial",
-            runtime_compatibility="needs-grafting",
-            support_level="native-backend-needs-contract",
+            runtime_compatibility="invalid-mtp-tensor-layout",
+            support_level="native-backend-invalid-mtp-tensors",
             support_notes=(support.notes if support else None),
         )
 

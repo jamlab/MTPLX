@@ -211,6 +211,57 @@ def _compact_model_summary(inspection: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _model_gate_error_lines(inspection: dict[str, Any]) -> list[str]:
+    compatibility = inspection.get("compatibility") or {}
+    mtp = inspection.get("mtp") or {}
+    lines = [
+        "error: model cannot run with MTPLX",
+        f"model: {inspection.get('model_dir') or inspection.get('model') or 'unknown'}",
+        f"tier: {compatibility.get('tier') or 'unknown'}",
+    ]
+    runtime_compatibility = compatibility.get("runtime_compatibility") or inspection.get("runtime_compatibility")
+    if runtime_compatibility:
+        lines.append(f"runtime: {runtime_compatibility}")
+    message = compatibility.get("message") or inspection.get("detail")
+    if message:
+        lines.append(f"reason: {message}")
+    if mtp:
+        lines.append(
+            "mtp: "
+            f"exists={str(bool(mtp.get('exists'))).lower()}, "
+            f"tensors={mtp.get('tensor_count', 0)}, "
+            f"gate={str(bool(mtp.get('passes_tensor_gate'))).lower()}"
+        )
+    if runtime_compatibility == "missing-mtp-weights":
+        lines.append(
+            "fix: choose a model with real MTP weights, or graft an MTP sidecar "
+            "into this base model."
+        )
+    elif compatibility.get("unsafe_force_required"):
+        lines.append("try: add --unsafe-force-unverified --yes to run without support guarantees")
+    else:
+        lines.append("try: mtplx inspect MODEL")
+    return lines
+
+
+def _print_model_gate_error(
+    inspection: dict[str, Any],
+    *,
+    printer=print,
+    json_output: bool = False,
+) -> None:
+    if json_output:
+        _print(
+            {
+                "error": "model failed MTPLX compatibility gate",
+                "model": _compact_model_summary(inspection),
+            }
+        )
+        return
+    for line in _model_gate_error_lines(inspection):
+        printer(line)
+
+
 def _profile_draft_lm_head_spec(profile: Any) -> dict[str, Any] | None:
     draft = getattr(profile, "draft_lm_head", None)
     if draft is None:
@@ -2734,7 +2785,7 @@ def cmd_serve_public(args: Any) -> int:
         yes=bool(getattr(args, "yes", False)),
     )
     if gate_exit is not None:
-        _print({"error": "model failed MTPLX compatibility gate", "model": inspection})
+        _print_model_gate_error(inspection, printer=_print_serve_start_line)
         return gate_exit
     draft_lm_head = _model_draft_lm_head_spec(inspection, profile) or {
         "bits": 4,
@@ -4082,7 +4133,11 @@ def cmd_quickstart_public(args: Any) -> int:
                 yes=bool(getattr(args, "yes", False)),
             )
             if gate_exit is not None:
-                _print({"error": "model failed MTPLX compatibility gate", "model": inspection})
+                _print_model_gate_error(
+                    inspection,
+                    printer=_quickstart_line,
+                    json_output=bool(getattr(args, "json", False)),
+                )
                 return gate_exit
             if target == "openwebui":
                 args.model = runtime_model
@@ -4102,7 +4157,11 @@ def cmd_quickstart_public(args: Any) -> int:
         yes=bool(getattr(args, "yes", False)),
     )
     if gate_exit is not None:
-        _print({"error": "model failed MTPLX compatibility gate", "model": inspection})
+        _print_model_gate_error(
+            inspection,
+            printer=_quickstart_line,
+            json_output=bool(getattr(args, "json", False)),
+        )
         return gate_exit
     _quickstart_line(f"model ready: {runtime_model}")
     if resolution.get("downloaded"):

@@ -592,6 +592,27 @@ def test_scan_for_models_honors_timeout(tmp_path, monkeypatch):
     assert found == []
 
 
+def test_classify_scanned_model_qwen_config_only_marks_mtp_missing(tmp_path):
+    target = _make_model_dir(tmp_path, "mlx-community/Qwen-config-only")
+
+    result = onboarding._classify_scanned_model(target)
+
+    assert result.tier == "mtp-missing"
+    assert result.arch_id == "qwen3-next-mtp"
+    label, _ = onboarding._tier_badge(result.tier)
+    assert "MTP weights missing" in label
+
+
+def test_classify_scanned_model_qwen_sidecar_without_contract_is_arch_compatible(tmp_path):
+    target = _make_model_dir(tmp_path, "Youssofal/Qwen-sidecar")
+    (target / "mtp.safetensors").write_bytes(b"placeholder")
+
+    result = onboarding._classify_scanned_model(target)
+
+    assert result.tier == "arch-compatible"
+    assert result.arch_id == "qwen3-next-mtp"
+
+
 def test_scan_and_pick_prints_candidate_progress_before_picker(tmp_path, monkeypatch, capsys):
     target = _make_model_dir(tmp_path, "lmstudio-community/Qwen-A")
     monkeypatch.setattr(
