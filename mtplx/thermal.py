@@ -194,6 +194,15 @@ def thermal_status() -> dict[str, Any]:
     }
 
 
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def fan_summary() -> dict[str, Any]:
     """Best-effort fan-RPM summary, used to verify ``thermalforge max`` actually
     ramped the fans rather than silently no-op'ing.
@@ -207,6 +216,9 @@ def fan_summary() -> dict[str, Any]:
         return {"ok": False, "min_rpm": None, "max_rpm": None, "fans": [], "raw": status}
     raw_stdout = status.get("status", {}).get("stdout") or ""
     rpms: list[int] = []
+    actual_rpms: list[int] = []
+    target_rpms: list[int] = []
+    capacity_rpms: list[int] = []
     fans: list[dict[str, Any]] = []
     try:
         import json as _json
@@ -234,28 +246,34 @@ def fan_summary() -> dict[str, Any]:
         for entry in candidates if isinstance(candidates, list) else []:
             if not isinstance(entry, dict):
                 continue
-            rpm_value = (
-                entry.get("actual_rpm")
-                if entry.get("actual_rpm") is not None
-                else entry.get("target_rpm")
-                if entry.get("target_rpm") is not None
-                else entry.get("rpm")
+            actual_int = _int_or_none(entry.get("actual_rpm"))
+            target_int = _int_or_none(entry.get("target_rpm"))
+            capacity_int = _int_or_none(entry.get("max_rpm"))
+            fallback_int = (
+                _int_or_none(entry.get("rpm"))
                 if entry.get("rpm") is not None
-                else entry.get("RPM")
+                else _int_or_none(entry.get("RPM"))
                 if entry.get("RPM") is not None
-                else entry.get("speed")
+                else _int_or_none(entry.get("speed"))
             )
-            try:
-                rpm_int = int(rpm_value)
-            except (TypeError, ValueError):
+            rpm_int = actual_int if actual_int is not None else target_int
+            if rpm_int is None:
+                rpm_int = fallback_int
+            if rpm_int is None:
                 continue
             rpms.append(rpm_int)
+            if actual_int is not None:
+                actual_rpms.append(actual_int)
+            if target_int is not None:
+                target_rpms.append(target_int)
+            if capacity_int is not None:
+                capacity_rpms.append(capacity_int)
             fans.append(
                 {
                     "rpm": rpm_int,
-                    "target_rpm": entry.get("target_rpm"),
-                    "actual_rpm": entry.get("actual_rpm"),
-                    "max_capacity_rpm": entry.get("max_rpm"),
+                    "target_rpm": target_int,
+                    "actual_rpm": actual_int,
+                    "max_capacity_rpm": capacity_int,
                     "mode": entry.get("mode"),
                     "raw": entry,
                 }
@@ -264,6 +282,12 @@ def fan_summary() -> dict[str, Any]:
         "ok": bool(rpms),
         "min_rpm": min(rpms) if rpms else None,
         "max_rpm": max(rpms) if rpms else None,
+        "actual_min_rpm": min(actual_rpms) if actual_rpms else None,
+        "actual_max_rpm": max(actual_rpms) if actual_rpms else None,
+        "target_min_rpm": min(target_rpms) if target_rpms else None,
+        "target_max_rpm": max(target_rpms) if target_rpms else None,
+        "capacity_min_rpm": min(capacity_rpms) if capacity_rpms else None,
+        "capacity_max_rpm": max(capacity_rpms) if capacity_rpms else None,
         "fans": fans,
         "raw": status,
     }
@@ -278,21 +302,32 @@ FAN_RAMP_FALLBACK_THRESHOLD_RPM = 4000
 
 
 def _fan_target_is_ramped(fan: dict[str, Any]) -> bool:
-    target = fan.get("target_rpm")
-    try:
-        target_int = None if target is None else int(target)
-    except (TypeError, ValueError):
-        target_int = None
+    target_int = _int_or_none(fan.get("target_rpm"))
     if target_int is None:
         return False
     max_capacity = fan.get("max_capacity_rpm") or (fan.get("raw") or {}).get("max_rpm")
-    try:
-        max_int = None if max_capacity is None else int(max_capacity)
-    except (TypeError, ValueError):
-        max_int = None
+    max_int = _int_or_none(max_capacity)
     if max_int and max_int > 0:
         return target_int >= int(max_int * FAN_RAMP_TARGET_FRACTION)
     return target_int >= FAN_RAMP_FALLBACK_THRESHOLD_RPM
+
+
+def _fan_actual_is_ramped(
+    fan: dict[str, Any],
+    *,
+    fraction: float = FAN_RAMP_TARGET_FRACTION,
+) -> bool:
+    actual_int = _int_or_none(fan.get("actual_rpm"))
+    if actual_int is None:
+        return False
+    max_capacity = fan.get("max_capacity_rpm") or (fan.get("raw") or {}).get("max_rpm")
+    max_int = _int_or_none(max_capacity)
+    if max_int and max_int > 0:
+        return actual_int >= int(max_int * fraction)
+    target_int = _int_or_none(fan.get("target_rpm"))
+    if target_int and target_int > 0:
+        return actual_int >= int(target_int * fraction)
+    return actual_int >= FAN_RAMP_FALLBACK_THRESHOLD_RPM
 
 
 def _summary_indicates_max(summary: dict[str, Any]) -> bool:
@@ -317,6 +352,29 @@ def _summary_indicates_max(summary: dict[str, Any]) -> bool:
     return False
 
 
+def _summary_indicates_actual_ramp(
+    summary: dict[str, Any],
+    *,
+    fraction: float = FAN_RAMP_TARGET_FRACTION,
+) -> bool:
+    if not summary.get("ok"):
+        return False
+    fans = summary.get("fans") or []
+    return bool(fans) and all(_fan_actual_is_ramped(fan, fraction=fraction) for fan in fans)
+
+
+def _rpm_range(min_value: Any, max_value: Any) -> str:
+    low = _int_or_none(min_value)
+    high = _int_or_none(max_value)
+    if low is None and high is None:
+        return "unavailable"
+    if low is None:
+        return f"{high} RPM"
+    if high is None or high == low:
+        return f"{low} RPM"
+    return f"{low}-{high} RPM"
+
+
 def _summary_indicates_auto(summary: dict[str, Any]) -> bool:
     """Return True iff all parsed fan rows are back on the automatic curve."""
 
@@ -327,11 +385,7 @@ def _summary_indicates_auto(summary: dict[str, Any]) -> bool:
         return False
     for fan in fans:
         mode = str(fan.get("mode") or "").lower()
-        target = fan.get("target_rpm")
-        try:
-            target_int = None if target is None else int(target)
-        except (TypeError, ValueError):
-            target_int = None
+        target_int = _int_or_none(fan.get("target_rpm"))
         # ThermalForge may report target_rpm as 0 or as the fan's low automatic
         # setpoint (~min_rpm) while mode is auto. The mode is the authoritative
         # restore signal; target only helps when a tool omits mode.
@@ -349,6 +403,10 @@ def set_thermal_profile_verified(
     profile: str,
     *,
     settle_seconds: float = 1.0,
+    require_actual_ramp: bool = False,
+    actual_ramp_timeout_s: float = 20.0,
+    actual_ramp_poll_interval_s: float = 1.0,
+    actual_ramp_fraction: float = FAN_RAMP_TARGET_FRACTION,
     log: Any = None,
 ) -> dict[str, Any]:
     """Set a fan profile and *prove* it took effect.
@@ -462,9 +520,52 @@ def set_thermal_profile_verified(
             ),
         }
 
+    if require_actual_ramp:
+        target_label = _rpm_range(after.get("target_min_rpm"), after.get("target_max_rpm"))
+        _emit(f"[max] target accepted: {target_label}; waiting for actual fans to ramp...")
+        deadline = time.monotonic() + max(0.0, float(actual_ramp_timeout_s))
+        while not _summary_indicates_actual_ramp(after, fraction=float(actual_ramp_fraction)):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(max(0.1, float(actual_ramp_poll_interval_s)))
+            after = fan_summary()
+        if not _summary_indicates_actual_ramp(after, fraction=float(actual_ramp_fraction)):
+            target_label = _rpm_range(after.get("target_min_rpm"), after.get("target_max_rpm"))
+            actual_label = _rpm_range(after.get("actual_min_rpm"), after.get("actual_max_rpm"))
+            return {
+                "ok": False,
+                "baseline": baseline,
+                "after": after,
+                "profile": profile,
+                "set_result": set_result,
+                "message": (
+                    f"`{tool_kind} {profile}` was accepted and target is {target_label}, "
+                    f"but actual fan RPM did not ramp before timeout. Actual: {actual_label}"
+                ),
+                "actionable": (
+                    "run `mtplx max --status --json` and check ThermalForge fan "
+                    "actual_rpm readings; MTPLX will not claim Max until the "
+                    "hardware ramp is visible."
+                ),
+            }
+
+        actual_label = _rpm_range(after.get("actual_min_rpm"), after.get("actual_max_rpm"))
+        target_label = _rpm_range(after.get("target_min_rpm"), after.get("target_max_rpm"))
+        _emit(f"[max] fans ramped: actual {actual_label}; target {target_label}")
+        return {
+            "ok": True,
+            "baseline": baseline,
+            "after": after,
+            "profile": profile,
+            "set_result": set_result,
+            "message": f"fans ramped to max (actual {actual_label}; target {target_label})",
+        }
+
+    target_label = _rpm_range(after.get("target_min_rpm"), after.get("target_max_rpm"))
+    actual_label = _rpm_range(after.get("actual_min_rpm"), after.get("actual_max_rpm"))
     _emit(
-        f"[max] fans pinned: target {after['max_rpm']} RPM (actual will catch "
-        f"up over ~15s); current actual {after['min_rpm']} RPM"
+        f"[max] fans commanded: target {target_label} (actual will catch "
+        f"up over ~15s); current actual {actual_label}"
     )
     return {
         "ok": True,
@@ -472,7 +573,7 @@ def set_thermal_profile_verified(
         "after": after,
         "profile": profile,
         "set_result": set_result,
-        "message": f"fans commanded to max ({after['max_rpm']} RPM target)",
+        "message": f"fans commanded to max ({target_label} target)",
     }
 
 
@@ -826,9 +927,18 @@ def install_max_lifecycle_hooks() -> Any:
 class MaxSession:
     """Verified, crash-safe lifecycle for every user-facing ``--max`` path."""
 
-    def __init__(self, *, log: Any = None, retry_open_app: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        log: Any = None,
+        retry_open_app: bool = True,
+        require_actual_ramp: bool = True,
+        actual_ramp_timeout_s: float = 25.0,
+    ) -> None:
         self.log = log
         self.retry_open_app = bool(retry_open_app)
+        self.require_actual_ramp = bool(require_actual_ramp)
+        self.actual_ramp_timeout_s = float(actual_ramp_timeout_s)
         self.cleanup: Any = None
         self.active = False
         self.thermal: dict[str, Any] = {
@@ -870,7 +980,12 @@ class MaxSession:
         # max. That closes the small but important crash window during live
         # verification itself.
         self.cleanup = install_max_lifecycle_hooks()
-        verified = set_thermal_profile_verified("performance", log=self._emit)
+        verified = set_thermal_profile_verified(
+            "performance",
+            log=self._emit,
+            require_actual_ramp=self.require_actual_ramp,
+            actual_ramp_timeout_s=self.actual_ramp_timeout_s,
+        )
         if not verified.get("ok") and self.retry_open_app:
             self._emit(f"[max] FIRST ATTEMPT FAILED: {verified.get('message')}")
             actionable = verified.get("actionable")
@@ -881,7 +996,12 @@ class MaxSession:
             if open_result.get("ok"):
                 self._emit("[max] opened ThermalForge.app; retrying in 4s...")
                 time.sleep(4.0)
-                verified = set_thermal_profile_verified("performance", log=self._emit)
+                verified = set_thermal_profile_verified(
+                    "performance",
+                    log=self._emit,
+                    require_actual_ramp=self.require_actual_ramp,
+                    actual_ramp_timeout_s=self.actual_ramp_timeout_s,
+                )
 
         self.thermal["verified"] = verified
         self.thermal["start"] = verified.get("set_result", {"ok": False})

@@ -334,7 +334,159 @@ def test_set_thermal_profile_verified_succeeds_when_daemon_commands_max(monkeypa
     )
 
     assert result["ok"] is True, result
-    assert any("fans pinned" in line.lower() for line in call_log)
+    assert any("fans commanded" in line.lower() for line in call_log)
+    assert "7826 RPM target" in result["message"]
+    thermal.detect_thermal_control.cache_clear()
+
+
+def test_set_thermal_profile_verified_does_not_report_zero_target_when_actual_is_zero(monkeypatch):
+    """Regression: ThermalForge can command max immediately while actual_rpm is
+    still 0. The message must report the target_rpm, not the actual fallback,
+    or the CLI prints the nonsense "target 0 RPM" line."""
+
+    thermal.detect_thermal_control.cache_clear()
+    monkeypatch.setattr(thermal, "_find_thermalforge", lambda: "/usr/local/bin/thermalforge")
+    call_log: list[str] = []
+    statuses = [
+        (
+            '{"fans": ['
+            '{"actual_rpm": 0, "target_rpm": 2317, "max_rpm": 7826, "mode": "auto", "index": 0},'
+            '{"actual_rpm": 0, "target_rpm": 2502, "max_rpm": 7826, "mode": "auto", "index": 1}'
+            ']}'
+        ),
+        (
+            '{"fans": ['
+            '{"actual_rpm": 0, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 0},'
+            '{"actual_rpm": 0, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 1}'
+            ']}'
+        ),
+    ]
+
+    def fake_run(command, *, timeout_s=None, cwd=None):
+        if command and command[-1] == "status":
+            stdout = statuses.pop(0) if statuses else (
+                '{"fans": ['
+                '{"actual_rpm": 0, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 0},'
+                '{"actual_rpm": 0, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 1}'
+                ']}'
+            )
+            return {"command": command, "returncode": 0, "ok": True, "stdout": stdout, "stderr": ""}
+        return {"command": command, "returncode": 0, "ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(thermal, "_run_probe", fake_run)
+
+    result = thermal.set_thermal_profile_verified(
+        "performance",
+        settle_seconds=0,
+        log=call_log.append,
+    )
+
+    assert result["ok"] is True, result
+    assert result["after"]["actual_max_rpm"] == 0
+    assert result["after"]["target_max_rpm"] == 7826
+    assert "7826 RPM target" in result["message"]
+    assert "target 0 RPM" not in "\n".join(call_log)
+    thermal.detect_thermal_control.cache_clear()
+
+
+def test_set_thermal_profile_verified_waits_for_actual_ramp_when_required(monkeypatch):
+    thermal.detect_thermal_control.cache_clear()
+    monkeypatch.setattr(thermal, "_find_thermalforge", lambda: "/usr/local/bin/thermalforge")
+    monkeypatch.setattr(thermal.time, "sleep", lambda _seconds: None)
+    call_log: list[str] = []
+    statuses = [
+        (
+            '{"fans": ['
+            '{"actual_rpm": 2315, "target_rpm": 2317, "max_rpm": 7826, "mode": "auto", "index": 0},'
+            '{"actual_rpm": 2501, "target_rpm": 2502, "max_rpm": 7826, "mode": "auto", "index": 1}'
+            ']}'
+        ),
+        (
+            '{"fans": ['
+            '{"actual_rpm": 0, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 0},'
+            '{"actual_rpm": 0, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 1}'
+            ']}'
+        ),
+        (
+            '{"fans": ['
+            '{"actual_rpm": 4400, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 0},'
+            '{"actual_rpm": 4500, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 1}'
+            ']}'
+        ),
+        (
+            '{"fans": ['
+            '{"actual_rpm": 6900, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 0},'
+            '{"actual_rpm": 7000, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 1}'
+            ']}'
+        ),
+    ]
+
+    def fake_run(command, *, timeout_s=None, cwd=None):
+        if command and command[-1] == "status":
+            stdout = statuses.pop(0) if statuses else (
+                '{"fans": ['
+                '{"actual_rpm": 6900, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 0},'
+                '{"actual_rpm": 7000, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 1}'
+                ']}'
+            )
+            return {"command": command, "returncode": 0, "ok": True, "stdout": stdout, "stderr": ""}
+        return {"command": command, "returncode": 0, "ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(thermal, "_run_probe", fake_run)
+
+    result = thermal.set_thermal_profile_verified(
+        "performance",
+        settle_seconds=0,
+        require_actual_ramp=True,
+        actual_ramp_timeout_s=5,
+        actual_ramp_poll_interval_s=0.1,
+        log=call_log.append,
+    )
+
+    assert result["ok"] is True, result
+    assert result["after"]["actual_min_rpm"] == 6900
+    assert "fans ramped to max" in result["message"]
+    assert any("waiting for actual fans to ramp" in line for line in call_log)
+    thermal.detect_thermal_control.cache_clear()
+
+
+def test_set_thermal_profile_verified_fails_when_actual_ramp_is_required_but_stuck(monkeypatch):
+    thermal.detect_thermal_control.cache_clear()
+    monkeypatch.setattr(thermal, "_find_thermalforge", lambda: "/usr/local/bin/thermalforge")
+    stuck_max = (
+        '{"fans": ['
+        '{"actual_rpm": 0, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 0},'
+        '{"actual_rpm": 0, "target_rpm": 7826, "max_rpm": 7826, "mode": "manual", "index": 1}'
+        ']}'
+    )
+    statuses = [
+        (
+            '{"fans": ['
+            '{"actual_rpm": 2315, "target_rpm": 2317, "max_rpm": 7826, "mode": "auto", "index": 0},'
+            '{"actual_rpm": 2501, "target_rpm": 2502, "max_rpm": 7826, "mode": "auto", "index": 1}'
+            ']}'
+        ),
+        stuck_max,
+    ]
+
+    def fake_run(command, *, timeout_s=None, cwd=None):
+        if command and command[-1] == "status":
+            stdout = statuses.pop(0) if statuses else stuck_max
+            return {"command": command, "returncode": 0, "ok": True, "stdout": stdout, "stderr": ""}
+        return {"command": command, "returncode": 0, "ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(thermal, "_run_probe", fake_run)
+
+    result = thermal.set_thermal_profile_verified(
+        "performance",
+        settle_seconds=0,
+        require_actual_ramp=True,
+        actual_ramp_timeout_s=0,
+    )
+
+    assert result["ok"] is False
+    assert "actual fan RPM did not ramp" in result["message"]
+    assert "Actual: 0 RPM" in result["message"]
     thermal.detect_thermal_control.cache_clear()
 
 
