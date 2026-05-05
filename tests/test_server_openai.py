@@ -792,12 +792,14 @@ def test_chat_stream_emits_heartbeat_during_alive_silence(monkeypatch):
     tokens = [ord("o"), ord("k"), ord("\n")]
 
     monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
-    monkeypatch.setattr(openai, "STREAM_HEARTBEAT_INTERVAL_S", 0.01)
+    monkeypatch.setattr(openai, "STREAM_HEARTBEAT_INTERVAL_S", 0.0)
     monkeypatch.setattr(openai, "STREAM_SILENCE_WARN_S", 0.01)
     monkeypatch.setattr(openai, "STREAM_SILENCE_WARN_INTERVAL_S", 60.0)
 
     def fake_run_generation(_state, _prompt_ids, **kwargs):
-        time.sleep(0.35)
+        # Leave enough wall time for the ASGI stream loop to observe an empty
+        # token queue even on slower GitHub macOS runners.
+        time.sleep(1.25)
         kwargs["token_callback"](tokens)
         return {
             "text": "ok\n",
