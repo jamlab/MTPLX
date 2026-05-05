@@ -11,7 +11,7 @@ launcher in ~/.local/bin. On Apple Silicon Homebrew installs, it also writes
 /opt/homebrew/bin/mtplx when that directory is writable.
 
 Environment:
-  MTPLX_PACKAGE_SPEC=mtplx              Package spec to install, for example mtplx==0.1.0rc2
+  MTPLX_PACKAGE_SPEC=mtplx              Package spec to install, for example mtplx==0.1.0rc3
   MTPLX_PYTHON=/path/to/python3         Python interpreter override
   MTPLX_VENV=~/.mtplx/venv              Install venv path
   MTPLX_USER_BIN=~/.local/bin           User launcher directory

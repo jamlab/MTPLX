@@ -12,7 +12,7 @@
 [![PyPI](https://img.shields.io/pypi/v/mtplx?label=PyPI)](https://pypi.org/project/mtplx/)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-black?logo=apple)](https://developer.apple.com/metal/)
-[![Status](https://img.shields.io/badge/status-v0.1.0--preview.2-orange)](CHANGELOG.md)
+[![Status](https://img.shields.io/badge/status-v0.1.0--preview.3-orange)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 </div>
@@ -105,7 +105,7 @@ Homebrew writes a durable launcher so `mtplx` works from a normal new Terminal t
 curl -fsSL https://raw.githubusercontent.com/youssofal/MTPLX/main/scripts/install_macos.sh | bash
 ```
 
-For Python-only installs, PyPI is also available. Preview 2 is packaged as `0.1.0rc2`, so use:
+For Python-only installs, PyPI is also available. Preview 3 is packaged as `0.1.0rc3`, so use:
 
 ```bash
 python3 -m pip install --pre mtplx

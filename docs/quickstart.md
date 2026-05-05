@@ -15,11 +15,11 @@ Homebrew is the recommended macOS path. Python-only installs can use PyPI:
 python3 -m pip install --pre mtplx
 ```
 
-The GitHub release wheel remains available for reproducible Preview 2 installs:
+The GitHub release wheel remains available for reproducible Preview 3 installs:
 
 ```bash
-gh release download v0.1.0-preview.2 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc2-py3-none-any.whl' --pattern 'install_preview_global.sh'
-bash install_preview_global.sh ./mtplx-0.1.0rc2-py3-none-any.whl
+gh release download v0.1.0-preview.3 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc3-py3-none-any.whl' --pattern 'install_preview_global.sh'
+bash install_preview_global.sh ./mtplx-0.1.0rc3-py3-none-any.whl
 ```
 
 The commands above are no-MLX-safe except generation and serving. A missing MLX runtime should appear in `doctor` as an actionable dependency issue, not a traceback.

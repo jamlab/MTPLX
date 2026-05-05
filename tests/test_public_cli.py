@@ -2,10 +2,22 @@ from __future__ import annotations
 
 import json
 import sys
+import tomllib
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 from mtplx.cli import build_parser, main
 from mtplx.commands import public
+from mtplx.version import DISPLAY_VERSION, __version__
+
+
+def test_version_metadata_matches_package_metadata():
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
+
+    assert __version__ == project["version"]
+    if __version__.startswith("0.1.0rc"):
+        assert DISPLAY_VERSION == f"0.1.0-preview.{__version__.removeprefix('0.1.0rc')}"
 
 
 def test_version_command_without_subcommand(capsys):
@@ -15,7 +27,7 @@ def test_version_command_without_subcommand(capsys):
         assert exc.code == 0
 
     captured = capsys.readouterr().out
-    assert "mtplx 0.1.0-preview.1 (0.1.0rc1)" in captured
+    assert "mtplx 0.1.0-preview.3 (0.1.0rc3)" in captured
 
 
 def test_empty_cli_shows_friendly_consumer_help(capsys):

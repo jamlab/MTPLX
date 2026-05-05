@@ -2,6 +2,12 @@
 
 All notable user-facing changes are recorded here.
 
+## v0.1.0-preview.3
+
+### Fixed
+
+- Corrected the package and CLI version constants so fresh installs report `mtplx 0.1.0-preview.3 (0.1.0rc3)`. Preview 3 supersedes Preview 2, whose artifacts contained the OpenClaw and WebUI fixes but still printed the Preview 1 version string.
+
 ## v0.1.0-preview.2
 
 ### Added
