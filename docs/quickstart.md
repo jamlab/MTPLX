@@ -1,8 +1,7 @@
 # Quickstart
 
 ```bash
-gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl' --pattern 'install_preview_global.sh'
-bash install_preview_global.sh ./mtplx-0.1.0rc1-py3-none-any.whl
+brew install youssofal/mtplx/mtplx
 
 mtplx help
 mtplx doctor --summary
@@ -10,7 +9,18 @@ mtplx pull Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed
 mtplx inspect Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed --json
 ```
 
-Public `pip install mtplx` is the Stage C target after PyPI Trusted Publishing is configured. The current private preview path uses the GitHub release wheel plus `install_preview_global.sh` so `mtplx` works from a normal Terminal without activating a project venv.
+Homebrew is the recommended macOS path. Python-only installs can use PyPI:
+
+```bash
+python3 -m pip install --pre mtplx
+```
+
+The GitHub release wheel remains available for reproducible Preview 2 installs:
+
+```bash
+gh release download v0.1.0-preview.2 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc2-py3-none-any.whl' --pattern 'install_preview_global.sh'
+bash install_preview_global.sh ./mtplx-0.1.0rc2-py3-none-any.whl
+```
 
 The commands above are no-MLX-safe except generation and serving. A missing MLX runtime should appear in `doctor` as an actionable dependency issue, not a traceback.
 

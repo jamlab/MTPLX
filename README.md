@@ -12,7 +12,7 @@
 [![PyPI](https://img.shields.io/pypi/v/mtplx?label=PyPI)](https://pypi.org/project/mtplx/)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-black?logo=apple)](https://developer.apple.com/metal/)
-[![Status](https://img.shields.io/badge/status-v0.1.0--preview.1-orange)](CHANGELOG.md)
+[![Status](https://img.shields.io/badge/status-v0.1.0--preview.2-orange)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 </div>
@@ -43,8 +43,9 @@ That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MT
 - **Native MTP speculative decoding.** Built-in MTP heads, no external drafter, no RAM hit for a second model.
 - **Math-correct sampling at T=0.6.** Probability-ratio acceptance with residual correction. Verified `max_diff = 0.0` against reference single-token AR on the verified Qwen3.6-27B path.
 - **~2.24× over no-MTP AR at `temp=0.6`.** The hardware-independent number, which the CLI reports as `mean_speedup_vs_ar`. Verified contract on the public default `Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`: `63.056 / 62.886 tok/s` MTP-D3 vs `28.156 tok/s` no-MTP AR, on Apple Silicon M5 Max with `--max` fans, target sampler `temp=0.6 top_p=0.95 top_k=20`, draft sampler `temp=0.70`. Absolute tok/s scales with memory bandwidth; the 2.24× multiplier doesn't.
-- **Real serving surface.** OpenAI-compatible `/v1/chat/completions` + `/v1/completions` + `/v1/models`, Anthropic-compatible `/v1/messages` (streaming SSE), `/health`, `/metrics`. Plug it into Open WebUI, Claude Code, Cline, Continue, or anything that speaks OpenAI.
-- **In-browser chat UI** with auto-detected model context (256k for Qwen3.6), live tokens-per-second, markdown rendering, code-block copy buttons, a stop button, and a settings sidebar that persists per-machine.
+- **Real serving surface.** OpenAI-compatible `/v1/chat/completions` + `/v1/completions` + `/v1/models`, Anthropic-compatible `/v1/messages` (streaming SSE), `/health`, `/metrics`. Plug it into Open WebUI, OpenClaw, Claude Code, Cline, Continue, or anything that speaks OpenAI.
+- **Agent tool calls.** OpenAI-style `tools` / `tool_choice`, structured `message.tool_calls`, streaming `delta.tool_calls`, and tool-result history are supported so agent clients execute tools instead of printing Qwen tool markup.
+- **In-browser chat UI** with auto-detected model context (256k for Qwen3.6), live tokens-per-second, markdown rendering, code-block copy buttons, a stop button, an MTP on/off toggle, and a settings sidebar that persists per-machine.
 - **Interactive start wizard.** Pick model, mode, and surface in three numbered prompts. Returning users get "same as last time?". No flag-soup required.
 - **Local-folder model picker.** Point the wizard at any parent directory — your `~/models/`, the LM Studio cache, the HuggingFace cache — and it walks the tree, classifies each model into the four-tier compatibility contract, and presents a numbered picker. Config-only classification, never mmaps a tensor file, so a single APFS-dataless or partial download in the tree can't crash the picker.
 - **One-line live download progress.** Single rich-rendered line with bar / percent / GB / speed / ETA, streamed at 8 fps. HuggingFace's tqdm bars are suppressed during the download so they don't fight the MTPLX UI for terminal real estate.
@@ -56,7 +57,7 @@ That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MT
 - **Idle-aware Max mode.** Server tracks request activity; after 15 minutes of no chat, fans drop to auto, then ramp back up on the next message.
 - **Four-tier model compatibility contract.** `mtplx inspect <model>` reports: verified / arch-compatible-unverified / incompatible-architecture / no-MTP. No silent garbage runs.
 - **Lazy imports.** `mtplx --help`, `doctor`, `inspect`, `init`, `setup` work on a fresh venv *without MLX installed*. Generation and serving pull in MLX only when needed.
-- **Preview status: 562-test suite green**, including end-to-end onboarding, local-folder picker, live download progress, fan-control crash safety, OpenAI server fake-state, lazy-import survival, exactness gates.
+- **Preview status: local and GitHub release gates green**, including onboarding, local-folder picker, live download progress, fan-control crash safety, OpenAI server/tool-call compatibility, lazy-import survival, exactness gates, wheel build, and repository hygiene.
 
 > **Preview honesty.** The cold path is verified at the **~2.24× multiplier** above. *Sustained* no-fan long-context throughput is currently in a worse lane on Flappy 10k versus the v0.2 target — the v0.1 release ships with this gap explicit. Closing it is the v0.2 deliverable; see [Roadmap](#roadmap).
 
@@ -104,7 +105,7 @@ Homebrew writes a durable launcher so `mtplx` works from a normal new Terminal t
 curl -fsSL https://raw.githubusercontent.com/youssofal/MTPLX/main/scripts/install_macos.sh | bash
 ```
 
-For Python-only installs, PyPI is also available. Preview 1 is packaged as `0.1.0rc1`, so use:
+For Python-only installs, PyPI is also available. Preview 2 is packaged as `0.1.0rc2`, so use:
 
 ```bash
 python3 -m pip install --pre mtplx

@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/install_preview_global.sh ./mtplx-0.1.0rc1-py3-none-any.whl
+  scripts/install_preview_global.sh ./mtplx-0.1.0rc2-py3-none-any.whl
 
 Installs the private MTPLX preview wheel into ~/.mtplx/preview-venv and creates
 a global `mtplx` launcher in ~/.local/bin. On Apple Silicon Homebrew installs,

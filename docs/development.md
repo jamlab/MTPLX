@@ -11,19 +11,19 @@ Keep generated artifacts, model weights, and local credentials out of Git. The r
 
 ## Release
 
-Private GitHub preview artifacts are published from a clean tag:
+Preview artifacts are published from a clean tag:
 
 ```bash
-git tag -a v0.1.0-preview.1 -m "MTPLX v0.1.0-preview.1"
-git push origin v0.1.0-preview.1
-gh release create v0.1.0-preview.1 dist/* --prerelease --title "MTPLX v0.1.0-preview.1"
+git tag -a v0.1.0-preview.2 -m "MTPLX v0.1.0-preview.2"
+git push origin v0.1.0-preview.2
+gh release create v0.1.0-preview.2 dist/* scripts/install_macos.sh scripts/install_preview_global.sh --prerelease --title "MTPLX Preview 2"
 ```
 
-While the repository is private, direct unauthenticated release-asset URLs return 404. Use GitHub CLI authentication for private artifact smoke tests:
+Use GitHub CLI authentication for artifact smoke tests:
 
 ```bash
-gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl' --pattern 'install_preview_global.sh'
-bash install_preview_global.sh ./mtplx-0.1.0rc1-py3-none-any.whl
+gh release download v0.1.0-preview.2 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc2-py3-none-any.whl' --pattern 'install_preview_global.sh'
+bash install_preview_global.sh ./mtplx-0.1.0rc2-py3-none-any.whl
 mtplx help
 ```
 
@@ -32,14 +32,14 @@ PyPI publishing is wired through Trusted Publishing, not local long-lived tokens
 ```text
 project: mtplx
 owner: youssofal
-repository: mtplx
+repository: MTPLX
 workflow: release.yml
 environment: pypi
 ```
 
-The `release.yml` workflow always builds and checks artifacts for tags. It uploads to PyPI only when either:
+The `release.yml` workflow always builds and checks artifacts for tags. PyPI
+publishing is manual only:
 
-- a maintainer manually runs the workflow with `publish_to_pypi=true`, or
-- the repository variable `ENABLE_PYPI_PUBLISH` is set to `true` for tag pushes.
-
-Keep `ENABLE_PYPI_PUBLISH` unset until the PyPI pending publisher and GitHub `pypi` environment approval gate are configured.
+- tag pushes build and check artifacts but do not publish
+- a maintainer must run the workflow with `publish_to_pypi=true` after the tag
+  exists and the local build/twine gates pass

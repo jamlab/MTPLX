@@ -2,6 +2,18 @@
 
 All notable user-facing changes are recorded here.
 
+## v0.1.0-preview.2
+
+### Added
+
+- Added OpenAI-compatible tool-call support for agent clients such as OpenClaw: MTPLX now accepts `tools` / `tool_choice`, feeds tool schemas into the Qwen chat template, returns structured `message.tool_calls`, streams `delta.tool_calls`, and preserves tool-result history across turns.
+- Added target-only AR switching without unloading the runtime: use `--no-mtp`, `/mtp off` in terminal chat, `"generation_mode":"ar"` in API requests, or the browser chat MTP toggle to compare against native-MTP generation.
+
+### Fixed
+
+- Fixed agent clients printing raw Qwen `<tool_call>` markup instead of executing tools.
+- Fixed malformed generated tool-call markup leaking to clients; MTPLX now returns an explicit protocol error.
+
 ## v0.1.0-preview.1
 
 ### Added

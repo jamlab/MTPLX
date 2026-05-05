@@ -5,7 +5,8 @@ This avoids long-lived PyPI API tokens in GitHub secrets.
 
 ## One-time PyPI setup
 
-`mtplx` is expected to be created through a pending trusted publisher.
+`mtplx` is published through PyPI Trusted Publishing. If the publisher ever
+needs to be recreated, use the exact values below.
 
 Create the pending publisher at:
 
@@ -27,14 +28,14 @@ The environment name matters. PyPI checks it against the GitHub OIDC token, so
 `pypi` on PyPI must match the `environment: pypi` job in
 `.github/workflows/release.yml`.
 
-## Publish Preview 1
+## Publish Preview 2
 
-After the pending publisher exists, run:
+After the version bump and release tag exist, run:
 
 ```bash
 gh workflow run release.yml \
   --repo youssofal/MTPLX \
-  -f ref=v0.1.0-preview.1 \
+  -f ref=v0.1.0-preview.2 \
   -f publish_to_pypi=true
 ```
 
@@ -54,7 +55,7 @@ python3 -m venv /tmp/mtplx-pypi-verify
 /tmp/mtplx-pypi-verify/bin/mtplx help
 ```
 
-Preview 1 is packaged as `0.1.0rc1`. If a user's pip is configured to reject
+Preview 2 is packaged as `0.1.0rc2`. If a user's pip is configured to reject
 pre-releases even when no stable release exists, this explicit form also works:
 
 ```bash
