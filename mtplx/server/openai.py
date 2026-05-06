@@ -23,7 +23,7 @@ import time
 import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -43,6 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, ConfigDict, Field
 
 from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
+from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
 from mtplx.mtp_patch import MTPContract
 from mtplx.sampling import SamplerConfig
@@ -458,11 +459,10 @@ class ServerState:
         self.foreground_active = 0
         self.rate_limiter = _RateLimiter(args.rate_limit)
         self.profile = get_profile(args.profile)
-        runtime_label = (
-            "Medium MTP"
-            if self.profile.name == "performance-cold"
-            else self.profile.name
-        )
+        runtime_label = {
+            "performance-cold": "Burst MTP",
+            "sustained": "Sustained MTP",
+        }.get(self.profile.name, self.profile.name)
         _startup_line(f"[4/6] Preparing {runtime_label} runtime")
         if args.generation_mode == "mtp" and not args.load_mtp:
             raise ValueError("--generation-mode mtp requires --load-mtp")
@@ -1606,8 +1606,93 @@ def _stream_heartbeat_payload(
     }
 
 
+@contextmanager
+def _temporary_env(updates: dict[str, str | None]):
+    previous = {key: os.environ.get(key) for key in updates}
+    try:
+        for key, value in updates.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _dynamic_paged_kv_env(
+    *,
+    prompt_tokens: int,
+    max_new_tokens: int,
+    mtp_depth: int,
+) -> dict[str, str]:
+    needed = max(0, int(prompt_tokens)) + max(0, int(max_new_tokens)) + max(0, int(mtp_depth))
+    return {"MTPLX_DYNAMIC_PAGED_KV_TOKENS": str(needed)}
+
+
+def _generation_truth_stats(state: "ServerState", effective_mode: str) -> dict[str, Any]:
+    load_mtp = bool(getattr(state.args, "load_mtp", True))
+    runtime_mtp_enabled = bool(getattr(state.runtime, "mtp_enabled", False))
+    draft_head = getattr(state, "draft_lm_head", None)
+    draft_head_installed = (
+        bool(draft_head.get("installed", "draft_only" in draft_head))
+        if isinstance(draft_head, dict)
+        else bool(draft_head)
+    )
+    if effective_mode == "mtp" and load_mtp and runtime_mtp_enabled:
+        benchmark_mode = "mtplx_mtp_loaded_mtp_decode"
+    elif effective_mode == "ar" and load_mtp and runtime_mtp_enabled:
+        benchmark_mode = "mtplx_mtp_loaded_target_ar"
+    elif effective_mode == "ar" and not load_mtp and not runtime_mtp_enabled:
+        benchmark_mode = "mtplx_stock_ar_unloaded"
+    else:
+        benchmark_mode = "mtplx_unclassified"
+    return {
+        "benchmark_mode": benchmark_mode,
+        "load_mtp": load_mtp,
+        "runtime_mtp_enabled": runtime_mtp_enabled,
+        "draft_head_installed": draft_head_installed,
+        "profile": getattr(getattr(state, "profile", None), "name", None),
+    }
+
+
 PUBLIC_MTPLX_STATS_KEYS = (
     "mode",
+    "profile",
+    "benchmark_mode",
+    "load_mtp",
+    "runtime_mtp_enabled",
+    "draft_head_installed",
+    "ar_return_hidden",
+    "forward_ar_hidden_calls",
+    "forward_ar_plain_calls",
+    "mtp_forward_calls",
+    "make_mtp_cache_calls",
+    "update_mtp_cache_calls",
+    "mtp_history_append_calls",
+    "full_logits_tokens_emitted",
+    "final_logits_tokens_emitted",
+    "logits_tokens_emitted",
+    "prefill_chunk_size",
+    "prefill_chunks",
+    "paged_kv_capacity_tokens",
+    "paged_kv_num_blocks",
+    "paged_active_array_calls",
+    "attention_dense_fallback_calls",
+    "prefill_dense_fallback_calls",
+    "decode_dense_fallback_calls",
+    "ar_dense_fallback_calls",
+    "postcommit_dense_fallback_calls",
+    "paged_attention_bailouts_by_phase_reason",
+    "paged_attention_large_q_path",
+    "large_q_split_sdpa_fallback_calls",
+    "partitioned_paged_calls",
+    "sessionbank_snapshot_bytes",
+    "sessionbank_skipped_oversized_snapshot",
     "generation_mode",
     "generated_tokens",
     "prompt_tokens",
@@ -1908,12 +1993,13 @@ def _store_retokenized_history_snapshot(
     state.begin_foreground()
     state.lock.acquire()
     try:
-        prompt_state = restore_or_prefill_prompt_state(
-            state.runtime,
-            history_ids,
-            mtp_hidden_variant="post_norm",
-            mtp_history_policy="committed",
-        )
+        with attention_phase("postcommit"):
+            prompt_state = restore_or_prefill_prompt_state(
+                state.runtime,
+                history_ids,
+                mtp_hidden_variant="post_norm",
+                mtp_history_policy="committed",
+            )
         mtp_snapshot = (
             snapshot_cache(prompt_state.committed_mtp_cache)
             if prompt_state.committed_mtp_cache is not None
@@ -1939,6 +2025,13 @@ def _store_retokenized_history_snapshot(
     finally:
         state.lock.release()
         state.end_foreground()
+    if entry is None:
+        return {
+            "stored": False,
+            "mode": "retokenized_history",
+            "reason": "sessionbank_snapshot_skipped",
+            "elapsed_s": time.perf_counter() - started,
+        }
     return {
         "stored": True,
         "mode": "retokenized_history",
@@ -2133,6 +2226,13 @@ def _store_generation_final_history_snapshot(
         )
     finally:
         state.lock.release()
+    if entry is None:
+        return {
+            "stored": False,
+            "mode": compatibility["mode"],
+            "reason": "sessionbank_snapshot_skipped",
+            "elapsed_s": time.perf_counter() - started,
+        }
     return {
         "stored": True,
         "mode": compatibility["mode"],
@@ -2365,73 +2465,79 @@ def _run_generation(
             state.lock.acquire()
         lock_wait_time_s += time.perf_counter() - lock_started
         try:
-            if effective_mode == "ar":
-                out = generate_ar(
-                    state.runtime,
-                    prompt_ids,
-                    max_tokens=response_max,
-                    sampler=sampler,
-                    seed=generation_seed,
-                    token_callback=record_tokens,
-                    trace_label=trace_label,
-                    trace_metadata=trace_metadata,
-                )
-            else:
-                adaptive_policy = _make_adaptive_policy(
-                    state.args, max_depth=effective_depth
-                )
-                out = generate_mtpk(
-                    state.runtime,
-                    prompt_ids,
-                    max_tokens=response_max,
-                    sampler=sampler,
-                    draft_sampler=state.draft_sampler,
-                    speculative_depth=effective_depth,
-                    seed=generation_seed,
-                    mtp_hidden_variant="post_norm",
-                    mtp_cache_policy="persistent",
-                    mtp_history_policy="committed",
-                    verify_strategy=state.args.verify_strategy,
-                    verify_core=state.args.verify_core,
-                    token_callback=record_tokens,
-                    session_bank=session_bank,
-                    session_restore_mode=_session_bank_restore_mode(
-                        session_restore_mode
-                    ),
-                    session_template_hash=session_template_hash,
-                    session_draft_head_identity=session_draft_head_identity,
-                    session_policy_fingerprint=session_policy_fingerprint,
-                    capture_final_state=session_bank is not None,
-                    trace_label=trace_label,
-                    trace_metadata=trace_metadata,
-                    adaptive_policy=adaptive_policy,
-                    online_correction_cache=bool(state.args.online_correction_cache),
-                    online_correction_cache_min_depth=int(
-                        state.args.online_correction_cache_min_depth
-                    ),
-                    online_correction_cache_key=str(
-                        state.args.online_correction_cache_key
-                    ),
-                    prompt_correction_cache=bool(state.args.prompt_correction_cache),
-                    prompt_correction_cache_min_depth=int(
-                        state.args.prompt_correction_cache_min_depth
-                    ),
-                    online_hidden_corrector_alpha=float(
-                        state.args.online_hidden_corrector_alpha
-                    ),
-                    online_hidden_corrector_decay=float(
-                        state.args.online_hidden_corrector_decay
-                    ),
-                    online_hidden_corrector_warmup=int(
-                        state.args.online_hidden_corrector_warmup
-                    ),
-                    online_hidden_corrector_max_feed_depth=(
-                        state.args.online_hidden_corrector_max_feed_depth
-                    ),
-                    online_hidden_corrector_key=str(
-                        state.args.online_hidden_corrector_key
-                    ),
-                )
+            dynamic_kv_env = _dynamic_paged_kv_env(
+                prompt_tokens=len(prompt_ids),
+                max_new_tokens=response_max,
+                mtp_depth=effective_depth,
+            )
+            with _temporary_env(dynamic_kv_env):
+                if effective_mode == "ar":
+                    out = generate_ar(
+                        state.runtime,
+                        prompt_ids,
+                        max_tokens=response_max,
+                        sampler=sampler,
+                        seed=generation_seed,
+                        token_callback=record_tokens,
+                        trace_label=trace_label,
+                        trace_metadata=trace_metadata,
+                    )
+                else:
+                    adaptive_policy = _make_adaptive_policy(
+                        state.args, max_depth=effective_depth
+                    )
+                    out = generate_mtpk(
+                        state.runtime,
+                        prompt_ids,
+                        max_tokens=response_max,
+                        sampler=sampler,
+                        draft_sampler=state.draft_sampler,
+                        speculative_depth=effective_depth,
+                        seed=generation_seed,
+                        mtp_hidden_variant="post_norm",
+                        mtp_cache_policy="persistent",
+                        mtp_history_policy="committed",
+                        verify_strategy=state.args.verify_strategy,
+                        verify_core=state.args.verify_core,
+                        token_callback=record_tokens,
+                        session_bank=session_bank,
+                        session_restore_mode=_session_bank_restore_mode(
+                            session_restore_mode
+                        ),
+                        session_template_hash=session_template_hash,
+                        session_draft_head_identity=session_draft_head_identity,
+                        session_policy_fingerprint=session_policy_fingerprint,
+                        capture_final_state=session_bank is not None,
+                        trace_label=trace_label,
+                        trace_metadata=trace_metadata,
+                        adaptive_policy=adaptive_policy,
+                        online_correction_cache=bool(state.args.online_correction_cache),
+                        online_correction_cache_min_depth=int(
+                            state.args.online_correction_cache_min_depth
+                        ),
+                        online_correction_cache_key=str(
+                            state.args.online_correction_cache_key
+                        ),
+                        prompt_correction_cache=bool(state.args.prompt_correction_cache),
+                        prompt_correction_cache_min_depth=int(
+                            state.args.prompt_correction_cache_min_depth
+                        ),
+                        online_hidden_corrector_alpha=float(
+                            state.args.online_hidden_corrector_alpha
+                        ),
+                        online_hidden_corrector_decay=float(
+                            state.args.online_hidden_corrector_decay
+                        ),
+                        online_hidden_corrector_warmup=int(
+                            state.args.online_hidden_corrector_warmup
+                        ),
+                        online_hidden_corrector_max_feed_depth=(
+                            state.args.online_hidden_corrector_max_feed_depth
+                        ),
+                        online_hidden_corrector_key=str(
+                            state.args.online_hidden_corrector_key
+                        ),
+                    )
         finally:
             state.lock.release()
             if not background_request:
@@ -2488,6 +2594,12 @@ def _run_generation(
                 if mtp_snapshot is not None
                 else None,
             )
+            stats["sessionbank_snapshot_bytes"] = int(
+                getattr(session_bank, "last_put_nbytes", 0) or 0
+            )
+            stats["sessionbank_skipped_oversized_snapshot"] = bool(
+                getattr(session_bank, "last_put_skipped_oversized_snapshot", False)
+            )
         envelope = _metrics_envelope(
             stats=stats,
             prompt_tokens=len(prompt_ids),
@@ -2514,6 +2626,7 @@ def _run_generation(
             envelope.update(request_observability)
         stats["generation_mode"] = effective_mode
         stats.update(envelope)
+        stats.update(_generation_truth_stats(state, effective_mode))
         if effective_mode == "ar":
             stats["mtp_depth"] = 0
             stats["verify_calls"] = 0
@@ -5609,6 +5722,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Generation mode. 'ar' uses target-only AR generation while keeping the same loaded runtime.",
     )
     parser.add_argument(
+        "--stock-ar",
+        action="store_true",
+        help=(
+            "Diagnostic only: run target AR without loading the MTP sidecar. "
+            "Equivalent to --generation-mode ar --no-load-mtp."
+        ),
+    )
+    parser.add_argument(
         "--load-mtp",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -5807,7 +5928,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Open the local MTPLX browser chat UI after startup.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.stock_ar:
+        args.generation_mode = "ar"
+        args.load_mtp = False
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:

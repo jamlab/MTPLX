@@ -34,7 +34,7 @@ mtplx start            # interactive: pick model → mode → web/CLI, then chat
 
 The Homebrew installer sets up the `mtplx` command in `/opt/homebrew/bin` and bootstraps the Python runtime under `/opt/homebrew/var/mtplx`. Python users can also run `python3 -m pip install --pre mtplx`.
 
-That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`), runtime mode, and surface (browser chat at `127.0.0.1:8000/` or terminal chat) on first run. On every subsequent run it asks "same as last time?" so you're one keypress from chatting.
+That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`), runtime mode (Sustained / Sustained Max / Burst), and surface (browser chat at `127.0.0.1:8000/` or terminal chat) on first run. On every subsequent run it asks "same as last time?" so you're one keypress from chatting.
 
 ---
 
@@ -49,17 +49,18 @@ That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MT
 - **Interactive start wizard.** Pick model, mode, and surface in three numbered prompts. Returning users get "same as last time?". No flag-soup required.
 - **Local-folder model picker.** Point the wizard at any parent directory — your `~/models/`, the LM Studio cache, the HuggingFace cache — and it walks the tree, classifies each model into the four-tier compatibility contract, and presents a numbered picker. Config-only classification, never mmaps a tensor file, so a single APFS-dataless or partial download in the tree can't crash the picker.
 - **One-line live download progress.** Single rich-rendered line with bar / percent / GB / speed / ETA, streamed at 8 fps. HuggingFace's tqdm bars are suppressed during the download so they don't fight the MTPLX UI for terminal real estate.
-- **Honest profile names that tell you what they do.**
-  - `Medium` — default native-MTP speed path (`performance-cold`), in the **~2.2× over no-MTP AR** lane, not sustained without fan control.
-  - `Max` — Medium + ThermalForge fans pinned at 100%, **~2.24× over no-MTP AR** in the recorded lane (`63.056 / 62.886 tok/s` MTP vs `28.156 tok/s` AR on M5 Max), loud by design.
+- **Honest mode names that tell you what they do.**
+  - `Sustained` — default long-context native-MTP path (`--profile sustained`) with chunked prefill, final-token logits, request-sized paged KV, and the normal Apple fan controller.
+  - `Sustained Max` — Sustained plus ThermalForge fans pinned at 100% (`--profile sustained --max`) for explicit fan-backed long-context runs.
+  - `Burst` — old max-fan performance-cold lane (`--profile performance-cold --max`), **not recommended**, max 8K context. This is the recorded headline lane (`63.056 / 62.886 tok/s` MTP vs `28.156 tok/s` AR on M5 Max), loud by design.
   - `Stable` — hidden compatibility flag (`--profile stable` / `--profile safe`) for the exact/staged long-reply path.
-- **Crash-safe fan control.** When Max is on, MTPLX spawns a detached watchdog that restores fans to auto if the parent dies for any reason — including `kill -9` and "I closed the terminal". Verified live on hardware.
-- **Idle-aware Max mode.** Server tracks request activity; after 15 minutes of no chat, fans drop to auto, then ramp back up on the next message.
+- **Crash-safe fan control.** When Sustained Max or Burst is on, MTPLX spawns a detached watchdog that restores fans to auto if the parent dies for any reason — including `kill -9` and "I closed the terminal". Verified live on hardware.
+- **Idle-aware fan-backed modes.** Server tracks request activity; after 15 minutes of no chat, fans drop to auto, then ramp back up on the next message.
 - **Four-tier model compatibility contract.** `mtplx inspect <model>` reports: verified / arch-compatible-unverified / incompatible-architecture / no-MTP. No silent garbage runs.
 - **Lazy imports.** `mtplx --help`, `doctor`, `inspect`, `init`, `setup` work on a fresh venv *without MLX installed*. Generation and serving pull in MLX only when needed.
 - **v0.1.4 status: local and GitHub release gates green**, including onboarding, local-folder picker, live download progress, fan-control crash safety, OpenAI server/tool-call compatibility, lazy-import survival, exactness gates, wheel build, and repository hygiene.
 
-> **Release honesty.** The cold path is verified at the **~2.24× multiplier** above. *Sustained* no-fan long-context throughput is currently in a worse lane on Flappy 10k versus the v0.2 target — the v0.1 release ships with this gap explicit. Closing it is the v0.2 deliverable; see [Roadmap](#roadmap).
+> **Release honesty.** Burst is the old fan-backed headline lane and is capped in the UI at short contexts only. Sustained is the explicit long-context memory-safety lane; it is not an AR downgrade. Long no-fan decode decay remains the v0.2 deliverable; see [Roadmap](#roadmap).
 
 ---
 
@@ -83,6 +84,7 @@ Power-user shortcuts (any of these skip the wizard):
 mtplx start --fresh                         # re-run the wizard from scratch
 mtplx start cli                             # terminal chat directly
 mtplx start cli --no-mtp                    # target-only AR generation
+mtplx start --profile sustained             # long-context native-MTP mode
 mtplx start --max                           # browser chat with fan boost
 mtplx start --model /path/to/model          # use a specific local or HF model
 mtplx pull Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed
@@ -143,11 +145,12 @@ Picked by `mtplx start`, or set explicitly via `--profile`. Every mode preserves
 
 | Mode | Profile | Mechanics | Speed lane | Best for |
 |---|---|---|---|---|
-| **Medium** | `performance-cold` | Native-MTP speed path, Apple fan curve | ~2.2× over no-MTP AR, not sustained without fans | Default first run, short replies, snappy chat |
-| **Max** | `performance-cold` + `--max` | Medium path plus ThermalForge pinned to 100% | **~2.24× over no-MTP AR** (recorded: 63.056/62.886 vs 28.156 tok/s on M5 Max) | Sustained workloads, you don't mind fans |
+| **Sustained** | `sustained` | Native-MTP long-context path with chunked prefill, final-token logits, request-sized paged KV, normal Apple fan controller | Target <=10-15% TPS cost vs Burst while avoiding the old long-context memory balloon | Large files, long documents, coding contexts, 16K-200K prompts |
+| **Sustained Max** | `sustained` + `--max` | Sustained path plus ThermalForge pinned to 100% | Fan-backed long-context lane | Long-context work where the user explicitly wants maximum cooling |
+| **Burst** | `performance-cold` + `--max` | Old max-fan performance-cold lane | **~2.24× over no-MTP AR** (recorded: 63.056/62.886 vs 28.156 tok/s on M5 Max) | Short prompts and benchmarks only; **not recommended**, max 8K context |
 | **Stable** | `stable` / `safe` | Exact/staged long-reply path, hidden from onboarding | Lower peak speed, steadier shape | Compatibility and conservative long replies |
 
-`Max` requires ThermalForge. `mtplx max --install` installs it from source into `~/.mtplx/bin/thermalforge`, sets up a passwordless sudoers rule scoped to that one binary, and verifies fans actually ramp before declaring success. One sudo prompt, end-to-end. Crash safety covers SIGINT, SIGTERM, SIGHUP, terminal close, and `kill -9` via a detached sidecar process.
+Fan-backed modes require ThermalForge. `mtplx max --install` installs it from source into `~/.mtplx/bin/thermalforge`, sets up a passwordless sudoers rule scoped to that one binary, and verifies fans actually ramp before declaring success. One sudo prompt, end-to-end. Crash safety covers SIGINT, SIGTERM, SIGHUP, terminal close, and `kill -9` via a detached sidecar process.
 
 ---
 
@@ -199,7 +202,7 @@ mtplx start                 # OpenAI/Anthropic-compatible server
 mtplx connect openwebui     # paste settings for Open WebUI
 mtplx openwebui docker-command
 mtplx bench run --suite cold-long-code-192
-mtplx max --install         # install ThermalForge for Max mode
+mtplx max --install         # install ThermalForge for Sustained Max / Burst
 mtplx max --status          # fan / thermal state
 ```
 

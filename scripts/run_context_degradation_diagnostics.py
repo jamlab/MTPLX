@@ -859,6 +859,13 @@ def _local_profile_env(profile: str, base_env: dict[str, str]) -> tuple[dict[str
         "MTPLX_NATIVE_GDN_TAIL_SIMDGROUPS",
         "MTPLX_MLX_CACHE_LIMIT",
         "MTPLX_SPLIT_VERIFY_EVAL",
+        "MTPLX_SUSTAINED_PREFILL",
+        "MTPLX_PREFILL_CHUNK_SIZE",
+        "MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS",
+        "MTPLX_DYNAMIC_PAGED_KV",
+        "MTPLX_DYNAMIC_PAGED_KV_TOKENS",
+        "MTPLX_DYNAMIC_PAGED_KV_MARGIN",
+        "MTPLX_DYNAMIC_PAGED_KV_MIN_BLOCKS",
     ]:
         env.pop(key, None)
     fast_defaults = {
@@ -872,6 +879,24 @@ def _local_profile_env(profile: str, base_env: dict[str, str]) -> tuple[dict[str
     if profile in {"current_baseline", "baseline"}:
         env.update(fast_defaults)
         info["profile_type"] = "baseline"
+    elif profile == "sustained":
+        env.update(fast_defaults)
+        env.update(
+            {
+                "MTPLX_SUSTAINED_PREFILL": "1",
+                "MTPLX_PREFILL_CHUNK_SIZE": "2048",
+                "MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS": "0",
+                "MTPLX_DYNAMIC_PAGED_KV": "1",
+                "MTPLX_VLLM_METAL_PAGED_ATTN": "1",
+                "MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE": "16",
+                "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL": "mlx_vector_paged",
+                "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN": "1",
+                "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD": "2048",
+                "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE": "512",
+                "MTPLX_CLEAR_CACHE_EVERY": "0",
+            }
+        )
+        info["profile_type"] = "sustained"
     elif profile == "split_verify_eval":
         env.update(fast_defaults)
         env["MTPLX_SPLIT_VERIFY_EVAL"] = "1"

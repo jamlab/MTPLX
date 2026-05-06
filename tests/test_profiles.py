@@ -3,6 +3,7 @@ from __future__ import annotations
 from mtplx.profiles import (
     DEFAULT_PROFILE_NAME,
     NATIVE_MTP_60_FAST_PATH_ENV,
+    SUSTAINED_PREFILL_ENV,
     apply_profile_env,
     get_profile,
     list_profiles,
@@ -49,4 +50,14 @@ def test_apply_and_restore_profile_env() -> None:
 def test_list_profiles_includes_all_public_modes() -> None:
     names = [profile["name"] for profile in list_profiles()]
 
-    assert names == ["stable", "performance-cold", "exact", "max-diagnostic"]
+    assert names == ["stable", "performance-cold", "sustained", "exact", "max-diagnostic"]
+
+
+def test_sustained_profile_is_native_mtp_long_context_path() -> None:
+    profile = get_profile("sustained")
+
+    assert profile.runtime_profile == "native_mtp_sustained"
+    assert profile.draft_lm_head is not None
+    assert profile.env_dict() == SUSTAINED_PREFILL_ENV
+    assert "MTPLX_TRUNK_CACHE_MATERIALIZE_EVERY" not in profile.env_dict()
+    assert "MTPLX_EVAL_STATE_ROOTS_ON_COMMIT" not in profile.env_dict()

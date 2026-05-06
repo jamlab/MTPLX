@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import inspect
-from dataclasses import dataclass
+import inspect as py_inspect
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,46 @@ class MTPLXRuntime:
     contract: MTPContract
     mtp_adapter_path: Path | None = None
     mtp_adapter_metadata: dict[str, Any] | None = None
+    diagnostic_counters: dict[str, int] = field(default_factory=dict)
+    _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
+    _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
+
+    def _count(self, key: str, amount: int = 1) -> None:
+        self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(amount)
+
+    @staticmethod
+    def _sequence_len(input_ids: Any) -> int:
+        shape = getattr(input_ids, "shape", ())
+        if len(shape) >= 2:
+            return int(shape[1])
+        if shape:
+            return int(shape[0])
+        return 1
+
+    def _forward_ar_capabilities(self) -> tuple[bool, bool]:
+        if (
+            self._forward_ar_supports_emit_logits is None
+            or self._forward_ar_supports_logits_keep is None
+        ):
+            try:
+                params = py_inspect.signature(self.model.__call__).parameters
+            except Exception:
+                params = {}
+            accepts_kwargs = any(
+                param.kind == py_inspect.Parameter.VAR_KEYWORD
+                for param in params.values()
+            )
+            patched_kwargs = bool(self.mtp_enabled and accepts_kwargs)
+            self._forward_ar_supports_emit_logits = (
+                "emit_logits" in params or patched_kwargs
+            )
+            self._forward_ar_supports_logits_keep = (
+                "logits_keep" in params or patched_kwargs
+            )
+        return (
+            bool(self._forward_ar_supports_emit_logits),
+            bool(self._forward_ar_supports_logits_keep),
+        )
 
     def forward_ar(
         self,
@@ -28,14 +68,37 @@ class MTPLXRuntime:
         cache=None,
         return_hidden: bool = False,
         hidden_variant: str | None = None,
+        emit_logits: bool = True,
+        logits_keep: int | None = None,
     ):
-        if not return_hidden and hidden_variant is None:
-            return self.model(input_ids, cache=cache)
+        self._count("forward_ar_hidden_calls" if return_hidden else "forward_ar_plain_calls")
         if not self.mtp_enabled and return_hidden:
             raise RuntimeError("return_hidden requires an MTP-patched runtime")
         kwargs = {}
         if hidden_variant is not None:
             kwargs["hidden_variant"] = hidden_variant
+        supports_emit_logits, supports_logits_keep = self._forward_ar_capabilities()
+        if supports_emit_logits:
+            kwargs["emit_logits"] = bool(emit_logits)
+        elif not emit_logits:
+            self._count("forward_ar_emit_logits_unsupported")
+        if logits_keep is not None and supports_logits_keep:
+            kwargs["logits_keep"] = int(logits_keep)
+        elif logits_keep is not None:
+            self._count("forward_ar_logits_keep_unsupported")
+        sequence_len = self._sequence_len(input_ids)
+        if bool(emit_logits) or not supports_emit_logits:
+            if logits_keep is not None and supports_logits_keep:
+                emitted = min(sequence_len, max(1, int(logits_keep)))
+            else:
+                emitted = sequence_len
+            self._count("logits_tokens_emitted", emitted)
+            if emitted == 1:
+                self._count("final_logits_tokens_emitted", 1)
+            else:
+                self._count("full_logits_tokens_emitted", emitted)
+        if not return_hidden and hidden_variant is None and not kwargs:
+            return self.model(input_ids, cache=cache)
         return self.model(
             input_ids,
             cache=cache,
@@ -73,6 +136,7 @@ class MTPLXRuntime:
     ):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
+        self._count("draft_mtp_calls")
         with mtp_adapter_depth(self.model, mtp_depth):
             kwargs = {
                 "mtp_cache": mtp_cache,
@@ -82,7 +146,7 @@ class MTPLXRuntime:
                 "position_offset": position_offset,
             }
             try:
-                params = inspect.signature(self.model.mtp_forward).parameters
+                params = py_inspect.signature(self.model.mtp_forward).parameters
             except Exception:
                 params = {}
             if "mtp_depth" in params:
@@ -99,6 +163,7 @@ class MTPLXRuntime:
     ):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
+        self._count("update_mtp_cache_calls")
         update = getattr(self.model, "mtp_update_cache", None)
         if update is not None:
             kwargs = {
@@ -107,7 +172,7 @@ class MTPLXRuntime:
                 "position_offset": position_offset,
             }
             try:
-                params = inspect.signature(update).parameters
+                params = py_inspect.signature(update).parameters
             except Exception:
                 params = {}
             if "mtp_depth" in params:
@@ -139,6 +204,7 @@ class MTPLXRuntime:
     def make_mtp_cache(self):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
+        self._count("make_mtp_cache_calls")
         cache = self.model.make_mtp_cache()
         from .cache_state import configure_mtp_attention_kv_cache
 

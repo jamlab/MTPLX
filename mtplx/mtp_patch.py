@@ -391,6 +391,8 @@ def inject_mtp_support(
             return_hidden: bool = False,
             input_embeddings=None,
             hidden_variant: str | None = None,
+            emit_logits: bool = True,
+            logits_keep: int | None = None,
             **kwargs,
         ):
             inner = self.model
@@ -406,11 +408,17 @@ def inject_mtp_support(
 
             pre_norm = hidden_states
             post_norm = inner.norm(hidden_states)
-            logits = (
-                inner.embed_tokens.as_linear(post_norm)
-                if self.args.tie_word_embeddings
-                else self.lm_head(post_norm)
-            )
+            logits = None
+            if emit_logits:
+                logits_source = post_norm
+                if logits_keep is not None:
+                    keep = max(1, int(logits_keep))
+                    logits_source = logits_source[:, -keep:, :]
+                logits = (
+                    inner.embed_tokens.as_linear(logits_source)
+                    if self.args.tie_word_embeddings
+                    else self.lm_head(logits_source)
+                )
             if not return_hidden:
                 return logits
             variant = hidden_variant or getattr(self, "_mtplx_hidden_variant", "post_norm")
@@ -636,12 +644,25 @@ def inject_mtp_support(
         original_outer_class = model.__class__
 
         class _MTPLXOuterModel(original_outer_class):
-            def __call__(self, inputs, cache=None, return_hidden: bool = False, input_embeddings=None, **kwargs):
+            def __call__(
+                self,
+                inputs,
+                cache=None,
+                return_hidden: bool = False,
+                input_embeddings=None,
+                hidden_variant: str | None = None,
+                emit_logits: bool = True,
+                logits_keep: int | None = None,
+                **kwargs,
+            ):
                 return self.language_model(
                     inputs,
                     cache=cache,
                     return_hidden=return_hidden,
                     input_embeddings=input_embeddings,
+                    hidden_variant=hidden_variant,
+                    emit_logits=emit_logits,
+                    logits_keep=logits_keep,
                     **kwargs,
                 )
 

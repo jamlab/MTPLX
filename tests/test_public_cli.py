@@ -6,6 +6,8 @@ import tomllib
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 from mtplx.cli import build_parser, main
 from mtplx.commands import public
 from mtplx.version import DISPLAY_VERSION, __version__
@@ -166,7 +168,10 @@ def test_start_help_is_a_user_journey(capsys):
     # of the old browser/CLI bifurcation.
     assert "Interactive end-to-end setup" in captured
     assert "What gets asked" in captured
-    assert "ThermalForge" in captured  # Max mode advertises auto-install
+    assert "Sustained" in captured
+    assert "Sustained Max" in captured
+    assert "Burst" in captured
+    assert "ThermalForge" in captured  # fan-backed modes advertise fan control
     # Power-user shortcuts still showcased.
     assert "mtplx start --fresh" in captured
     assert "mtplx start --max" in captured
@@ -207,7 +212,7 @@ def test_start_dry_run_is_consumer_friendly(monkeypatch, tmp_path, capsys):
     assert code == 0
     assert "MTPLX start" in captured
     assert "model: models/example" in captured
-    assert "profile: performance-cold" in captured
+    assert "profile: sustained" in captured
     assert "then: load once -> chat in this terminal -> stream output -> show speed stats" in captured
 
 
@@ -1226,12 +1231,32 @@ def test_chat_and_serve_default_to_performance_cold_mode():
     assert chat_args.reasoning is None
     assert serve_args.profile == "performance-cold"
     assert serve_args.reasoning is None
+    assert serve_args.stock_ar is False
     assert serve_max_args.max is True
     assert serve_args.stream_interval == 1
     assert serve_args.rate_limit == 0
     assert serve_args.reasoning_parser == "qwen3"
     assert serve_args.stats_footer is True
     assert serve_no_footer_args.stats_footer is False
+
+
+def test_stock_ar_is_diagnostic_serve_and_bench_only():
+    parser = build_parser()
+
+    serve = parser.parse_args(["serve", "--stock-ar"])
+    bench = parser.parse_args(["bench", "context", "--stock-ar", "--dry-run"])
+
+    assert serve.stock_ar is True
+    assert bench.stock_ar is True
+    assert bench.bench_action == "context"
+    for argv in (
+        ["quickstart", "--stock-ar"],
+        ["chat", "--stock-ar"],
+        ["run", "hello", "--stock-ar"],
+        ["start", "cli", "--stock-ar", "--dry-run"],
+    ):
+        with pytest.raises(SystemExit):
+            parser.parse_args(argv)
 
 
 def test_product_helper_commands_parse():
@@ -1576,6 +1601,61 @@ def test_serve_no_mtp_dispatches_ar_generation_mode(monkeypatch):
         assert exc.code == 0
 
     assert calls["cmd"][calls["cmd"].index("--generation-mode") + 1] == "ar"
+
+
+def test_serve_stock_ar_dispatches_unloaded_ar(monkeypatch):
+    calls = {}
+
+    monkeypatch.setattr(public, "_resolve_runtime_model_path", lambda model, cache_dir=None: (model, None))
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda model, unsafe_force_unverified=False, yes=False: (
+            {"compatibility": {"tier": "verified", "can_run": True, "exit_code": 0}},
+            None,
+        ),
+    )
+    monkeypatch.setattr(public, "_port_is_busy", lambda host, port: False)
+
+    def fake_execvpe(_executable, cmd, _env):
+        calls["cmd"] = cmd
+        raise SystemExit(0)
+
+    monkeypatch.setattr(public.os, "execvpe", fake_execvpe)
+    args = SimpleNamespace(
+        command="serve",
+        model="models/example",
+        cache_dir=None,
+        profile="performance-cold",
+        unsafe_force_unverified=False,
+        yes=True,
+        host="127.0.0.1",
+        port=8000,
+        depth=3,
+        no_mtp=False,
+        stock_ar=True,
+        api_key=None,
+        rate_limit=0,
+        stream_interval=1,
+        max_response_tokens=None,
+        temperature=0.6,
+        top_p=0.95,
+        reasoning_parser="qwen3",
+        stats_footer=True,
+        warmup_tokens=0,
+        strict_warmup=False,
+        strict_fast_path=False,
+        max=False,
+        _cli_flags=set(),
+    )
+
+    try:
+        public.cmd_serve_public(args)
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    assert calls["cmd"][calls["cmd"].index("--generation-mode") + 1] == "ar"
+    assert "--stock-ar" in calls["cmd"]
 
 
 def test_bare_serve_invokes_server_onboarding_in_tty(monkeypatch):
@@ -2125,6 +2205,7 @@ def test_profiles_command_lists_default_without_mlx(capsys):
     assert [profile["name"] for profile in payload["profiles"]] == [
         "stable",
         "performance-cold",
+        "sustained",
         "exact",
         "max-diagnostic",
     ]

@@ -278,6 +278,7 @@ def test_profiles_without_mlx(tmp_path: Path) -> None:
     assert [profile["name"] for profile in payload["profiles"]] == [
         "stable",
         "performance-cold",
+        "sustained",
         "exact",
         "max-diagnostic",
     ]

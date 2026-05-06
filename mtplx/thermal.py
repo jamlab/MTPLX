@@ -1110,7 +1110,7 @@ def run_command_with_profile(
 
 # ---------- auto-install -----------------------------------------------------
 #
-# Bootstrap path for users who pick Max mode in `mtplx start` and don't
+# Bootstrap path for users who pick a fan-backed mode in `mtplx start` and don't
 # already have a fan controller.
 #
 # As of 2026-04 the upstream Homebrew tap (ProducerGuy/tap) ships a formula

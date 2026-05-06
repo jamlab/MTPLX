@@ -5,6 +5,7 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
+from mtplx.attention_context import attention_phase
 from mtplx.cache_state import (
     BlockOwnedKVCache,
     OwnedRecurrentStateCache,
@@ -494,6 +495,159 @@ def test_configure_tail_owned_attention_kv_cache_uses_vllm_metal_env(monkeypatch
     assert isinstance(cache[0], VllmMetalPagedKVCache)
     assert cache[0].block_size == 16
     assert cache[0].num_blocks == 32
+
+
+def test_dynamic_paged_kv_sizes_capacity_from_request(monkeypatch):
+    from mlx_lm.models.cache import KVCache
+
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV_TOKENS", str(32768 + 128 + 3))
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV_MARGIN", "128")
+    cache = [KVCache()]
+
+    stats = configure_tail_owned_attention_kv_cache(cache)
+
+    expected_blocks = ((32768 + 128 + 3 + 128) + 16 - 1) // 16
+    assert stats["num_blocks"] >= expected_blocks
+    assert isinstance(cache[0], VllmMetalPagedKVCache)
+    assert cache[0].capacity >= 32768 + 128 + 3 + 128
+
+
+def test_paged_kv_grows_on_dynamic_overflow(monkeypatch):
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
+    paged = VllmMetalPagedKVCache(block_size=4, num_blocks=1)
+    keys = mx.zeros((1, 2, 6, 3), dtype=mx.float32)
+    values = mx.zeros((1, 2, 6, 3), dtype=mx.float32)
+
+    paged.update_without_fetch(keys, values)
+
+    assert paged.capacity >= 6
+    assert paged.paged_stats()["grow_events"] == 1
+
+
+def test_paged_active_array_assertion_guards_dense_fallback(monkeypatch):
+    monkeypatch.setenv("MTPLX_ASSERT_NO_PAGED_ACTIVE_ARRAYS", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD", "4")
+    paged = VllmMetalPagedKVCache(block_size=4, num_blocks=4)
+    keys = mx.zeros((1, 2, 4, 3), dtype=mx.float32)
+    values = mx.zeros((1, 2, 4, 3), dtype=mx.float32)
+    paged.update_without_fetch(keys, values)
+
+    with pytest.raises(RuntimeError, match="materialize active K/V arrays"):
+        _ = paged.state
+
+
+def test_paged_attention_records_phase_aware_large_q_bailout(monkeypatch):
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD", "1")
+
+    paged = VllmMetalPagedKVCache(block_size=4, num_blocks=16)
+    keys = mx.zeros((1, 2, 32, 8), dtype=mx.float32)
+    values = mx.zeros((1, 2, 32, 8), dtype=mx.float32)
+    queries = mx.zeros((1, 8, 4, 8), dtype=mx.float32)
+    paged.update_without_fetch(keys, values)
+
+    with attention_phase("prefill"):
+        assert paged.paged_attention(queries, scale=8**-0.5, mask="causal") is None
+        paged.record_dense_fallback()
+
+    stats = paged.paged_stats()
+    assert stats["prefill_dense_fallback_calls"] == 1
+    assert stats["paged_attention_bailouts_by_phase_reason"] == {
+        "prefill:q_len_gt_max": 1
+    }
+
+
+def test_mlx_vector_large_q_routes_to_partitioned_paged(monkeypatch):
+    class FakeOps:
+        def __init__(self):
+            self.calls = 0
+
+        def paged_attention_v2_online_partitioned(self, *args, **kwargs):
+            self.calls += 1
+
+    fake_ops = FakeOps()
+    monkeypatch.setattr("mtplx.cache_state._load_vllm_metal_ops", lambda: fake_ops)
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE", "8")
+
+    paged = VllmMetalPagedKVCache(block_size=4, num_blocks=16)
+    keys = mx.zeros((1, 2, 32, 8), dtype=mx.float32)
+    values = mx.zeros((1, 2, 32, 8), dtype=mx.float32)
+    queries = mx.zeros((1, 8, 4, 8), dtype=mx.float32)
+    paged.update_without_fetch(keys, values)
+
+    with attention_phase("prefill"):
+        actual = paged.paged_attention(queries, scale=8**-0.5, mask="causal")
+
+    assert actual is not None
+    assert fake_ops.calls == 1
+    stats = paged.paged_stats()
+    assert stats["partitioned_paged_calls"] == 1
+    assert stats["paged_attention_large_q_path"] == "partitioned_paged"
+    assert stats["dense_fallback_calls"] == 0
+
+
+def test_large_q_split_fallback_stays_in_paged_storage(monkeypatch):
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    def missing_ops():
+        raise RuntimeError("no external ops")
+
+    monkeypatch.setattr("mtplx.cache_state._load_vllm_metal_ops", missing_ops)
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_LARGE_Q_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_LARGE_Q_KV_CHUNK_SIZE", "7")
+
+    mx.random.seed(1357)
+    paged = VllmMetalPagedKVCache(block_size=4, num_blocks=16)
+    queries = mx.random.normal((1, 8, 4, 8), dtype=mx.float32)
+    keys = mx.random.normal((1, 2, 32, 8), dtype=mx.float32)
+    values = mx.random.normal((1, 2, 32, 8), dtype=mx.float32)
+    paged.update_without_fetch(keys, values)
+
+    expected = scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=None,
+        scale=8**-0.5,
+        mask="causal",
+    )
+    actual = paged.paged_attention(queries, scale=8**-0.5, mask="causal")
+    mx.eval(expected, actual)
+
+    assert actual is not None
+    diff = mx.max(mx.abs(expected.astype(mx.float32) - actual.astype(mx.float32)))
+    mx.eval(diff)
+    assert float(diff.item()) <= 1e-3
+    stats = paged.paged_stats()
+    assert stats["large_q_split_sdpa_fallback_calls"] == 1
+    assert stats["active_array_calls"] == 0
+    assert stats["dense_fallback_calls"] == 0
+
+
+def test_long_context_dense_fallback_guard_accepts_new_override(monkeypatch):
+    monkeypatch.setenv("MTPLX_ASSERT_NO_PAGED_ACTIVE_ARRAYS", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD", "4")
+    monkeypatch.setenv("MTPLX_ALLOW_LONG_CONTEXT_DENSE_FALLBACK", "1")
+    paged = VllmMetalPagedKVCache(block_size=4, num_blocks=4)
+    keys = mx.zeros((1, 2, 4, 3), dtype=mx.float32)
+    values = mx.zeros((1, 2, 4, 3), dtype=mx.float32)
+    paged.update_without_fetch(keys, values)
+
+    assert paged.state[0] is not None
 
 
 def test_configure_vllm_metal_paged_cache_mlx_vector_is_packaged(monkeypatch):

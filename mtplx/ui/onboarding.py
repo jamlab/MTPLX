@@ -1014,10 +1014,11 @@ def _scan_and_pick(root: Path) -> str | None:
 def screen_mode() -> tuple[str, bool]:
     """Return (profile_name, max_mode_flag).
 
-    Quickstart exposes the two speed-first product choices:
+    Quickstart exposes the explicit product choices:
 
-      Medium : native-MTP speed path, no fan control, burst only
-      Max    : same native-MTP speed path, fans pinned 100% while running
+      Sustained     : native-MTP long-context path, normal fan controller
+      Sustained Max : Sustained path, fans pinned 100% while running
+      Burst         : old max-fan native-MTP burst lane, short contexts only
 
     The Stable/safe profile remains available through explicit flags, but it
     is no longer part of the default onboarding path.
@@ -1030,20 +1031,27 @@ def screen_mode() -> tuple[str, bool]:
         options=[
             (
                 "1",
-                "Medium  ·  native-MTP speed path, ~2.2x burst (not sustained)",
-                "Uses the performance-cold profile: depth-3 speculative decode, capture-commit verify, linear-GDN tape verifier, optimized draft head/sampler when the model contract provides them. Fans stay on Apple's default curve.",
+                "Sustained  ·  long-context safe, normal fan controller",
+                "Chunked prefill, no full-prompt logits, and dynamic paged KV. Pick this for large files, long documents, coding contexts, or 16K-200K prompts.",
             ),
             (
                 "2",
-                "Max  ·  Medium + fans pinned at 100%, ~2.24x (loud)",
-                "Same decoding path as Medium, plus ThermalForge pins the fans while MTPLX runs and restores them after shutdown. Needs ThermalForge installed.",
+                "Sustained Max  ·  Sustained + fans pinned at 100%",
+                "Same long-context-safe Sustained runtime, plus ThermalForge pins the fans while MTPLX runs and restores them after shutdown. Needs ThermalForge installed.",
+            ),
+            (
+                "3",
+                "Burst  [not recommended; max 8K context]",
+                "Old max-fan performance-cold lane. Fastest headline burst for short prompts and benchmarks only; avoid for long documents or coding contexts.",
             ),
         ],
     )
-    choice = _prompt_choice("Select", ["1", "2"], default="1")
+    choice = _prompt_choice("Select", ["1", "2", "3"], default="1")
     if choice == "2":
+        return "sustained", True
+    if choice == "3":
         return "performance-cold", True
-    return "performance-cold", False
+    return "sustained", False
 
 
 def screen_interface() -> str:
@@ -1106,16 +1114,18 @@ def screen_server_surface(
 def run_onboarding_screens(*, configured_model: str | None = None) -> dict:
     """Walk all three screens and return the chosen state dict.
 
-    When the user picks Max mode but no fan controller is detected, this
-    function offers to install ThermalForge automatically. If install is
-    declined or fails, ``max`` is left as ``False`` so the rest of the
-    pipeline doesn't promise fan-boosted speeds it can't deliver.
+    When the user picks a fan-backed mode but no fan controller is detected,
+    this function offers to install ThermalForge automatically. If install is
+    declined or fails, the wizard falls back to Sustained without fan boost so
+    the rest of the pipeline does not promise a fan-backed mode it cannot
+    deliver.
     """
 
     model = screen_model(configured=configured_model)
     profile, max_mode = screen_mode()
-    if max_mode:
-        max_mode = ensure_thermal_control_installed()
+    if max_mode and not ensure_thermal_control_installed():
+        profile = "sustained"
+        max_mode = False
     target = screen_interface()
     return {
         "model": model,
@@ -1136,8 +1146,9 @@ def run_serve_onboarding_screens(
 
     model = screen_model(configured=configured_model)
     profile, max_mode = screen_mode()
-    if max_mode:
-        max_mode = ensure_thermal_control_installed()
+    if max_mode and not ensure_thermal_control_installed():
+        profile = "sustained"
+        max_mode = False
     open_browser = screen_server_surface(
         host=host,
         port=port,
@@ -1171,9 +1182,9 @@ def ensure_thermal_control_installed() -> bool:
         return True
 
     _choice_panel(
-        heading="Max mode setup  ·  ThermalForge",
+        heading="Fan mode setup  ·  ThermalForge",
         intro=(
-            "Max mode needs a fan controller. ThermalForge (free, open "
+            "Fan-backed modes need a fan controller. ThermalForge (free, open "
             "source) is not installed on this Mac yet."
         ),
         options=[
@@ -1184,7 +1195,7 @@ def ensure_thermal_control_installed() -> bool:
             ),
             (
                 "2",
-                "Skip — Max falls back to Medium",
+                "Skip — continue without fan boost",
                 "No fan boost, but everything else still works.",
             ),
         ],
@@ -1220,7 +1231,7 @@ def _print_install_skipped() -> None:
         console = Console()
         console.print(
             "[yellow]  Skipped. Continuing without fan boost — "
-            "Max behaves like Medium.[/yellow]\n"
+            "the selected fan-backed mode will run without fan boost.[/yellow]\n"
         )
     except Exception:
         print("  Skipped. Continuing without fan boost.\n")
@@ -1273,12 +1284,18 @@ def _quickstart_state_is_reusable(last: dict) -> bool:
     """Return whether a saved state should be offered by Quickstart.
 
     Stable/safe remains a supported explicit profile, but Quickstart no longer
-    advertises or reuses it as the default consumer path.
+    advertises or reuses it as the default consumer path. The current wizard
+    choices are Sustained, Sustained Max, and Burst; old Medium saved states
+    are intentionally re-onboarded so users see the new tradeoff copy.
     """
 
     model = str(last.get("model") or "").strip()
     target = str(last.get("target") or "")
-    if last.get("profile") != "performance-cold":
+    profile = last.get("profile")
+    max_mode = bool(last.get("max"))
+    if profile == "performance-cold" and not max_mode:
+        return False
+    if profile not in {"performance-cold", "sustained"}:
         return False
     if target not in {"openwebui", "open-webui", "web", "terminal", "cli"}:
         return False
@@ -1366,11 +1383,12 @@ def run_quickstart_flow(
     try:
         if last and not fresh:
             if confirm_same_as_last(last):
-                # If the saved state says Max but ThermalForge has gone away
-                # (uninstalled, new machine) we must re-offer the install
+                # If the saved state says a fan-backed mode but ThermalForge
+                # has gone away (uninstalled, new machine), re-offer install
                 # rather than silently dump a JSON warning at runtime.
                 if last.get("max") and not ensure_thermal_control_installed():
                     last = dict(last)
+                    last["profile"] = "sustained"
                     last["max"] = False
                     save_state(last)
                 return last
@@ -1467,10 +1485,14 @@ def run_serve_flow(
 # ---------- label helpers ---------------------------------------------------
 def mode_label(state: dict) -> str:
     profile = state.get("profile", "safe")
-    if state.get("max"):
-        return "Max  ·  Medium path + fans pinned at 100%  ·  ~2.24x"
+    if state.get("max") and profile == "sustained":
+        return "Sustained Max  ·  long-context path + fans pinned at 100%"
+    if state.get("max") and profile == "performance-cold":
+        return "Burst  ·  max-fan short-context lane  ·  max 8K context"
     if profile == "performance-cold":
-        return "Medium  ·  native-MTP speed path  ·  ~2.2x burst (not sustained)"
+        return "Performance-cold  ·  legacy burst path without fan boost"
+    if profile == "sustained":
+        return "Sustained  ·  long-context native-MTP path  ·  normal fan controller"
     if profile in {"safe", "stable"}:
         return "Stable  ·  long-reply exact/staged path  ·  no fan control"
     return str(profile)

@@ -248,6 +248,18 @@ def _install_split_attention_hook(attn: Any) -> bool:
                 impl_override=impl_override,
             )
             if output is None:
+                if hasattr(cache, "record_dense_fallback"):
+                    cache.record_dense_fallback()
+                elif hasattr(cache, "dense_fallback_calls"):
+                    cache.dense_fallback_calls += 1
+                if (
+                    hasattr(cache, "long_context_dense_fallback_forbidden")
+                    and cache.long_context_dense_fallback_forbidden()
+                ):
+                    raise RuntimeError(
+                        "Sustained long-context paged attention attempted dense "
+                        "cache.state fallback after the partition threshold"
+                    )
                 keys, values = cache.state
                 output = scaled_dot_product_attention(
                     queries,

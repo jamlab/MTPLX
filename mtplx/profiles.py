@@ -15,7 +15,13 @@ from typing import Mapping, MutableMapping
 ProfileName = str
 
 DEFAULT_PROFILE_NAME = "performance-cold"
-PROFILE_CHOICES = ("stable", "performance-cold", "exact", "max-diagnostic")
+PROFILE_CHOICES = (
+    "stable",
+    "performance-cold",
+    "sustained",
+    "exact",
+    "max-diagnostic",
+)
 
 DEFAULT_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
 DEFAULT_MODEL_ID = DEFAULT_HF_MODEL_ID
@@ -50,6 +56,20 @@ LONG_RESPONSE_STAGED_ENV = {
     "MTPLX_TARGET_LAYER_EVAL_SCHEDULE": "2048:16,8192:8",
     "MTPLX_TARGET_LAYER_EVAL_CONTEXT_THRESHOLD": "0",
     "MTPLX_TARGET_LAYER_EVAL_MAX_Q": "8",
+}
+
+SUSTAINED_PREFILL_ENV = {
+    "MTPLX_SUSTAINED_PREFILL": "1",
+    "MTPLX_PREFILL_CHUNK_SIZE": "2048",
+    "MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS": "0",
+    "MTPLX_DYNAMIC_PAGED_KV": "1",
+    "MTPLX_VLLM_METAL_PAGED_ATTN": "1",
+    "MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE": "16",
+    "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL": "mlx_vector_paged",
+    "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN": "1",
+    "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD": "2048",
+    "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE": "512",
+    "MTPLX_CLEAR_CACHE_EVERY": "0",
 }
 
 
@@ -154,7 +174,7 @@ STABLE_PROFILE = RuntimeProfile(
         "phase0j-gdn8-speed4-target-layer-sched-state-root-mlx-vector-paged-flappy-uncapped-modelswap-20260501",
     ),
     caveats=(
-        "Lower peak throughput than Medium or Max.",
+        "Lower peak throughput than the fan-backed Burst lane.",
         "Selected for repeatable long replies while the v0.2 decay work continues.",
     ),
 )
@@ -163,16 +183,34 @@ PERFORMANCE_COLD_PROFILE = RuntimeProfile(
     name="performance-cold",
     runtime_profile="native_mtp_60_cold",
     summary=(
-        "Medium Mode: native-MTP speed path; about 2.2x burst over the same "
-        "Optimized-Speed model with MTP off, but not sustained without fan control."
+        "Burst engine: native-MTP performance-cold path for the old max-fan "
+        "headline lane. Use only for short contexts, recommended max 8K."
     ),
     env=_items(NATIVE_MTP_60_FAST_PATH_ENV),
     benchmark_ids=(
         "mtp-depth-d3-gdn8-speed4-cyankiwi-mtp-draftlmhead4b-gs64-linear-gdn-from-conv-tape-mlx-qmv-unroll4-clean-preflight-batchedtargetarrays-lazymtphistory-dropevents-skipsnapshot-v4-20260429-143701",
     ),
     caveats=(
-        "Best no-fan burst throughput; may decay on long-context generation.",
+        "Best fan-backed burst throughput; not recommended for long context.",
         "Requires the MLX-MTPLX fork for the native QMV/QMM fast path.",
+    ),
+    required_mlx_fork_commit=NATIVE_MTP_60_MLX_FORK_COMMIT,
+    required_mlx_fork_fragment=NATIVE_MTP_60_MLX_FORK_FRAGMENT,
+    draft_lm_head=DraftLMHeadRequirement(bits=4, group_size=64, mode="affine"),
+)
+
+SUSTAINED_PROFILE = RuntimeProfile(
+    name="sustained",
+    runtime_profile="native_mtp_sustained",
+    summary=(
+        "Sustained Mode: explicit long-context native-MTP path with chunked "
+        "prefill, final-token logits, and request-sized paged KV."
+    ),
+    env=_items(SUSTAINED_PREFILL_ENV),
+    caveats=(
+        "User-selected; no automatic profile switching.",
+        "Targets long-context memory safety while preserving most Burst TPS.",
+        "Does not include v0.2 decode-state eval scheduling flags.",
     ),
     required_mlx_fork_commit=NATIVE_MTP_60_MLX_FORK_COMMIT,
     required_mlx_fork_fragment=NATIVE_MTP_60_MLX_FORK_FRAGMENT,
@@ -192,8 +230,7 @@ MAX_DIAGNOSTIC_PROFILE = RuntimeProfile(
     name="max-diagnostic",
     runtime_profile="max_diagnostic",
     summary=(
-        "Max Mode: Medium path plus ThermalForge fan control; about 2.24x in "
-        "the measured speed lane and loud by design."
+        "Diagnostic fan-control profile for QA-only experiments."
     ),
     env=_merge_env(EXACT_PAGED_ATTENTION_ENV, LONG_RESPONSE_STAGED_ENV),
     caveats=(
@@ -208,6 +245,7 @@ MAX_DIAGNOSTIC_PROFILE = RuntimeProfile(
 PROFILES: dict[ProfileName, RuntimeProfile] = {
     STABLE_PROFILE.name: STABLE_PROFILE,
     PERFORMANCE_COLD_PROFILE.name: PERFORMANCE_COLD_PROFILE,
+    SUSTAINED_PROFILE.name: SUSTAINED_PROFILE,
     EXACT_PROFILE.name: EXACT_PROFILE,
     MAX_DIAGNOSTIC_PROFILE.name: MAX_DIAGNOSTIC_PROFILE,
 }

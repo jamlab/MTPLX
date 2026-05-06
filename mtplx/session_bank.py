@@ -132,6 +132,8 @@ class SessionBank:
         self.idle_ttl_s = float(idle_ttl_s)
         self._entries: dict[tuple[int, ...], SessionBankEntry] = {}
         self.last_miss_reason: str | None = None
+        self.last_put_nbytes: int = 0
+        self.last_put_skipped_oversized_snapshot: bool = False
         self.eviction_log: list[dict[str, Any]] = []
 
     def __len__(self) -> int:
@@ -160,19 +162,67 @@ class SessionBank:
         snapshot_epoch: int = 0,
         mtp_snapshot_epoch: int | None = None,
         nbytes_override: int | None = None,
-    ) -> SessionBankEntry:
+    ) -> SessionBankEntry | None:
         tokens = tuple(int(token) for token in token_ids)
         if not tokens:
             raise ValueError("cannot store an empty prefix")
         if mtp_snapshot_epoch is not None and int(mtp_snapshot_epoch) != int(snapshot_epoch):
             raise ValueError("trunk and MTP snapshots must share the same commit boundary")
-        snapshot = snapshot_cache(cache)
+        self.last_put_nbytes = 0
+        self.last_put_skipped_oversized_snapshot = False
+        if nbytes_override is not None and int(nbytes_override) > self.per_session_max_bytes:
+            self.last_put_nbytes = int(nbytes_override)
+            self.last_put_skipped_oversized_snapshot = True
+            self.eviction_log.append(
+                {
+                    "reason": "skipped_oversized_snapshot",
+                    "session_id": session_id,
+                    "prefix_len": len(tokens),
+                    "token_hash": token_prefix_hash(tokens),
+                    "nbytes": int(nbytes_override),
+                    "budget": int(self.per_session_max_bytes),
+                }
+            )
+            return None
+        try:
+            snapshot = snapshot_cache(cache)
+        except RuntimeError as exc:
+            if "materialize active K/V arrays" not in str(exc):
+                raise
+            self.last_put_skipped_oversized_snapshot = True
+            self.eviction_log.append(
+                {
+                    "reason": "skipped_dense_materializing_snapshot",
+                    "session_id": session_id,
+                    "prefix_len": len(tokens),
+                    "token_hash": token_prefix_hash(tokens),
+                    "nbytes": 0,
+                    "budget": int(self.per_session_max_bytes),
+                    "error": str(exc),
+                }
+            )
+            return None
         computed_nbytes = (
             _snapshot_nbytes(snapshot)
             + _tree_nbytes(logits)
             + _tree_nbytes(hidden)
             + _tree_nbytes(mtp_history_snapshot)
         )
+        entry_nbytes = int(nbytes_override if nbytes_override is not None else computed_nbytes)
+        self.last_put_nbytes = int(entry_nbytes)
+        if entry_nbytes > self.per_session_max_bytes:
+            self.last_put_skipped_oversized_snapshot = True
+            self.eviction_log.append(
+                {
+                    "reason": "skipped_oversized_snapshot",
+                    "session_id": session_id,
+                    "prefix_len": len(tokens),
+                    "token_hash": token_prefix_hash(tokens),
+                    "nbytes": int(entry_nbytes),
+                    "budget": int(self.per_session_max_bytes),
+                }
+            )
+            return None
         entry = SessionBankEntry(
             token_ids=tokens,
             token_hash=token_prefix_hash(tokens),
@@ -183,7 +233,7 @@ class SessionBank:
             logits=_clone_tree(logits),
             hidden=_clone_tree(hidden),
             cache_ref=cache if keep_live_ref else None,
-            nbytes=int(nbytes_override if nbytes_override is not None else computed_nbytes),
+            nbytes=int(entry_nbytes),
             session_id=session_id,
             template_hash=template_hash,
             mtp_history_policy=mtp_history_policy,
@@ -387,6 +437,13 @@ class SessionBank:
             if unprotected:
                 candidates = unprotected
             elif len(candidates) == 1:
+                entry = candidates[0]
+                if (
+                    entry.nbytes > self.per_session_max_bytes
+                    or entry.nbytes > self.max_bytes
+                ):
+                    self._evict_entry(entry, reason=reason or CacheMissReason.EVICTED.value)
+                    continue
                 return
             victim = min(
                 candidates,

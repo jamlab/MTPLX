@@ -18,6 +18,7 @@ import mlx.core as mx
 import numpy as np
 
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
+from .attention_context import attention_phase
 from .cache_state import (
     detach_array_leaf,
     detach_cache_state,
@@ -112,6 +113,143 @@ def _env_truthy(name: str) -> bool:
         "yes",
         "on",
     }
+
+
+def _env_falsey(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _runtime_count(rt: MTPLXRuntime, key: str, amount: int = 1) -> None:
+    counters = getattr(rt, "diagnostic_counters", None)
+    if counters is None:
+        return
+    counters[key] = int(counters.get(key, 0)) + int(amount)
+
+
+def _runtime_counter_snapshot(rt: MTPLXRuntime) -> dict[str, int]:
+    return {
+        str(key): int(value)
+        for key, value in getattr(rt, "diagnostic_counters", {}).items()
+    }
+
+
+def _runtime_counter_delta(
+    rt: MTPLXRuntime,
+    before: dict[str, int],
+) -> dict[str, int]:
+    current = getattr(rt, "diagnostic_counters", {})
+    keys = set(before) | set(current)
+    return {
+        str(key): int(current.get(key, 0)) - int(before.get(key, 0))
+        for key in keys
+    }
+
+
+def _attach_runtime_diagnostics(
+    stats: "GenerationStats",
+    rt: MTPLXRuntime,
+    before: dict[str, int],
+    *,
+    ar_return_hidden: bool | None = None,
+) -> None:
+    counters = _runtime_counter_delta(rt, before)
+    stats.runtime_mtp_enabled = bool(getattr(rt, "mtp_enabled", False))
+    if ar_return_hidden is not None:
+        stats.ar_return_hidden = bool(ar_return_hidden)
+    stats.forward_ar_hidden_calls = int(counters.get("forward_ar_hidden_calls", 0))
+    stats.forward_ar_plain_calls = int(counters.get("forward_ar_plain_calls", 0))
+    stats.mtp_forward_calls = int(counters.get("draft_mtp_calls", 0))
+    stats.make_mtp_cache_calls = int(counters.get("make_mtp_cache_calls", 0))
+    stats.update_mtp_cache_calls = int(counters.get("update_mtp_cache_calls", 0))
+    stats.mtp_history_append_calls = int(counters.get("mtp_history_append_calls", 0))
+    stats.full_logits_tokens_emitted = int(counters.get("full_logits_tokens_emitted", 0))
+    stats.final_logits_tokens_emitted = int(counters.get("final_logits_tokens_emitted", 0))
+    stats.logits_tokens_emitted = int(counters.get("logits_tokens_emitted", 0))
+    stats.prefill_chunks = int(counters.get("prefill_chunks", 0))
+    stats.prefill_chunk_size = _env_int("MTPLX_PREFILL_CHUNK_SIZE", 0)
+    owned_attn = stats.owned_attn_kv if isinstance(stats.owned_attn_kv, dict) else {}
+    stats.paged_kv_capacity_tokens = int(owned_attn.get("capacity") or 0)
+    stats.paged_kv_num_blocks = int(owned_attn.get("num_blocks") or 0)
+    stats.paged_active_array_calls = int(owned_attn.get("active_array_calls") or 0)
+    stats.attention_dense_fallback_calls = int(
+        owned_attn.get("dense_fallback_calls") or 0
+    )
+    stats.prefill_dense_fallback_calls = int(
+        owned_attn.get("prefill_dense_fallback_calls") or 0
+    )
+    stats.decode_dense_fallback_calls = int(
+        owned_attn.get("decode_dense_fallback_calls") or 0
+    )
+    stats.ar_dense_fallback_calls = int(
+        owned_attn.get("ar_dense_fallback_calls") or 0
+    )
+    stats.postcommit_dense_fallback_calls = int(
+        owned_attn.get("postcommit_dense_fallback_calls") or 0
+    )
+    bailouts = owned_attn.get("paged_attention_bailouts_by_phase_reason") or {}
+    stats.paged_attention_bailouts_by_phase_reason = (
+        dict(bailouts) if isinstance(bailouts, dict) else {}
+    )
+    stats.paged_attention_large_q_path = str(
+        owned_attn.get("paged_attention_large_q_path") or ""
+    )
+    stats.large_q_split_sdpa_fallback_calls = int(
+        owned_attn.get("large_q_split_sdpa_fallback_calls") or 0
+    )
+    stats.partitioned_paged_calls = int(
+        owned_attn.get("partitioned_paged_calls") or 0
+    )
+
+
+def _sustained_prefill_enabled() -> bool:
+    return _env_truthy("MTPLX_SUSTAINED_PREFILL")
+
+
+def _final_logits_prefill_enabled() -> bool:
+    return _sustained_prefill_enabled() or _env_falsey(
+        "MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS"
+    )
+
+
+def _prefill_chunk_size() -> int:
+    return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE", 2048))
+
+
+def _iter_prefill_chunks(token_ids: list[int]) -> list[list[int]]:
+    if not token_ids:
+        return []
+    if not _sustained_prefill_enabled():
+        return [token_ids]
+    chunk_size = _prefill_chunk_size()
+    return [token_ids[start : start + chunk_size] for start in range(0, len(token_ids), chunk_size)]
+
+
+def _eval_cache_roots(cache: Any) -> None:
+    arrays = _tree_mx_arrays(cache)
+    if not arrays:
+        return
+    deduped: list[mx.array] = []
+    seen: set[int] = set()
+    for array in arrays:
+        ident = id(array)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        deduped.append(array)
+    if deduped:
+        _eval(*deduped, _caller_depth=2)
 
 
 def _eval_verify_outputs(verify_logits: mx.array, verify_hidden: mx.array, captures: Any | None = None) -> dict[str, float]:
@@ -634,6 +772,36 @@ class GenerationStats:
     generated_tokens: int
     elapsed_s: float
     tok_s: float
+    benchmark_mode: str | None = None
+    load_mtp: bool | None = None
+    runtime_mtp_enabled: bool = False
+    draft_head_installed: bool | None = None
+    ar_return_hidden: bool = False
+    forward_ar_hidden_calls: int = 0
+    forward_ar_plain_calls: int = 0
+    mtp_forward_calls: int = 0
+    make_mtp_cache_calls: int = 0
+    update_mtp_cache_calls: int = 0
+    mtp_history_append_calls: int = 0
+    full_logits_tokens_emitted: int = 0
+    final_logits_tokens_emitted: int = 0
+    logits_tokens_emitted: int = 0
+    prefill_chunk_size: int = 0
+    prefill_chunks: int = 0
+    paged_kv_capacity_tokens: int = 0
+    paged_kv_num_blocks: int = 0
+    paged_active_array_calls: int = 0
+    attention_dense_fallback_calls: int = 0
+    prefill_dense_fallback_calls: int = 0
+    decode_dense_fallback_calls: int = 0
+    ar_dense_fallback_calls: int = 0
+    postcommit_dense_fallback_calls: int = 0
+    paged_attention_bailouts_by_phase_reason: dict[str, int] = field(default_factory=dict)
+    paged_attention_large_q_path: str = ""
+    large_q_split_sdpa_fallback_calls: int = 0
+    partitioned_paged_calls: int = 0
+    sessionbank_snapshot_bytes: int = 0
+    sessionbank_skipped_oversized_snapshot: bool = False
     accepted_drafts: int = 0
     rejected_drafts: int = 0
     drafted_tokens: int = 0
@@ -824,6 +992,9 @@ def restore_or_prefill_prompt_state(
                 mx.array([suffix]),
                 cache=restored.cache,
                 return_hidden=True,
+                hidden_variant=mtp_hidden_variant,
+                emit_logits=True,
+                logits_keep=1 if _final_logits_prefill_enabled() else None,
             )
             _eval(suffix_logits, suffix_hidden)
             suffix_time = time.perf_counter() - started
@@ -864,21 +1035,36 @@ def restore_or_prefill_prompt_state(
     mtp_history_cache = None
     prompt_history_time = 0.0
     if mtp_history_policy == "committed":
-        cache, logits, hidden, prompt_hidden, target_time = _prefill_with_hidden_sequence(
-            rt,
-            prompt_ids,
-        )
-        prompt_eval_time = target_time
-        mtp_history_cache = rt.make_mtp_cache()
-        if len(prompt_ids) > 1:
-            prompt_history_time = _append_mtp_history(
-                rt,
+        if _sustained_prefill_enabled():
+            (
+                cache,
+                logits,
+                hidden,
                 mtp_history_cache,
-                prompt_hidden[:, :-1, :],
-                prompt_ids[1:],
+                target_time,
+                prompt_history_time,
+            ) = _prefill_committed_mtp_history_streaming(
+                rt,
+                prompt_ids,
                 mtp_hidden_variant=mtp_hidden_variant,
             )
-            prompt_eval_time += prompt_history_time
+            prompt_eval_time = target_time + prompt_history_time
+        else:
+            cache, logits, hidden, prompt_hidden, target_time = _prefill_with_hidden_sequence(
+                rt,
+                prompt_ids,
+            )
+            prompt_eval_time = target_time
+            mtp_history_cache = rt.make_mtp_cache()
+            if len(prompt_ids) > 1:
+                prompt_history_time = _append_mtp_history(
+                    rt,
+                    mtp_history_cache,
+                    prompt_hidden[:, :-1, :],
+                    prompt_ids[1:],
+                    mtp_hidden_variant=mtp_hidden_variant,
+                )
+                prompt_eval_time += prompt_history_time
     else:
         cache, logits, hidden, target_time = _prefill(rt, prompt_ids, return_hidden=True)
         prompt_eval_time = target_time
@@ -1222,23 +1408,34 @@ def _prefill(rt: MTPLXRuntime, prompt_ids: list[int], *, return_hidden: bool):
 
     cache = rt.make_cache()
     target_forward_time = 0.0
+    final_logits_only = _final_logits_prefill_enabled()
 
     if len(prompt_ids) > 1:
-        started = time.perf_counter()
-        prefill = rt.forward_ar(
-            mx.array([prompt_ids[:-1]]),
-            cache=cache,
-            return_hidden=False,
-        )
-        _eval(prefill)
-        target_forward_time += time.perf_counter() - started
+        for chunk in _iter_prefill_chunks(prompt_ids[:-1]):
+            started = time.perf_counter()
+            with attention_phase("prefill"):
+                prefill = rt.forward_ar(
+                    mx.array([chunk]),
+                    cache=cache,
+                    return_hidden=False,
+                    emit_logits=not final_logits_only,
+                )
+            if prefill is None:
+                _eval_cache_roots(cache)
+            else:
+                _eval(prefill)
+            _runtime_count(rt, "prefill_chunks")
+            target_forward_time += time.perf_counter() - started
 
     started = time.perf_counter()
-    result = rt.forward_ar(
-        mx.array([[prompt_ids[-1]]]),
-        cache=cache,
-        return_hidden=return_hidden,
-    )
+    with attention_phase("prefill"):
+        result = rt.forward_ar(
+            mx.array([[prompt_ids[-1]]]),
+            cache=cache,
+            return_hidden=return_hidden,
+            emit_logits=True,
+            logits_keep=1 if final_logits_only else None,
+        )
     if return_hidden:
         logits, hidden = result
         _eval(logits, hidden)
@@ -1251,17 +1448,89 @@ def _prefill(rt: MTPLXRuntime, prompt_ids: list[int], *, return_hidden: bool):
     return cache, logits[:, -1, :], hidden, target_forward_time
 
 
+def _prefill_committed_mtp_history_streaming(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    mtp_hidden_variant: str,
+):
+    if not prompt_ids:
+        raise ValueError("prompt_ids must not be empty")
+
+    cache = rt.make_cache()
+    mtp_history_cache = rt.make_mtp_cache()
+    target_forward_time = 0.0
+    prompt_history_time = 0.0
+    final_logits_only = _final_logits_prefill_enabled()
+    body = prompt_ids[:-1]
+
+    cursor = 0
+    for chunk in _iter_prefill_chunks(body):
+        started = time.perf_counter()
+        with attention_phase("prefill"):
+            logits_chunk, hidden_chunk = rt.forward_ar(
+                mx.array([chunk]),
+                cache=cache,
+                return_hidden=True,
+                hidden_variant=mtp_hidden_variant,
+                emit_logits=not final_logits_only,
+            )
+        if logits_chunk is None:
+            _eval(hidden_chunk)
+        else:
+            _eval(logits_chunk, hidden_chunk)
+        target_forward_time += time.perf_counter() - started
+        _runtime_count(rt, "prefill_chunks")
+
+        token_ids = prompt_ids[cursor + 1 : cursor + 1 + len(chunk)]
+        prompt_history_time += _append_mtp_history(
+            rt,
+            mtp_history_cache,
+            hidden_chunk,
+            token_ids,
+            mtp_hidden_variant=mtp_hidden_variant,
+            force_eval=True,
+        )
+        cursor += len(chunk)
+        del hidden_chunk
+        del logits_chunk
+
+    started = time.perf_counter()
+    with attention_phase("prefill"):
+        logits, hidden = rt.forward_ar(
+            mx.array([[prompt_ids[-1]]]),
+            cache=cache,
+            return_hidden=True,
+            hidden_variant=mtp_hidden_variant,
+            emit_logits=True,
+            logits_keep=1 if final_logits_only else None,
+        )
+    _eval(logits, hidden)
+    target_forward_time += time.perf_counter() - started
+    return (
+        cache,
+        logits[:, -1, :],
+        hidden[:, -1:, :],
+        mtp_history_cache,
+        target_forward_time,
+        prompt_history_time,
+    )
+
+
 def _prefill_with_hidden_sequence(rt: MTPLXRuntime, prompt_ids: list[int]):
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
 
     cache = rt.make_cache()
     started = time.perf_counter()
-    logits, hidden = rt.forward_ar(
-        mx.array([prompt_ids]),
-        cache=cache,
-        return_hidden=True,
-    )
+    with attention_phase("prefill"):
+        logits, hidden = rt.forward_ar(
+            mx.array([prompt_ids]),
+            cache=cache,
+            return_hidden=True,
+            emit_logits=True,
+            logits_keep=1 if _final_logits_prefill_enabled() else None,
+        )
     _eval(logits, hidden)
     target_forward_time = time.perf_counter() - started
     return cache, logits[:, -1, :], hidden[:, -1:, :], hidden, target_forward_time
@@ -1363,6 +1632,7 @@ def _append_mtp_history(
         return 0.0
     if hidden_states.shape[1] != len(token_ids):
         raise ValueError("hidden_states length must match token_ids length")
+    _runtime_count(rt, "mtp_history_append_calls")
     started = time.perf_counter()
     hidden = rt.update_mtp_cache(
         hidden_states,
@@ -1388,10 +1658,17 @@ def generate_ar(
     trace_label: str | None = None,
     trace_metadata: dict[str, Any] | None = None,
 ) -> GenerationOutput:
+    counter_start = _runtime_counter_snapshot(rt)
     rng = np.random.default_rng(seed)
     stop_token_ids = _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
     started_all = time.perf_counter()
-    ar_return_hidden = bool(rt.mtp_enabled)
+    ar_return_hidden = bool(
+        rt.mtp_enabled
+        and (
+            _env_truthy("MTPLX_AR_RETURN_HIDDEN")
+            or _env_truthy("MTPLX_DIAGNOSTIC_AR_RETURN_HIDDEN")
+        )
+    )
     cache, logits, hidden, prompt_eval_time = _prefill(
         rt,
         prompt_ids,
@@ -1491,11 +1768,12 @@ def generate_ar(
             break
 
         started = time.perf_counter()
-        result_next = rt.forward_ar(
-            mx.array([[token]]),
-            cache=cache,
-            return_hidden=ar_return_hidden,
-        )
+        with attention_phase("ar_decode"):
+            result_next = rt.forward_ar(
+                mx.array([[token]]),
+                cache=cache,
+                return_hidden=ar_return_hidden,
+            )
         if ar_return_hidden:
             logits_next, hidden_next = result_next
         else:
@@ -1535,6 +1813,12 @@ def generate_ar(
         decode_trace_run_id=trace.run_id if trace.enabled else None,
         events=events,
     )
+    _attach_runtime_diagnostics(
+        stats,
+        rt,
+        counter_start,
+        ar_return_hidden=ar_return_hidden,
+    )
     return GenerationOutput(
         tokens=tokens,
         text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
@@ -1569,6 +1853,7 @@ def generate_mtp1(
             "verify_strategy must be 'batched', 'sequential', 'capture', "
             "'capture_commit', 'graphbank', or 'graphbank_capture_commit'"
         )
+    counter_start = _runtime_counter_snapshot(rt)
     verify_core_backend = resolve_gdn_capture_backend(verify_core)
 
     rng = np.random.default_rng(seed)
@@ -1645,11 +1930,12 @@ def generate_mtp1(
                 event["speculation_skipped"] = True
                 event["verify_strategy"] = verify_strategy
                 started = time.perf_counter()
-                logits_next, hidden_next = rt.forward_ar(
-                    mx.array([[primary]]),
-                    cache=cache,
-                    return_hidden=True,
-                )
+                with attention_phase("decode_verify"):
+                    logits_next, hidden_next = rt.forward_ar(
+                        mx.array([[primary]]),
+                        cache=cache,
+                        return_hidden=True,
+                    )
                 _eval(logits_next, hidden_next)
                 elapsed_commit = time.perf_counter() - started
                 target_time += elapsed_commit
@@ -1676,11 +1962,12 @@ def generate_mtp1(
 
         if verify_strategy == "sequential":
             started = time.perf_counter()
-            verify_logits, verify_hidden = rt.forward_ar(
-                mx.array([[primary]]),
-                cache=cache,
-                return_hidden=True,
-            )
+            with attention_phase("decode_verify"):
+                verify_logits, verify_hidden = rt.forward_ar(
+                    mx.array([[primary]]),
+                    cache=cache,
+                    return_hidden=True,
+                )
             _eval(verify_logits, verify_hidden)
             elapsed_verify = time.perf_counter() - started
             verify_time += elapsed_verify
@@ -1723,11 +2010,12 @@ def generate_mtp1(
                 accepted += 1
                 tokens.append(draft_token)
                 started = time.perf_counter()
-                logits_next, hidden_next = rt.forward_ar(
-                    mx.array([[draft_token]]),
-                    cache=cache,
-                    return_hidden=True,
-                )
+                with attention_phase("decode_verify"):
+                    logits_next, hidden_next = rt.forward_ar(
+                        mx.array([[draft_token]]),
+                        cache=cache,
+                        return_hidden=True,
+                    )
                 _eval(logits_next, hidden_next)
                 elapsed_commit = time.perf_counter() - started
                 verify_time += elapsed_commit
@@ -1748,11 +2036,12 @@ def generate_mtp1(
                 correction_tokens += 1
                 tokens.append(int(correction))
                 started = time.perf_counter()
-                logits_next, hidden_next = rt.forward_ar(
-                    mx.array([[int(correction)]]),
-                    cache=cache,
-                    return_hidden=True,
-                )
+                with attention_phase("decode_verify"):
+                    logits_next, hidden_next = rt.forward_ar(
+                        mx.array([[int(correction)]]),
+                        cache=cache,
+                        return_hidden=True,
+                    )
                 _eval(logits_next, hidden_next)
                 elapsed_repair = time.perf_counter() - started
                 target_time += elapsed_repair
@@ -1775,19 +2064,20 @@ def generate_mtp1(
         captures = None
         if verify_strategy in {"capture", "capture_commit", "graphbank_capture_commit"}:
             started = time.perf_counter()
-            if graphbank is not None:
-                verify_logits, verify_hidden, captures = graphbank.forward_ar_capture(
-                    mx.array([[primary, draft_token]]),
-                    cache=cache,
-                    return_hidden=True,
-                )
-            else:
-                verify_logits, verify_hidden, captures = rt.forward_ar_capture(
-                    mx.array([[primary, draft_token]]),
-                    cache=cache,
-                    return_hidden=True,
-                    capture_backend=verify_core_backend,
-                )
+            with attention_phase("decode_verify"):
+                if graphbank is not None:
+                    verify_logits, verify_hidden, captures = graphbank.forward_ar_capture(
+                        mx.array([[primary, draft_token]]),
+                        cache=cache,
+                        return_hidden=True,
+                    )
+                else:
+                    verify_logits, verify_hidden, captures = rt.forward_ar_capture(
+                        mx.array([[primary, draft_token]]),
+                        cache=cache,
+                        return_hidden=True,
+                        capture_backend=verify_core_backend,
+                    )
             _eval_verify_outputs(verify_logits, verify_hidden, captures)
             elapsed_verify = time.perf_counter() - started
             verify_time += elapsed_verify
@@ -1877,11 +2167,12 @@ def generate_mtp1(
                         rollback_time += elapsed_rollback
                         _add_timing(event, "rollback", elapsed_rollback)
                         started = time.perf_counter()
-                        logits_next, hidden_next = rt.forward_ar(
-                            mx.array([[primary]]),
-                            cache=cache,
-                            return_hidden=True,
-                        )
+                        with attention_phase("decode_verify"):
+                            logits_next, hidden_next = rt.forward_ar(
+                                mx.array([[primary]]),
+                                cache=cache,
+                                return_hidden=True,
+                            )
                         _eval(logits_next, hidden_next)
                         elapsed_repair = time.perf_counter() - started
                         target_time += elapsed_repair
@@ -1922,11 +2213,12 @@ def generate_mtp1(
                         event["pending_primary"] = int(correction)
                     else:
                         started = time.perf_counter()
-                        logits_next, hidden_next = rt.forward_ar(
-                            mx.array([[primary, int(correction)]]),
-                            cache=cache,
-                            return_hidden=True,
-                        )
+                        with attention_phase("decode_verify"):
+                            logits_next, hidden_next = rt.forward_ar(
+                                mx.array([[primary, int(correction)]]),
+                                cache=cache,
+                                return_hidden=True,
+                            )
                         event["capture_repair"] = "standard_primary_correction_reforward"
                         _eval(logits_next, hidden_next)
                         elapsed_repair = time.perf_counter() - started
@@ -1943,18 +2235,19 @@ def generate_mtp1(
             continue
 
         started = time.perf_counter()
-        if graphbank is not None:
-            verify_logits, verify_hidden = graphbank.forward_ar(
-                mx.array([[primary, draft_token]]),
-                cache=cache,
-                return_hidden=True,
-            )
-        else:
-            verify_logits, verify_hidden = rt.forward_ar(
-                mx.array([[primary, draft_token]]),
-                cache=cache,
-                return_hidden=True,
-            )
+        with attention_phase("decode_verify"):
+            if graphbank is not None:
+                verify_logits, verify_hidden = graphbank.forward_ar(
+                    mx.array([[primary, draft_token]]),
+                    cache=cache,
+                    return_hidden=True,
+                )
+            else:
+                verify_logits, verify_hidden = rt.forward_ar(
+                    mx.array([[primary, draft_token]]),
+                    cache=cache,
+                    return_hidden=True,
+                )
         if captures is not None:
             _eval_verify_outputs(verify_logits, verify_hidden, captures)
         else:
@@ -2027,11 +2320,12 @@ def generate_mtp1(
             rollback_time += elapsed_rollback
             _add_timing(event, "rollback", elapsed_rollback)
             started = time.perf_counter()
-            logits_next, hidden_next = rt.forward_ar(
-                mx.array([[primary]]),
-                cache=cache,
-                return_hidden=True,
-            )
+            with attention_phase("decode_verify"):
+                logits_next, hidden_next = rt.forward_ar(
+                    mx.array([[primary]]),
+                    cache=cache,
+                    return_hidden=True,
+                )
             _eval(logits_next, hidden_next)
             elapsed_repair = time.perf_counter() - started
             target_time += elapsed_repair
@@ -2049,11 +2343,12 @@ def generate_mtp1(
             rollback_time += elapsed_rollback
             _add_timing(event, "rollback", elapsed_rollback)
             started = time.perf_counter()
-            logits_next, hidden_next = rt.forward_ar(
-                mx.array([[primary, int(correction)]]),
-                cache=cache,
-                return_hidden=True,
-            )
+            with attention_phase("decode_verify"):
+                logits_next, hidden_next = rt.forward_ar(
+                    mx.array([[primary, int(correction)]]),
+                    cache=cache,
+                    return_hidden=True,
+                )
             _eval(logits_next, hidden_next)
             elapsed_repair = time.perf_counter() - started
             target_time += elapsed_repair
@@ -2107,6 +2402,7 @@ def generate_mtp1(
         deferred_correction_repairs=deferred_correction_repairs,
         events=events,
     )
+    _attach_runtime_diagnostics(stats, rt, counter_start)
     return GenerationOutput(
         tokens=tokens,
         text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
@@ -2209,6 +2505,7 @@ def generate_mtpk(
             "verify_strategy must be 'batched', 'capture_commit', "
             "'graphbank', or 'graphbank_capture_commit'"
         )
+    counter_start = _runtime_counter_snapshot(rt)
     verify_core_backend = resolve_gdn_capture_backend(verify_core)
     online_hidden_enabled = online_hidden_corrector_alpha > 0.0
     online_hidden_max_feed_depth = (
@@ -3327,32 +3624,33 @@ def generate_mtpk(
         set_native_mlp_context(len(tokens))
         started_forward = time.perf_counter()
         captures = None
-        if verify_strategy in {"capture_commit", "graphbank_capture_commit"}:
-            if graphbank is not None:
-                verify_logits, verify_hidden, captures = graphbank.forward_ar_capture(
+        with attention_phase("decode_verify"):
+            if verify_strategy in {"capture_commit", "graphbank_capture_commit"}:
+                if graphbank is not None:
+                    verify_logits, verify_hidden, captures = graphbank.forward_ar_capture(
+                        mx.array([verify_input]),
+                        cache=cache,
+                        return_hidden=True,
+                    )
+                else:
+                    verify_logits, verify_hidden, captures = rt.forward_ar_capture(
+                        mx.array([verify_input]),
+                        cache=cache,
+                        return_hidden=True,
+                        capture_backend=verify_core_backend,
+                    )
+            elif graphbank is not None:
+                verify_logits, verify_hidden = graphbank.forward_ar(
                     mx.array([verify_input]),
                     cache=cache,
                     return_hidden=True,
                 )
             else:
-                verify_logits, verify_hidden, captures = rt.forward_ar_capture(
+                verify_logits, verify_hidden = rt.forward_ar(
                     mx.array([verify_input]),
                     cache=cache,
                     return_hidden=True,
-                    capture_backend=verify_core_backend,
                 )
-        elif graphbank is not None:
-            verify_logits, verify_hidden = graphbank.forward_ar(
-                mx.array([verify_input]),
-                cache=cache,
-                return_hidden=True,
-            )
-        else:
-            verify_logits, verify_hidden = rt.forward_ar(
-                mx.array([verify_input]),
-                cache=cache,
-                return_hidden=True,
-            )
         elapsed_verify_forward = time.perf_counter() - started_forward
         verify_forward_time += elapsed_verify_forward
         _add_timing(event, "verify_forward", elapsed_verify_forward)
@@ -3723,11 +4021,12 @@ def generate_mtpk(
             rollback_time += elapsed_rollback
             _add_timing(event, "rollback", elapsed_rollback)
             started = time.perf_counter()
-            repair_logits, repair_hidden = rt.forward_ar(
-                mx.array([committed]),
-                cache=cache,
-                return_hidden=True,
-            )
+            with attention_phase("decode_verify"):
+                repair_logits, repair_hidden = rt.forward_ar(
+                    mx.array([committed]),
+                    cache=cache,
+                    return_hidden=True,
+                )
             _eval(repair_logits, repair_hidden)
             elapsed_repair = time.perf_counter() - started
             target_time += elapsed_repair
@@ -3780,11 +4079,12 @@ def generate_mtpk(
             )
             commit_time += time.perf_counter() - commit_started
         commit_started = time.perf_counter()
-        commit_logits, commit_hidden = rt.forward_ar(
-            mx.array([[pending_token]]),
-            cache=cache,
-            return_hidden=True,
-        )
+        with attention_phase("decode_verify"):
+            commit_logits, commit_hidden = rt.forward_ar(
+                mx.array([[pending_token]]),
+                cache=cache,
+                return_hidden=True,
+            )
         _eval(commit_logits, commit_hidden)
         elapsed_commit_forward = time.perf_counter() - commit_started
         target_time += elapsed_commit_forward
@@ -3958,6 +4258,7 @@ def generate_mtpk(
         owned_attn_kv=tail_owned_attention_kv_stats(cache),
         events=events,
     )
+    _attach_runtime_diagnostics(stats, rt, counter_start)
     return GenerationOutput(
         tokens=tokens,
         text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
@@ -3991,6 +4292,7 @@ def generate_mtpa(
     if mtp_cache_policy not in {"persistent", "fresh"}:
         raise ValueError("mtp_cache_policy must be 'persistent' or 'fresh'")
 
+    counter_start = _runtime_counter_snapshot(rt)
     rng = np.random.default_rng(seed)
     draft_sampler = _env_scaled_draft_sampler(sampler, draft_sampler)
     policy = AdaptiveDepthPolicy(
@@ -4077,11 +4379,12 @@ def generate_mtpa(
         _add_timing(event, "snapshot", elapsed_snapshot)
         verify_input = [primary] + draft_tokens
         started = time.perf_counter()
-        verify_logits, verify_hidden = rt.forward_ar(
-            mx.array([verify_input]),
-            cache=cache,
-            return_hidden=True,
-        )
+        with attention_phase("decode_verify"):
+            verify_logits, verify_hidden = rt.forward_ar(
+                mx.array([verify_input]),
+                cache=cache,
+                return_hidden=True,
+            )
         _eval(verify_logits, verify_hidden)
         elapsed_verify = time.perf_counter() - started
         verify_time += elapsed_verify
@@ -4159,11 +4462,12 @@ def generate_mtpa(
         rollback_time += elapsed_rollback
         _add_timing(event, "rollback", elapsed_rollback)
         started = time.perf_counter()
-        repair_logits, repair_hidden = rt.forward_ar(
-            mx.array([committed]),
-            cache=cache,
-            return_hidden=True,
-        )
+        with attention_phase("decode_verify"):
+            repair_logits, repair_hidden = rt.forward_ar(
+                mx.array([committed]),
+                cache=cache,
+                return_hidden=True,
+            )
         _eval(repair_logits, repair_hidden)
         elapsed_repair = time.perf_counter() - started
         target_time += elapsed_repair
@@ -4205,6 +4509,7 @@ def generate_mtpa(
         ),
         events=events,
     )
+    _attach_runtime_diagnostics(stats, rt, counter_start)
     return GenerationOutput(
         tokens=tokens,
         text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),

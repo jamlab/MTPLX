@@ -326,6 +326,25 @@ def test_chat_generation_mode_request_override_routes_ar(monkeypatch):
     assert response.json()["mtplx_stats"]["mtp_depth"] == 0
 
 
+def test_generation_truth_stats_distinguish_stock_ar_from_target_ar():
+    target_state = _fake_state()
+    target_state.args.load_mtp = True
+    target_state.runtime.mtp_enabled = True
+    target_state.draft_lm_head = {"draft_only": {"bits": 4}}
+
+    stock_state = _fake_state()
+    stock_state.args.load_mtp = False
+    stock_state.runtime.mtp_enabled = False
+
+    target = openai._generation_truth_stats(target_state, "ar")
+    assert target["benchmark_mode"] == "mtplx_mtp_loaded_target_ar"
+    assert target["draft_head_installed"] is True
+    stock = openai._generation_truth_stats(stock_state, "ar")
+    assert stock["benchmark_mode"] == "mtplx_stock_ar_unloaded"
+    assert stock["load_mtp"] is False
+    assert stock["runtime_mtp_enabled"] is False
+
+
 def test_chat_generation_mode_request_override_routes_mtp_depth(monkeypatch):
     captured: dict[str, object] = {}
     client = TestClient(create_app(_fake_state()))
@@ -915,7 +934,7 @@ def test_server_state_emits_startup_progress(monkeypatch, capsys):
     state = openai.ServerState(args)
 
     captured = capsys.readouterr().out
-    assert "[4/6] Preparing Medium MTP runtime" in captured
+    assert "[4/6] Preparing Burst MTP runtime" in captured
     assert "[5/6] Loading model weights: models/example" in captured
     assert "This is the long step" in captured
     assert "Model load in progress (this may take a minute)" in captured

@@ -48,11 +48,15 @@ def test_state_round_trip(tmp_path, monkeypatch):
 def test_mode_label_covers_all_modes():
     """Mode labels explain runtime mechanics and hardware-neutral speed gain."""
     stable = onboarding.mode_label({"profile": "stable", "max": False})
-    medium = onboarding.mode_label({"profile": "performance-cold", "max": False})
-    maxed = onboarding.mode_label({"profile": "performance-cold", "max": True})
+    legacy = onboarding.mode_label({"profile": "performance-cold", "max": False})
+    sustained = onboarding.mode_label({"profile": "sustained", "max": False})
+    sustained_max = onboarding.mode_label({"profile": "sustained", "max": True})
+    burst = onboarding.mode_label({"profile": "performance-cold", "max": True})
     assert "Stable" in stable and "exact/staged" in stable and "tok/s" not in stable
-    assert "Medium" in medium and "~2.2x" in medium and "not sustained" in medium
-    assert "Max" in maxed and "100%" in maxed and "~2.24x" in maxed
+    assert "legacy" in legacy and "fan boost" in legacy
+    assert "Sustained" in sustained and "long-context" in sustained
+    assert "Sustained Max" in sustained_max and "100%" in sustained_max
+    assert "Burst" in burst and "max 8K" in burst
 
 
 def test_interface_label_covers_all_targets():
@@ -69,32 +73,42 @@ def test_run_onboarding_screens_with_stubbed_input(monkeypatch, capsys):
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     state = onboarding.run_onboarding_screens()
     assert state["model"] == onboarding.DEFAULT_HF_MODEL
-    assert state["profile"] == "performance-cold"
+    assert state["profile"] == "sustained"
     assert state["max"] is False
     assert state["target"] == "openwebui"
 
 
-def test_run_onboarding_max_mode_sets_max_flag_when_thermal_available(monkeypatch):
-    """Picking Max + a working fan controller → ``max=True``."""
+def test_run_onboarding_sustained_max_sets_max_flag_when_thermal_available(monkeypatch):
+    """Picking Sustained Max + a working fan controller -> ``profile=sustained,max=True``."""
     answers = iter(["1", "2", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     monkeypatch.setattr(onboarding, "ensure_thermal_control_installed", lambda: True)
     state = onboarding.run_onboarding_screens()
-    assert state["profile"] == "performance-cold"
+    assert state["profile"] == "sustained"
     assert state["max"] is True
     assert state["target"] == "terminal"
 
 
-def test_run_onboarding_max_mode_drops_flag_when_thermal_unavailable(monkeypatch):
-    """Picking Max + declined/failed install → ``max=False`` (don't lie about
-    fan boost we can't deliver)."""
-    answers = iter(["1", "2", "2"])
+def test_run_onboarding_fan_mode_falls_back_to_sustained_when_thermal_unavailable(monkeypatch):
+    """Picking a fan-backed mode + declined/failed install -> Sustained no-fan."""
+    answers = iter(["1", "3", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     monkeypatch.setattr(onboarding, "ensure_thermal_control_installed", lambda: False)
     state = onboarding.run_onboarding_screens()
-    assert state["profile"] == "performance-cold"
+    assert state["profile"] == "sustained"
     assert state["max"] is False
     assert state["target"] == "terminal"
+
+
+def test_run_onboarding_sustained_mode_is_explicit(monkeypatch):
+    answers = iter(["1", "1", "1"])
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    state = onboarding.run_onboarding_screens()
+
+    assert state["profile"] == "sustained"
+    assert state["max"] is False
+    assert state["target"] == "openwebui"
 
 
 def test_run_serve_onboarding_screens_defaults_to_api_server(monkeypatch):
@@ -102,7 +116,7 @@ def test_run_serve_onboarding_screens_defaults_to_api_server(monkeypatch):
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     state = onboarding.run_serve_onboarding_screens(host="127.0.0.1", port=8765)
     assert state["model"] == onboarding._verified_default_model()
-    assert state["profile"] == "performance-cold"
+    assert state["profile"] == "sustained"
     assert state["max"] is False
     assert state["target"] == "server"
     assert state["open_browser"] is False
@@ -251,12 +265,12 @@ def test_run_quickstart_flow_saves_state_on_first_run(tmp_path, monkeypatch):
 def test_run_quickstart_flow_returning_user_says_same(tmp_path, monkeypatch):
     monkeypatch.setenv("MTPLX_QUICKSTART_STATE", str(tmp_path / "returning.json"))
     onboarding.save_state(
-        {
-            "model": "mtplx/foo",
-            "profile": "performance-cold",
-            "max": False,
-            "target": "openwebui",
-        }
+            {
+                "model": "mtplx/foo",
+                "profile": "sustained",
+                "max": False,
+                "target": "openwebui",
+            }
     )
     # Returning-user prompt: empty answer (default Y) should reuse last state.
     answers = iter([""])
@@ -265,6 +279,25 @@ def test_run_quickstart_flow_returning_user_says_same(tmp_path, monkeypatch):
     assert state is not None
     assert state["model"] == "mtplx/foo"
     assert state["target"] == "openwebui"
+
+
+def test_run_quickstart_flow_returning_user_reuses_sustained(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_QUICKSTART_STATE", str(tmp_path / "returning-sustained.json"))
+    onboarding.save_state(
+        {
+            "model": "mtplx/foo",
+            "profile": "sustained",
+            "max": False,
+            "target": "openwebui",
+        }
+    )
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": "")
+
+    state = onboarding.run_quickstart_flow(fresh=False)
+
+    assert state is not None
+    assert state["profile"] == "sustained"
+    assert state["model"] == "mtplx/foo"
 
 
 def test_run_quickstart_flow_legacy_stable_state_is_not_reused(tmp_path, monkeypatch):
@@ -284,7 +317,7 @@ def test_run_quickstart_flow_legacy_stable_state_is_not_reused(tmp_path, monkeyp
     state = onboarding.run_quickstart_flow(fresh=False)
     assert state is not None
     assert state["model"] == onboarding.DEFAULT_HF_MODEL
-    assert state["profile"] == "performance-cold"
+    assert state["profile"] == "sustained"
     assert state["max"] is False
     assert state["target"] == "openwebui"
 
@@ -313,10 +346,12 @@ def test_run_quickstart_flow_returning_user_with_stale_max_drops_max(
     )
     state = onboarding.run_quickstart_flow(fresh=False)
     assert state is not None
+    assert state["profile"] == "sustained"
     assert state["max"] is False  # downgraded; honesty preserved
     # Persisted file is rewritten so the next run reflects reality.
     persisted = onboarding.load_state()
-    assert persisted is not None and persisted["max"] is False
+    assert persisted is not None and persisted["profile"] == "sustained"
+    assert persisted["max"] is False
 
 
 def test_run_quickstart_flow_returning_user_says_no(tmp_path, monkeypatch):
@@ -334,7 +369,7 @@ def test_run_quickstart_flow_returning_user_says_no(tmp_path, monkeypatch):
     state = onboarding.run_quickstart_flow(fresh=False)
     assert state is not None
     assert state["model"] == onboarding.DEFAULT_HF_MODEL
-    assert state["profile"] == "performance-cold"
+    assert state["profile"] == "sustained"
     assert state["target"] == "openwebui"
 
 

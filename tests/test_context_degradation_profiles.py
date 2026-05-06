@@ -25,6 +25,19 @@ def test_dirty_detach_profile_sets_gdn_conv_cadence_and_cache_limit():
     assert env["MTPLX_MLX_CACHE_LIMIT"] == "1gb"
 
 
+def test_sustained_profile_sets_v015_memory_env_without_decode_state_flags():
+    env, info = _local_profile_env("sustained", {})
+
+    assert info["profile_type"] == "sustained"
+    assert env["MTPLX_SUSTAINED_PREFILL"] == "1"
+    assert env["MTPLX_PREFILL_CHUNK_SIZE"] == "2048"
+    assert env["MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS"] == "0"
+    assert env["MTPLX_DYNAMIC_PAGED_KV"] == "1"
+    assert env["MTPLX_VLLM_METAL_PAGED_ATTN_IMPL"] == "mlx_vector_paged"
+    assert "MTPLX_TRUNK_CACHE_MATERIALIZE_EVERY" not in env
+    assert "MTPLX_EVAL_STATE_ROOTS_ON_COMMIT" not in env
+
+
 def test_cache_limit_profile_sets_only_allocator_limit_probe():
     env, info = _local_profile_env("cache_limit_512mb", {})
 

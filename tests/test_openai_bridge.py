@@ -149,6 +149,11 @@ def test_server_parse_args_exposes_product_flags():
     assert args.session_postcommit_mode == "async"
     validate_server_security_args(args)
 
+    stock = parse_args(["--stock-ar"])
+    assert stock.stock_ar is True
+    assert stock.generation_mode == "ar"
+    assert stock.load_mtp is False
+
 
 def test_generation_final_postcommit_exact_stores_final_state_without_retokenized_prefill():
     state = _postcommit_state()
