@@ -784,6 +784,17 @@ class VllmMetalPagedKVCache:
     def _partitioned_attention_enabled(self) -> bool:
         return _env_truthy("MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN")
 
+    @staticmethod
+    def _safe_2pass_paged_q_len(*, query_heads: int, kv_heads: int) -> int:
+        """Max q_len that keeps the packaged paged-tail Metal threadgroup legal."""
+
+        query_heads = max(1, int(query_heads))
+        kv_heads = max(1, int(kv_heads))
+        if query_heads % kv_heads:
+            return 0
+        gqa_factor = max(1, query_heads // kv_heads)
+        return max(1, 1024 // max(1, 32 * gqa_factor))
+
     def _long_context_dense_fallback_forbidden(self) -> bool:
         if _env_truthy("MTPLX_ALLOW_LONG_CONTEXT_DENSE_FALLBACK"):
             return False
@@ -1345,7 +1356,12 @@ class VllmMetalPagedKVCache:
                 self.paged_attention_calls += 1
                 self.attention_time_s += time.perf_counter() - started
                 return out
-            if q_len > max_q_len:
+            safe_tail_q_len = self._safe_2pass_paged_q_len(
+                query_heads=int(queries.shape[1]),
+                kv_heads=int(self.key_cache.shape[2]),
+            )
+            effective_max_q_len = min(max_q_len, safe_tail_q_len)
+            if q_len > effective_max_q_len:
                 if partitioned_enabled and int(self.offset) >= partition_threshold:
                     self.paged_attention_large_q_path = "partitioned_paged"
                     return run_partitioned_paged(force_fp32_paged=False)
@@ -1358,7 +1374,7 @@ class VllmMetalPagedKVCache:
                 block_size=int(self.block_size),
                 scale=float(scale),
                 mask=mask,
-                max_q_len=max_q_len,
+                max_q_len=effective_max_q_len,
                 sliding_window=int(sliding_window),
             )
             if out is not None:

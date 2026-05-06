@@ -660,6 +660,25 @@ def _tool_schema():
     }
 
 
+def _add_tool_schema():
+    return {
+        "type": "function",
+        "function": {
+            "name": "add",
+            "description": "Add two numbers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "a": {"type": "integer"},
+                    "b": {"type": "integer"},
+                },
+                "required": ["a", "b"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 def _fake_generation(text: str):
     return {
         "text": text,
@@ -828,6 +847,56 @@ def test_chat_stream_tool_calls_emit_delta_tool_calls(monkeypatch):
     assert '"tool_calls"' in response.text
     assert '"finish_reason": "tool_calls"' in response.text
     assert "<tool_call>" not in response.text
+
+
+def test_chat_stream_tool_call_arguments_are_incremental(monkeypatch):
+    state = _fake_state()
+    state.args.stream_interval = 1
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: _fake_generation(
+            '<tool_call>{"name":"add","arguments":{"a":25,"b":17}}</tool_call>'
+        ),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Use add."}],
+            "tools": [_add_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 16,
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    tool_deltas = [
+        payload["choices"][0]["delta"]["tool_calls"][0]
+        for payload in payloads
+        if payload["choices"][0]["delta"].get("tool_calls")
+    ]
+    assert tool_deltas[0]["id"].startswith("call_")
+    assert tool_deltas[0]["type"] == "function"
+    assert tool_deltas[0]["function"] == {"name": "add", "arguments": ""}
+
+    argument_fragments = [
+        delta["function"]["arguments"]
+        for delta in tool_deltas
+        if delta.get("function", {}).get("arguments") is not None
+    ]
+    assert "".join(argument_fragments) == '{"a":25,"b":17}'
+    assert len([fragment for fragment in argument_fragments if fragment]) > 1
+    assert '{"a":25,"b":17}' not in argument_fragments
 
 
 def test_chat_stream_emits_heartbeat_during_alive_silence(monkeypatch):

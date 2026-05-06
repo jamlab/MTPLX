@@ -1229,6 +1229,41 @@ def _parse_generated_tool_calls(
     return calls
 
 
+def _stream_tool_call_deltas(
+    tool_calls: list[dict[str, Any]],
+    *,
+    argument_chunk_chars: int,
+):
+    chunk_size = max(1, int(argument_chunk_chars))
+    for index, tool_call in enumerate(tool_calls):
+        function = tool_call.get("function") if isinstance(tool_call, dict) else None
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "")
+        arguments = str(function.get("arguments") or "")
+        yield {
+            "tool_calls": [
+                {
+                    "index": index,
+                    "id": str(tool_call.get("id") or f"call_{index}"),
+                    "type": str(tool_call.get("type") or "function"),
+                    "function": {"name": name, "arguments": ""},
+                }
+            ]
+        }
+        for start in range(0, len(arguments), chunk_size):
+            yield {
+                "tool_calls": [
+                    {
+                        "index": index,
+                        "function": {
+                            "arguments": arguments[start : start + chunk_size]
+                        },
+                    }
+                ]
+            }
+
+
 def _template_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
     function = tool_call.get("function")
     if isinstance(function, dict):
@@ -4995,14 +5030,12 @@ def create_app(state: ServerState) -> FastAPI:
                             assistant_tool_calls=tool_calls,
                             stream_response=True,
                         )
-                        yield stream_chunk(
-                            delta={
-                                "tool_calls": [
-                                    {"index": index, **tool_call}
-                                    for index, tool_call in enumerate(tool_calls)
-                                ]
-                            }
-                        )
+                        argument_chunk_chars = max(1, int(state.args.stream_interval))
+                        for delta in _stream_tool_call_deltas(
+                            tool_calls,
+                            argument_chunk_chars=argument_chunk_chars,
+                        ):
+                            yield stream_chunk(delta=delta)
                         finish_reason = "tool_calls"
                     else:
                         display_text = _display_text(

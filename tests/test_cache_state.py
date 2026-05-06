@@ -595,6 +595,68 @@ def test_mlx_vector_large_q_routes_to_partitioned_paged(monkeypatch):
     assert stats["dense_fallback_calls"] == 0
 
 
+def test_mlx_vector_mid_q_respects_gqa_threadgroup_limit(monkeypatch):
+    import mtplx.cache_state as cache_state
+    import mtplx.kernels.sdpa_2pass_paged as paged_kernel
+
+    class FakeOps:
+        def __init__(self):
+            self.calls = 0
+
+        def paged_attention_v2_online_partitioned(self, *args, **kwargs):
+            self.calls += 1
+
+    def fail_tail(**_kwargs):
+        raise AssertionError("illegal GQA q_len must not reach sdpa_2pass_paged_tail")
+
+    fake_ops = FakeOps()
+    monkeypatch.setattr(cache_state, "_load_vllm_metal_ops", lambda: fake_ops)
+    monkeypatch.setattr(paged_kernel, "sdpa_2pass_paged_tail", fail_tail)
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q", "16")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE", "8")
+
+    paged = VllmMetalPagedKVCache(block_size=16, num_blocks=128)
+    keys = mx.zeros((1, 4, 2048, 8), dtype=mx.float32)
+    values = mx.zeros((1, 4, 2048, 8), dtype=mx.float32)
+    queries = mx.zeros((1, 24, 14, 8), dtype=mx.float32)
+    paged.update_without_fetch(keys, values)
+
+    actual = paged.paged_attention(queries, scale=8**-0.5, mask="causal")
+
+    assert actual is not None
+    assert fake_ops.calls == 1
+    stats = paged.paged_stats()
+    assert stats["partitioned_paged_calls"] == 1
+    assert stats["paged_attention_large_q_path"] == "partitioned_paged"
+    assert stats["dense_fallback_calls"] == 0
+
+
+def test_packaged_paged_tail_declines_oversized_threadgroup():
+    from mtplx.kernels.sdpa_2pass_paged import sdpa_2pass_paged_tail
+
+    queries = mx.zeros((1, 24, 14, 8), dtype=mx.float32)
+    key_cache = mx.zeros((128, 16, 4, 8), dtype=mx.float32)
+    value_cache = mx.zeros((128, 16, 4, 8), dtype=mx.float32)
+
+    actual = sdpa_2pass_paged_tail(
+        queries=queries,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        offset=2048,
+        block_size=16,
+        scale=8**-0.5,
+        mask="causal",
+        max_q_len=16,
+        sliding_window=-1,
+    )
+
+    assert actual is None
+
+
 def test_large_q_split_fallback_stays_in_paged_storage(monkeypatch):
     from mlx_lm.models.base import scaled_dot_product_attention
 

@@ -333,6 +333,8 @@ def sdpa_2pass_paged_tail(
 
     queries = mx.contiguous(queries)
     gqa_factor = int(hq) // hk
+    if 32 * gqa_factor * int(q_len) > 1024:
+        return None
     window_start = 0
     if int(sliding_window) > 0:
         window_start = max(0, int(offset) - int(sliding_window))
