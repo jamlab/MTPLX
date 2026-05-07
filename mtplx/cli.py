@@ -2199,11 +2199,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bench_p.add_argument(
         "--prefill-layout",
-        choices=("profile", "contiguous-then-repage", "contiguous-dense-decode"),
+        choices=("profile", "contiguous-then-repage", "contiguous-dense-decode", "paged"),
         default="profile",
         help=(
             "Override MTPLX_SUSTAINED_PREFILL_LAYOUT for bench prefill-ladder. "
             "Use profile for the selected profile default."
+        ),
+    )
+    bench_p.add_argument(
+        "--paged-attn-impl",
+        choices=(
+            "mlx-vector-paged",
+            "mlx_vector_paged",
+            "fast-sdpa-gather",
+            "fast_sdpa_gather",
+            "exact-gather",
+            "exact_gather",
+            "sdpa-2pass-paged",
+            "sdpa_2pass_paged",
+            "vllm-metal",
+            "vllm_metal",
+            "paged",
+        ),
+        help="Diagnostic override for MTPLX_VLLM_METAL_PAGED_ATTN_IMPL after profile env is applied.",
+    )
+    bench_p.add_argument(
+        "--mtp-history-policy",
+        choices=("auto", "committed", "full", "last-window", "last_window", "cycle", "none"),
+        help="Diagnostic override for MTPLX_MTP_HISTORY_POLICY after profile env is applied.",
+    )
+    bench_p.add_argument(
+        "--prefill-cache-cleanup",
+        action="store_true",
+        help=(
+            "Diagnostic OMLX-style prefill mode: synchronize and clear MLX's "
+            "cache after each prefill chunk."
+        ),
+    )
+    bench_p.add_argument(
+        "--prefill-stock-cache-only",
+        action="store_true",
+        help=(
+            "Unsafe diagnostic OMLX-style prefill mode: call the model in "
+            "stock cache-only form for chunks that do not need hidden states. "
+            "Requires MTPLX_ALLOW_UNSAFE_PREFILL_STOCK_CACHE_ONLY=1."
         ),
     )
     bench_p.add_argument("--limit", type=int)

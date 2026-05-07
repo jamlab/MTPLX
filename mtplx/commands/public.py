@@ -920,12 +920,17 @@ def cmd_bench_public(args: Any) -> int:
     action = args.bench_action
     if action == "prefill-ladder":
         from mtplx.prefill_bench import (
+            UnsafePrefillDiagnosticError,
             emit_prefill_ladder,
             run_prefill_ladder,
             write_prefill_ladder,
         )
 
-        payload = run_prefill_ladder(args)
+        try:
+            payload = run_prefill_ladder(args)
+        except UnsafePrefillDiagnosticError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         if getattr(args, "output", None):
             write_prefill_ladder(args.output, payload)
         emit_prefill_ladder(payload, json_output=bool(getattr(args, "json", False)))
@@ -950,7 +955,10 @@ def cmd_pull_public(args: Any) -> int:
 
     json_mode = bool(getattr(args, "json", False))
     callback = None
-    finalize: Any = lambda: None
+
+    def finalize() -> None:
+        return None
+
     progress_interval_s = 10.0
     if not json_mode:
         callback, finalize = _rich_download_progress_callback(
@@ -3166,7 +3174,7 @@ def cmd_serve_public(args: Any) -> int:
                 _print_serve_start_line("Use the existing server, or stop that terminal with Ctrl-C to restart.")
                 return 0
         _print_serve_start_line(f"error: port {int(args.port)} is already in use")
-        _print_serve_start_line(f"try: mtplx status")
+        _print_serve_start_line("try: mtplx status")
         server_command = _server_command_name(args)
         _print_serve_start_line(f"try: stop the old mtplx {server_command} terminal with Ctrl-C")
         profile_arg = (
@@ -4395,7 +4403,7 @@ def _quickstart_print_openwebui_handoff(args: Any, *, runtime_model: str) -> Non
     # The full banner + status panel are rendered by `_print_serve_start_banner`
     # inside `cmd_serve_public`, so this hand-off only emits a brief progress
     # marker. Keeping it minimal avoids visual duplication of the panel.
-    _quickstart_line(f"[2/3] Starting local MTPLX server for the browser chat...")
+    _quickstart_line("[2/3] Starting local MTPLX server for the browser chat...")
     _quickstart_line(f"      Loading model: {runtime_model}")
     _quickstart_line("      Keep this terminal open. The next step is the model load.")
     _quickstart_line()

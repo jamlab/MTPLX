@@ -27,12 +27,15 @@ PROMPT_FORMAT_CHOICES = (DEFAULT_PROMPT_FORMAT, RAW_PROMPT_FORMAT)
 PROFILE_PREFILL_LAYOUT = "profile"
 CONTIGUOUS_THEN_REPAGE_LAYOUT = "contiguous-then-repage"
 CONTIGUOUS_DENSE_DECODE_LAYOUT = "contiguous-dense-decode"
+PAGED_PREFILL_LAYOUT = "paged"
 PREFILL_LAYOUT_CHOICES = (
     PROFILE_PREFILL_LAYOUT,
     CONTIGUOUS_THEN_REPAGE_LAYOUT,
     CONTIGUOUS_DENSE_DECODE_LAYOUT,
+    PAGED_PREFILL_LAYOUT,
 )
 PROMPT_POLICY_VERSION = "coding_agent_tail_v2"
+UNSAFE_STOCK_CACHE_ONLY_ALLOW_ENV = "MTPLX_ALLOW_UNSAFE_PREFILL_STOCK_CACHE_ONLY"
 DEFAULT_SYSTEM_PROMPT = (
     "You are MTPLX, a precise coding agent. Follow the user's instructions, "
     "preserve exact behavior, and prefer production-safe patches."
@@ -66,10 +69,22 @@ DEFAULT_FINAL_REQUEST = (
 )
 
 
+def _env_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _unsafe_stock_cache_only_allowed() -> bool:
+    return _env_truthy(os.environ.get(UNSAFE_STOCK_CACHE_ONLY_ALLOW_ENV))
+
+
 @dataclass(frozen=True)
 class PromptBuild:
     token_ids: list[int]
     metadata: dict[str, Any]
+
+
+class UnsafePrefillDiagnosticError(RuntimeError):
+    """Raised when a known-risk diagnostic prefill path is requested casually."""
 
 
 def parse_contexts(value: str | None, *, full: bool = False) -> list[int]:
@@ -281,6 +296,42 @@ def _apply_prefill_layout_override(prefill_layout: str) -> str | None:
     return value
 
 
+def _apply_paged_attention_impl_override(args: Any) -> str:
+    impl = str(getattr(args, "paged_attn_impl", "") or "").strip().lower()
+    impl = impl.replace("-", "_")
+    if impl:
+        os.environ["MTPLX_VLLM_METAL_PAGED_ATTN_IMPL"] = impl
+    return impl
+
+
+def _apply_mtp_history_policy_override(args: Any) -> str:
+    policy = str(getattr(args, "mtp_history_policy", "") or "").strip().lower()
+    policy = policy.replace("-", "_")
+    if policy:
+        os.environ["MTPLX_MTP_HISTORY_POLICY"] = policy
+    return policy
+
+
+def _apply_prefill_cache_cleanup_override(args: Any) -> bool:
+    enabled = bool(getattr(args, "prefill_cache_cleanup", False))
+    if enabled:
+        os.environ["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP"] = "1"
+    return enabled
+
+
+def _apply_prefill_stock_cache_only_override(args: Any) -> bool:
+    enabled = bool(getattr(args, "prefill_stock_cache_only", False))
+    if enabled:
+        if not _unsafe_stock_cache_only_allowed():
+            raise UnsafePrefillDiagnosticError(
+                "--prefill-stock-cache-only is an unsafe diagnostic path after "
+                "a 64k M5 Max watchdog panic. Set "
+                f"{UNSAFE_STOCK_CACHE_ONLY_ALLOW_ENV}=1 to run it explicitly."
+            )
+        os.environ["MTPLX_PREFILL_STOCK_CACHE_ONLY"] = "1"
+    return enabled
+
+
 def _encode_prompt_content(
     tokenizer: Any,
     content: str,
@@ -410,6 +461,9 @@ def _recommended_prefill_qa_commands(
 def _env_snapshot() -> dict[str, str]:
     keys = (
         "MTPLX_PREFILL_CHUNK_SIZE",
+        "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP",
+        "MTPLX_PREFILL_STOCK_CACHE_ONLY",
+        UNSAFE_STOCK_CACHE_ONLY_ALLOW_ENV,
         "MTPLX_SUSTAINED_PREFILL",
         "MTPLX_SUSTAINED_PREFILL_LAYOUT",
         "MTPLX_VLLM_METAL_PAGED_ATTN",
@@ -419,6 +473,7 @@ def _env_snapshot() -> dict[str, str]:
         "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN",
         "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD",
         "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE",
+        "MTPLX_VLLM_METAL_PAGED_TURBOQUANT",
         "MTPLX_VLLM_METAL_PAGED_LARGE_Q_CHUNK_SIZE",
         "MTPLX_VLLM_METAL_PAGED_LARGE_Q_KV_CHUNK_SIZE",
         "MTPLX_ASSERT_NO_LARGE_Q_SPLIT_FALLBACK",
@@ -477,8 +532,29 @@ def _row_from_output(
         ),
         "verify_calls": int(_stats_value(stats, "verify_calls", 0) or 0),
         "verify_time_s": float(_stats_value(stats, "verify_time_s", 0.0) or 0.0),
+        "verify_forward_time_s": float(
+            _stats_value(stats, "verify_forward_time_s", 0.0) or 0.0
+        ),
+        "verify_eval_time_s": float(
+            _stats_value(stats, "verify_eval_time_s", 0.0) or 0.0
+        ),
+        "verify_logits_eval_time_s": float(
+            _stats_value(stats, "verify_logits_eval_time_s", 0.0) or 0.0
+        ),
+        "verify_hidden_eval_time_s": float(
+            _stats_value(stats, "verify_hidden_eval_time_s", 0.0) or 0.0
+        ),
+        "verify_joint_eval_time_s": float(
+            _stats_value(stats, "verify_joint_eval_time_s", 0.0) or 0.0
+        ),
+        "verify_eval_unattributed_time_s": float(
+            _stats_value(stats, "verify_eval_unattributed_time_s", 0.0) or 0.0
+        ),
         "draft_time_s": float(_stats_value(stats, "draft_time_s", 0.0) or 0.0),
         "repair_time_s": float(_stats_value(stats, "repair_time_s", 0.0) or 0.0),
+        "target_forward_time_s": float(
+            _stats_value(stats, "target_forward_time_s", 0.0) or 0.0
+        ),
         "elapsed_s": elapsed,
         "decode_elapsed_s": decode_elapsed,
         "peak_memory_gb": float(_stats_value(stats, "peak_memory_bytes", 0) or 0)
@@ -495,6 +571,18 @@ def _row_from_output(
         ),
         "prompt_mtp_history_tok_s": float(
             _stats_value(stats, "prompt_mtp_history_tok_s", 0.0) or 0.0
+        ),
+        "prefill_chunk_cache_cleanup_enabled": bool(
+            _stats_value(stats, "prefill_chunk_cache_cleanup_enabled", False)
+        ),
+        "prefill_chunk_cache_cleanup_events": int(
+            _stats_value(stats, "prefill_chunk_cache_cleanup_events", 0) or 0
+        ),
+        "prefill_stock_cache_only_enabled": bool(
+            _stats_value(stats, "prefill_stock_cache_only_enabled", False)
+        ),
+        "prefill_stock_cache_only_calls": int(
+            _stats_value(stats, "prefill_stock_cache_only_calls", 0) or 0
         ),
         "mtp_history_policy": str(_stats_value(stats, "mtp_history_policy", "") or ""),
         "mtp_history_window_tokens": int(
@@ -584,6 +672,20 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
     profile_env = profile.env_dict()
     if prefill_layout_env_value is not None:
         profile_env["MTPLX_SUSTAINED_PREFILL_LAYOUT"] = prefill_layout_env_value
+    paged_attn_impl_requested = str(getattr(args, "paged_attn_impl", "") or "").strip().lower().replace("-", "_")
+    mtp_history_policy_requested = str(getattr(args, "mtp_history_policy", "") or "").strip().lower().replace("-", "_")
+    prefill_cache_cleanup_requested = bool(getattr(args, "prefill_cache_cleanup", False))
+    prefill_stock_cache_only_requested = bool(
+        getattr(args, "prefill_stock_cache_only", False)
+    )
+    if paged_attn_impl_requested:
+        profile_env["MTPLX_VLLM_METAL_PAGED_ATTN_IMPL"] = paged_attn_impl_requested
+    if mtp_history_policy_requested:
+        profile_env["MTPLX_MTP_HISTORY_POLICY"] = mtp_history_policy_requested
+    if prefill_cache_cleanup_requested:
+        profile_env["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP"] = "1"
+    if prefill_stock_cache_only_requested and _unsafe_stock_cache_only_allowed():
+        profile_env["MTPLX_PREFILL_STOCK_CACHE_ONLY"] = "1"
     payload: dict[str, Any] = {
         "kind": "prefill_ladder",
         "git_sha": _git_sha(),
@@ -632,12 +734,36 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
         "rows": [],
         "dry_run": bool(getattr(args, "dry_run", False)),
     }
+    if paged_attn_impl_requested:
+        payload["paged_attn_impl_override"] = paged_attn_impl_requested
+    if mtp_history_policy_requested:
+        payload["mtp_history_policy_override"] = mtp_history_policy_requested
+    if prefill_cache_cleanup_requested:
+        payload["prefill_cache_cleanup_override"] = True
+    if prefill_stock_cache_only_requested:
+        payload["prefill_stock_cache_only_override"] = True
+        if not _unsafe_stock_cache_only_allowed():
+            payload["prefill_stock_cache_only_blocked"] = (
+                f"requires {UNSAFE_STOCK_CACHE_ONLY_ALLOW_ENV}=1"
+            )
     if payload["dry_run"]:
         return payload
 
     apply_profile_env(profile.name)
     _apply_prefill_layout_override(prefill_layout)
+    paged_attn_impl = _apply_paged_attention_impl_override(args)
+    mtp_history_policy = _apply_mtp_history_policy_override(args)
+    prefill_cache_cleanup = _apply_prefill_cache_cleanup_override(args)
+    prefill_stock_cache_only = _apply_prefill_stock_cache_only_override(args)
     payload["env"] = _env_snapshot()
+    if paged_attn_impl and paged_attn_impl != paged_attn_impl_requested:
+        payload["paged_attn_impl_override"] = paged_attn_impl
+    if mtp_history_policy and mtp_history_policy != mtp_history_policy_requested:
+        payload["mtp_history_policy_override"] = mtp_history_policy
+    if prefill_cache_cleanup and not prefill_cache_cleanup_requested:
+        payload["prefill_cache_cleanup_override"] = True
+    if prefill_stock_cache_only and not prefill_stock_cache_only_requested:
+        payload["prefill_stock_cache_only_override"] = True
 
     from .generation import generate_ar, generate_mtpk
     from .runtime import load

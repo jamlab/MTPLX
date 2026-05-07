@@ -219,6 +219,14 @@ def _attach_runtime_diagnostics(
     stats.logits_tokens_emitted = int(counters.get("logits_tokens_emitted", 0))
     stats.prefill_chunks = int(counters.get("prefill_chunks", 0))
     stats.prefill_chunk_size = _env_int("MTPLX_PREFILL_CHUNK_SIZE", 0)
+    stats.prefill_chunk_cache_cleanup_enabled = _prefill_chunk_cache_cleanup_enabled()
+    stats.prefill_chunk_cache_cleanup_events = int(
+        counters.get("prefill_chunk_cache_cleanup_events", 0)
+    )
+    stats.prefill_stock_cache_only_enabled = _prefill_stock_cache_only_enabled()
+    stats.prefill_stock_cache_only_calls = int(
+        counters.get("prefill_stock_cache_only_calls", 0)
+    )
     owned_attn = stats.owned_attn_kv if isinstance(stats.owned_attn_kv, dict) else {}
     stats.paged_kv_capacity_tokens = int(owned_attn.get("capacity") or 0)
     stats.paged_kv_num_blocks = int(owned_attn.get("num_blocks") or 0)
@@ -288,6 +296,43 @@ def _final_logits_prefill_enabled() -> bool:
     return _sustained_prefill_enabled() or _env_falsey(
         "MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS"
     )
+
+
+def _prefill_chunk_cache_cleanup_enabled() -> bool:
+    return _env_truthy("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP")
+
+
+def _prefill_chunk_cache_cleanup(rt: MTPLXRuntime) -> float:
+    if not _prefill_chunk_cache_cleanup_enabled():
+        return 0.0
+    started = time.perf_counter()
+    try:
+        mx.synchronize()
+    except RuntimeError:
+        pass
+    mx.clear_cache()
+    _runtime_count(rt, "prefill_chunk_cache_cleanup_events")
+    return time.perf_counter() - started
+
+
+def _prefill_stock_cache_only_enabled() -> bool:
+    return _env_truthy("MTPLX_PREFILL_STOCK_CACHE_ONLY") and _env_truthy(
+        "MTPLX_ALLOW_UNSAFE_PREFILL_STOCK_CACHE_ONLY"
+    )
+
+
+def _prefill_cache_only_forward(rt: MTPLXRuntime, token_ids: list[int], cache: Any) -> Any:
+    if not _prefill_stock_cache_only_enabled():
+        return rt.forward_ar(
+            mx.array([token_ids]),
+            cache=cache,
+            return_hidden=False,
+            emit_logits=not _final_logits_prefill_enabled(),
+        )
+    unused_logits = rt.model(mx.array([token_ids]), cache=cache)
+    del unused_logits
+    _runtime_count(rt, "prefill_stock_cache_only_calls")
+    return None
 
 
 def _prefill_chunk_size() -> int:
@@ -919,6 +964,10 @@ class GenerationStats:
     logits_tokens_emitted: int = 0
     prefill_chunk_size: int = 0
     prefill_chunks: int = 0
+    prefill_chunk_cache_cleanup_enabled: bool = False
+    prefill_chunk_cache_cleanup_events: int = 0
+    prefill_stock_cache_only_enabled: bool = False
+    prefill_stock_cache_only_calls: int = 0
     paged_kv_capacity_tokens: int = 0
     paged_kv_num_blocks: int = 0
     paged_active_array_calls: int = 0
@@ -1604,18 +1653,14 @@ def _prefill(rt: MTPLXRuntime, prompt_ids: list[int], *, return_hidden: bool):
         for chunk in _iter_prefill_chunks(prompt_ids[:-1]):
             started = time.perf_counter()
             with attention_phase("prefill"):
-                prefill = rt.forward_ar(
-                    mx.array([chunk]),
-                    cache=cache,
-                    return_hidden=False,
-                    emit_logits=not final_logits_only,
-                )
+                prefill = _prefill_cache_only_forward(rt, chunk, cache)
             if prefill is None:
                 _eval_cache_roots(cache)
             else:
                 _eval(prefill)
             _runtime_count(rt, "prefill_chunks")
             target_forward_time += time.perf_counter() - started
+            target_forward_time += _prefill_chunk_cache_cleanup(rt)
 
     started = time.perf_counter()
     with attention_phase("prefill"):
@@ -1664,48 +1709,64 @@ def _prefill_committed_mtp_history_streaming(
 
     cursor = 0
     for chunk in _iter_prefill_chunks(body):
+        token_start_index = cursor + 1
+        token_end_index = token_start_index + len(chunk)
+        needs_history_hidden = (
+            history_window_tokens is None
+            or token_end_index > history_start_token_index
+        )
         started = time.perf_counter()
         with attention_phase("prefill"):
-            logits_chunk, hidden_chunk = rt.forward_ar(
-                mx.array([chunk]),
-                cache=cache,
-                return_hidden=True,
-                hidden_variant=mtp_hidden_variant,
-                emit_logits=not final_logits_only,
-            )
-        if logits_chunk is None:
+            if needs_history_hidden:
+                logits_chunk, hidden_chunk = rt.forward_ar(
+                    mx.array([chunk]),
+                    cache=cache,
+                    return_hidden=True,
+                    hidden_variant=mtp_hidden_variant,
+                    emit_logits=not final_logits_only,
+                )
+            else:
+                hidden_chunk = None
+                logits_chunk = _prefill_cache_only_forward(rt, chunk, cache)
+        if hidden_chunk is None:
+            if logits_chunk is None:
+                _eval_cache_roots(cache)
+            else:
+                _eval(logits_chunk)
+        elif logits_chunk is None:
             _eval(hidden_chunk)
         else:
             _eval(logits_chunk, hidden_chunk)
         target_forward_time += time.perf_counter() - started
         _runtime_count(rt, "prefill_chunks")
 
-        token_start_index = cursor + 1
-        token_ids = prompt_ids[token_start_index : token_start_index + len(chunk)]
-        slice_start = max(0, history_start_token_index - token_start_index)
-        if slice_start < len(token_ids):
-            sliced_token_ids = token_ids[slice_start:]
-            sliced_hidden = hidden_chunk[
-                :,
-                slice_start : slice_start + len(sliced_token_ids),
-                :,
-            ]
-            prompt_history_time += _append_mtp_history(
-                rt,
-                mtp_history_cache,
-                sliced_hidden,
-                sliced_token_ids,
-                mtp_hidden_variant=mtp_hidden_variant,
-                position_offset=(
-                    token_start_index + slice_start - 1
-                    if history_window_tokens is not None
-                    else None
-                ),
-                force_eval=True,
-            )
+        if hidden_chunk is not None:
+            token_ids = prompt_ids[token_start_index : token_start_index + len(chunk)]
+            slice_start = max(0, history_start_token_index - token_start_index)
+            if slice_start < len(token_ids):
+                sliced_token_ids = token_ids[slice_start:]
+                sliced_hidden = hidden_chunk[
+                    :,
+                    slice_start : slice_start + len(sliced_token_ids),
+                    :,
+                ]
+                prompt_history_time += _append_mtp_history(
+                    rt,
+                    mtp_history_cache,
+                    sliced_hidden,
+                    sliced_token_ids,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    position_offset=(
+                        token_start_index + slice_start - 1
+                        if history_window_tokens is not None
+                        else None
+                    ),
+                    force_eval=True,
+                )
         cursor += len(chunk)
         del hidden_chunk
         del logits_chunk
+        target_forward_time += _prefill_chunk_cache_cleanup(rt)
 
     started = time.perf_counter()
     with attention_phase("prefill"):

@@ -9,12 +9,21 @@ stock fused SDPA and must pass acceptance parity before any serving claim.
 from __future__ import annotations
 
 from functools import lru_cache
+import os
 from typing import Any
 
 import mlx.core as mx
 
 
 def _compute_blocks(gqa_factor: int, n_kv: int) -> int:
+    override = (os.environ.get("MTPLX_SDPA_2PASS_BLOCKS") or "").strip()
+    if override:
+        try:
+            blocks = int(override)
+        except ValueError:
+            blocks = 0
+        if blocks > 0:
+            return int(blocks)
     arch = str(mx.device_info().get("architecture", ""))
     devc = arch[-1] if arch else ""
     n_simds = int(gqa_factor)

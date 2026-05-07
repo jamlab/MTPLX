@@ -117,6 +117,8 @@ def test_bench_prefill_ladder_dry_run_json(monkeypatch, capsys):
     assert "--disable-thinking" in payload["recommended_plugged_in_commands"][0]
     assert payload["profile"]["env"]["MTPLX_LAZY_VERIFY_LOGITS"] == "1"
     assert payload["profile"]["env"]["MTPLX_BATCH_TARGET_ARRAYS"] == "1"
+    assert payload["profile"]["env"]["MTPLX_DEFER_VERIFY_HIDDEN_EVAL"] == "1"
+    assert payload["profile"]["env"]["MTPLX_VLLM_METAL_PAGED_TURBOQUANT"] == "0"
 
 
 def test_shell_banner_env_suppresses_compact_help_ascii(monkeypatch, capsys):

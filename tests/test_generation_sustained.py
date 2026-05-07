@@ -10,6 +10,7 @@ from mtplx.generation import (
     _make_target_prefill_cache,
     _maybe_repage_target_prefill_cache,
     _prefill,
+    _prefill_committed_mtp_history_streaming,
     generate_ar,
 )
 from mtplx.mtp_patch import MTPContract
@@ -28,6 +29,20 @@ class TinyModel:
 
     def make_cache(self):
         return []
+
+    def make_mtp_cache(self):
+        return []
+
+    def mtp_update_cache(
+        self,
+        hidden_states,
+        next_token_ids,
+        *,
+        mtp_cache=None,
+        concat_order=None,
+        position_offset=None,
+    ):
+        return hidden_states
 
     def __call__(
         self,
@@ -193,6 +208,56 @@ def test_sustained_prefill_chunks_without_full_prompt_logits(monkeypatch):
     assert rt.diagnostic_counters["final_logits_tokens_emitted"] == 1
 
 
+def test_sustained_prefill_chunk_cache_cleanup_is_explicit(monkeypatch):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP", "1")
+    calls: list[str] = []
+    monkeypatch.setattr("mtplx.generation.mx.synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr("mtplx.generation.mx.clear_cache", lambda: calls.append("clear"))
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=True)
+
+    _prefill(rt, [10, 11, 12, 13, 14], return_hidden=True)
+
+    assert calls == ["sync", "clear", "sync", "clear"]
+    assert rt.diagnostic_counters["prefill_chunk_cache_cleanup_events"] == 2
+
+
+def test_sustained_prefill_stock_cache_only_requires_unsafe_allow(monkeypatch):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
+    monkeypatch.setenv("MTPLX_PREFILL_STOCK_CACHE_ONLY", "1")
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=True)
+
+    _prefill(rt, [10, 11, 12, 13, 14], return_hidden=True)
+
+    assert [call["tokens"] for call in model.calls] == [2, 2, 1]
+    assert [call["return_hidden"] for call in model.calls] == [False, False, True]
+    assert [call["emit_logits"] for call in model.calls] == [False, False, True]
+    assert rt.diagnostic_counters.get("prefill_stock_cache_only_calls", 0) == 0
+
+
+def test_sustained_prefill_stock_cache_only_is_explicit_unsafe(monkeypatch):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
+    monkeypatch.setenv("MTPLX_PREFILL_STOCK_CACHE_ONLY", "1")
+    monkeypatch.setenv("MTPLX_ALLOW_UNSAFE_PREFILL_STOCK_CACHE_ONLY", "1")
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=True)
+
+    _prefill(rt, [10, 11, 12, 13, 14], return_hidden=True)
+
+    assert [call["tokens"] for call in model.calls] == [2, 2, 1]
+    assert [call["return_hidden"] for call in model.calls] == [False, False, True]
+    assert [call["emit_logits"] for call in model.calls] == [True, True, True]
+    assert rt.diagnostic_counters["prefill_stock_cache_only_calls"] == 2
+
+
 def test_sustained_prefill_forwards_logits_controls_through_patched_kwargs_wrapper(monkeypatch):
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
@@ -204,6 +269,47 @@ def test_sustained_prefill_forwards_logits_controls_through_patched_kwargs_wrapp
 
     assert [call["emit_logits"] for call in model.calls] == [False, False, True]
     assert rt.diagnostic_counters.get("full_logits_tokens_emitted", 0) == 0
+
+
+def test_last_window_mtp_history_skips_discarded_chunk_hidden(monkeypatch):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=True)
+    appended: list[tuple[list[int], int | None]] = []
+
+    def append_history(
+        _rt,
+        _mtp_cache,
+        hidden_states,
+        token_ids,
+        *,
+        mtp_hidden_variant,
+        position_offset=None,
+        force_eval=False,
+    ):
+        appended.append((list(token_ids), position_offset))
+        return 0.0
+
+    monkeypatch.setattr("mtplx.generation._append_mtp_history", append_history)
+
+    _prefill_committed_mtp_history_streaming(
+        rt,
+        list(range(9)),
+        mtp_hidden_variant="post_norm",
+        history_window_tokens=3,
+    )
+
+    assert [call["tokens"] for call in model.calls] == [2, 2, 2, 2, 1]
+    assert [call["return_hidden"] for call in model.calls] == [
+        False,
+        False,
+        True,
+        True,
+        True,
+    ]
+    assert appended == [([6], 5), ([7, 8], 6)]
 
 
 def test_32k_prefill_peak_memory_bounded():

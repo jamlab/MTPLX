@@ -63,8 +63,10 @@ def test_sustained_profile_is_native_mtp_long_context_path() -> None:
     assert profile.env_dict()["MTPLX_SUSTAINED_PREFILL_LAYOUT"] == "contiguous_then_repage"
     assert profile.env_dict()["MTPLX_LAZY_VERIFY_LOGITS"] == "1"
     assert profile.env_dict()["MTPLX_BATCH_TARGET_ARRAYS"] == "1"
+    assert profile.env_dict()["MTPLX_DEFER_VERIFY_HIDDEN_EVAL"] == "1"
     assert profile.env_dict()["MTPLX_LAZY_MTP_HISTORY_APPEND"] == "1"
     assert profile.env_dict()["MTPLX_DROP_EVENTS"] == "1"
     assert profile.env_dict()["MTPLX_SKIP_VERIFY_SNAPSHOT"] == "1"
+    assert profile.env_dict()["MTPLX_VLLM_METAL_PAGED_TURBOQUANT"] == "0"
     assert "MTPLX_TRUNK_CACHE_MATERIALIZE_EVERY" not in profile.env_dict()
     assert "MTPLX_EVAL_STATE_ROOTS_ON_COMMIT" not in profile.env_dict()
