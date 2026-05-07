@@ -2,8 +2,6 @@
 tool-only responses (the original v0.2.0 fix) and mixed text+tool responses
 (this fix - issue #20)."""
 
-import pytest
-
 from mtplx.server.openai import _ToolAwareContentStreamTranslator
 
 
@@ -79,9 +77,12 @@ def test_mixed_text_then_tool_call_streamed_in_pieces():
     # Preamble emits as content
     assert any(d.get("content") == "I will investigate. " for d in deltas_a)
     # Now the marker arrives
-    deltas_b = t.feed("content", "<tool_call>\n<function=lookup>\n"
-                                 "<parameter=q>\ny\n</parameter>\n"
-                                 "</function>\n</tool_call>")
+    t.feed(
+        "content",
+        "<tool_call>\n<function=lookup>\n"
+        "<parameter=q>\ny\n</parameter>\n"
+        "</function>\n</tool_call>",
+    )
     finish_deltas = t.finish()
     assert t.has_tool_calls is True
     assert any("tool_calls" in d for d in finish_deltas)
@@ -98,9 +99,12 @@ def test_partial_marker_held_across_chunks_in_content_mode():
     assert not any("<tool_ca" in c for c in contents_a)
 
     # Complete the marker
-    out_b = t.feed("content", "ll>\n<function=lookup>\n"
-                              "<parameter=q>\ny\n</parameter>\n"
-                              "</function>\n</tool_call>")
+    t.feed(
+        "content",
+        "ll>\n<function=lookup>\n"
+        "<parameter=q>\ny\n</parameter>\n"
+        "</function>\n</tool_call>",
+    )
     finish_deltas = t.finish()
     assert t.has_tool_calls is True
     assert any("tool_calls" in d for d in finish_deltas)
