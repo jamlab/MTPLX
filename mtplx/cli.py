@@ -2229,11 +2229,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Diagnostic override for MTPLX_MTP_HISTORY_POLICY after profile env is applied.",
     )
     bench_p.add_argument(
+        "--mtp-history-window",
+        type=int,
+        help="Diagnostic override for MTPLX_MTP_HISTORY_LAST_WINDOW after profile env is applied.",
+    )
+    bench_p.add_argument(
         "--prefill-cache-cleanup",
         action="store_true",
         help=(
             "Diagnostic OMLX-style prefill mode: synchronize and clear MLX's "
             "cache after each prefill chunk."
+        ),
+    )
+    bench_p.add_argument(
+        "--prefill-cache-cleanup-every",
+        help=(
+            "Diagnostic override for MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY "
+            "after profile env is applied."
         ),
     )
     bench_p.add_argument(
@@ -2272,6 +2284,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     bench_p.add_argument(
+        "--no-batch-target-arrays",
+        action="store_true",
+        help="Diagnostic override: set MTPLX_BATCH_TARGET_ARRAYS=0 after profile env is applied.",
+    )
+    bench_p.add_argument(
         "--prefill-stock-cache-only",
         action="store_true",
         help=(
@@ -2288,6 +2305,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable Qwen thinking in bench prefill-ladder chat formatting.",
     )
     bench_p.add_argument("--speculative-depth", type=int, default=0)
+    bench_p.add_argument(
+        "--vary-seed-by-context",
+        action="store_true",
+        help=(
+            "Diagnostic only: add the context row index to --seed. By default "
+            "the ladder uses one seed so rows compare context length rather "
+            "than different sampling trajectories."
+        ),
+    )
     bench_p.add_argument("--adaptive", action="store_true")
     bench_p.set_defaults(func=_cmd_bench)
 

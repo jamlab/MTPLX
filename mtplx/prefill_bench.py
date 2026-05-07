@@ -312,11 +312,44 @@ def _apply_mtp_history_policy_override(args: Any) -> str:
     return policy
 
 
+def _apply_mtp_history_window_override(args: Any) -> int | None:
+    raw = getattr(args, "mtp_history_window", None)
+    if raw is None:
+        return None
+    window = int(raw)
+    if window <= 0:
+        raise ValueError("--mtp-history-window must be positive")
+    os.environ["MTPLX_MTP_HISTORY_LAST_WINDOW"] = str(window)
+    return window
+
+
 def _apply_prefill_cache_cleanup_override(args: Any) -> bool:
     enabled = bool(getattr(args, "prefill_cache_cleanup", False))
     if enabled:
         os.environ["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP"] = "1"
     return enabled
+
+
+def _apply_prefill_cache_cleanup_every_override(args: Any) -> int | None:
+    raw = getattr(args, "prefill_cache_cleanup_every", None)
+    if raw is None:
+        return None
+    raw_text = str(raw).strip().lower()
+    if raw_text == "auto":
+        os.environ["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY"] = "auto"
+        return None
+    every = int(raw_text)
+    if every <= 0:
+        raise ValueError("--prefill-cache-cleanup-every must be positive")
+    os.environ["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY"] = str(every)
+    return every
+
+
+def _apply_batch_target_arrays_override(args: Any) -> str | None:
+    if not bool(getattr(args, "no_batch_target_arrays", False)):
+        return None
+    os.environ["MTPLX_BATCH_TARGET_ARRAYS"] = "0"
+    return "0"
 
 
 def _apply_prefill_chunk_size_override(args: Any) -> int | None:
@@ -501,6 +534,8 @@ def _env_snapshot() -> dict[str, str]:
         "MTPLX_PREFILL_CHUNK_SIZE_DENSE",
         "MTPLX_PREFILL_CHUNK_SIZE_REPAGE",
         "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP",
+        "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY",
+        "MTPLX_PREFILL_OMLX_EXTERNAL",
         "MTPLX_PREFILL_STOCK_CACHE_ONLY",
         UNSAFE_STOCK_CACHE_ONLY_ALLOW_ENV,
         "MTPLX_SUSTAINED_PREFILL",
@@ -508,6 +543,10 @@ def _env_snapshot() -> dict[str, str]:
         "MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT",
         "MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS",
         "MTPLX_DEFER_VERIFY_HIDDEN_EVAL",
+        "MTPLX_VERIFY_HIDDEN_MODE",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH",
         "MTPLX_VLLM_METAL_PAGED_ATTN",
         "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL",
         "MTPLX_VLLM_METAL_PAGED_ATTN_MAX_Q",
@@ -589,6 +628,13 @@ def _row_from_output(
         ),
         "decode_tok_s": generated / decode_elapsed if decode_elapsed > 0 else 0.0,
         "generated_tokens": generated,
+        "speculative_depth": int(_stats_value(stats, "speculative_depth", 0) or 0),
+        "requested_speculative_depth": int(
+            _stats_value(stats, "requested_speculative_depth", 0) or 0
+        ),
+        "long_context_mtp_depth_policy": dict(
+            _stats_value(stats, "long_context_mtp_depth_policy", {}) or {}
+        ),
         "accepted_drafts": int(_stats_value(stats, "accepted_drafts", 0) or 0),
         "drafted_tokens": int(_stats_value(stats, "drafted_tokens", 0) or 0),
         "draft_acceptance_rate": (
@@ -643,6 +689,9 @@ def _row_from_output(
         "prefill_chunk_cache_cleanup_enabled": bool(
             _stats_value(stats, "prefill_chunk_cache_cleanup_enabled", False)
         ),
+        "prefill_chunk_cache_cleanup_every": int(
+            _stats_value(stats, "prefill_chunk_cache_cleanup_every", 1) or 1
+        ),
         "prefill_chunk_cache_cleanup_events": int(
             _stats_value(stats, "prefill_chunk_cache_cleanup_events", 0) or 0
         ),
@@ -651,6 +700,15 @@ def _row_from_output(
         ),
         "prefill_stock_cache_only_calls": int(
             _stats_value(stats, "prefill_stock_cache_only_calls", 0) or 0
+        ),
+        "prefill_omlx_external_enabled": bool(
+            _stats_value(stats, "prefill_omlx_external_enabled", False)
+        ),
+        "prefill_omlx_external_calls": int(
+            _stats_value(stats, "prefill_omlx_external_calls", 0) or 0
+        ),
+        "prefill_external_cache_only_calls": int(
+            _stats_value(stats, "prefill_external_cache_only_calls", 0) or 0
         ),
         "mtp_history_policy": str(_stats_value(stats, "mtp_history_policy", "") or ""),
         "mtp_history_window_tokens": int(
@@ -746,7 +804,11 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
         profile_env["MTPLX_SUSTAINED_PREFILL_LAYOUT"] = prefill_layout_env_value
     paged_attn_impl_requested = str(getattr(args, "paged_attn_impl", "") or "").strip().lower().replace("-", "_")
     mtp_history_policy_requested = str(getattr(args, "mtp_history_policy", "") or "").strip().lower().replace("-", "_")
+    mtp_history_window_requested = getattr(args, "mtp_history_window", None)
     prefill_cache_cleanup_requested = bool(getattr(args, "prefill_cache_cleanup", False))
+    prefill_cache_cleanup_every_requested = getattr(
+        args, "prefill_cache_cleanup_every", None
+    )
     prefill_chunk_size_requested = getattr(args, "prefill_chunk_size", None)
     defer_verify_hidden_requested = bool(
         getattr(args, "defer_verify_hidden_eval", False)
@@ -765,6 +827,9 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
         .lower()
         .replace("-", "_")
     )
+    no_batch_target_arrays_requested = bool(
+        getattr(args, "no_batch_target_arrays", False)
+    )
     prefill_stock_cache_only_requested = bool(
         getattr(args, "prefill_stock_cache_only", False)
     )
@@ -772,8 +837,24 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
         profile_env["MTPLX_VLLM_METAL_PAGED_ATTN_IMPL"] = paged_attn_impl_requested
     if mtp_history_policy_requested:
         profile_env["MTPLX_MTP_HISTORY_POLICY"] = mtp_history_policy_requested
+    if mtp_history_window_requested is not None:
+        mtp_history_window_value = int(mtp_history_window_requested)
+        if mtp_history_window_value <= 0:
+            raise ValueError("--mtp-history-window must be positive")
+        profile_env["MTPLX_MTP_HISTORY_LAST_WINDOW"] = str(mtp_history_window_value)
     if prefill_cache_cleanup_requested:
         profile_env["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP"] = "1"
+    if prefill_cache_cleanup_every_requested is not None:
+        cleanup_every_text = str(prefill_cache_cleanup_every_requested).strip().lower()
+        if cleanup_every_text == "auto":
+            profile_env["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY"] = "auto"
+        else:
+            prefill_cache_cleanup_every_value = int(cleanup_every_text)
+            if prefill_cache_cleanup_every_value <= 0:
+                raise ValueError("--prefill-cache-cleanup-every must be positive")
+            profile_env["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY"] = str(
+                prefill_cache_cleanup_every_value
+            )
     if prefill_chunk_size_requested is not None:
         prefill_chunk_size_value = int(prefill_chunk_size_requested)
         if prefill_chunk_size_value <= 0:
@@ -785,6 +866,8 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
         profile_env["MTPLX_DEFER_VERIFY_HIDDEN_EVAL"] = "0"
     if verify_hidden_mode_requested:
         profile_env["MTPLX_VERIFY_HIDDEN_MODE"] = verify_hidden_mode_requested
+    if no_batch_target_arrays_requested:
+        profile_env["MTPLX_BATCH_TARGET_ARRAYS"] = "0"
     if prefill_stock_cache_only_requested and _unsafe_stock_cache_only_allowed():
         profile_env["MTPLX_PREFILL_STOCK_CACHE_ONLY"] = "1"
     payload: dict[str, Any] = {
@@ -794,6 +877,8 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
         "profile": profile.to_dict(),
         "generation_mode": getattr(args, "generation_mode", None) or "mtp",
         "max_tokens": int(getattr(args, "max_tokens", 128)),
+        "seed": int(getattr(args, "seed", None) or 0),
+        "vary_seed_by_context": bool(getattr(args, "vary_seed_by_context", False)),
         "contexts": contexts,
         "hardware": inspect_hardware(),
         "env": profile_env,
@@ -839,8 +924,14 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
         payload["paged_attn_impl_override"] = paged_attn_impl_requested
     if mtp_history_policy_requested:
         payload["mtp_history_policy_override"] = mtp_history_policy_requested
+    if mtp_history_window_requested is not None:
+        payload["mtp_history_window_override"] = int(mtp_history_window_requested)
     if prefill_cache_cleanup_requested:
         payload["prefill_cache_cleanup_override"] = True
+    if prefill_cache_cleanup_every_requested is not None:
+        payload["prefill_cache_cleanup_every_override"] = (
+            str(prefill_cache_cleanup_every_requested).strip().lower()
+        )
     if prefill_chunk_size_requested is not None:
         payload["prefill_chunk_size_override"] = int(prefill_chunk_size_requested)
     if defer_verify_hidden_requested:
@@ -849,6 +940,8 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
         payload["defer_verify_hidden_eval_override"] = False
     if verify_hidden_mode_requested:
         payload["verify_hidden_mode_override"] = verify_hidden_mode_requested
+    if no_batch_target_arrays_requested:
+        payload["batch_target_arrays_override"] = False
     if prefill_stock_cache_only_requested:
         payload["prefill_stock_cache_only_override"] = True
         if not _unsafe_stock_cache_only_allowed():
@@ -862,24 +955,33 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
     _apply_prefill_layout_override(prefill_layout)
     paged_attn_impl = _apply_paged_attention_impl_override(args)
     mtp_history_policy = _apply_mtp_history_policy_override(args)
+    mtp_history_window = _apply_mtp_history_window_override(args)
     prefill_cache_cleanup = _apply_prefill_cache_cleanup_override(args)
+    prefill_cache_cleanup_every = _apply_prefill_cache_cleanup_every_override(args)
     prefill_chunk_size = _apply_prefill_chunk_size_override(args)
     defer_verify_hidden = _apply_defer_verify_hidden_override(args)
     verify_hidden_mode = _apply_verify_hidden_mode_override(args)
+    batch_target_arrays = _apply_batch_target_arrays_override(args)
     prefill_stock_cache_only = _apply_prefill_stock_cache_only_override(args)
     payload["env"] = _env_snapshot()
     if paged_attn_impl and paged_attn_impl != paged_attn_impl_requested:
         payload["paged_attn_impl_override"] = paged_attn_impl
     if mtp_history_policy and mtp_history_policy != mtp_history_policy_requested:
         payload["mtp_history_policy_override"] = mtp_history_policy
+    if mtp_history_window is not None:
+        payload["mtp_history_window_override"] = mtp_history_window
     if prefill_cache_cleanup and not prefill_cache_cleanup_requested:
         payload["prefill_cache_cleanup_override"] = True
+    if prefill_cache_cleanup_every is not None:
+        payload["prefill_cache_cleanup_every_override"] = prefill_cache_cleanup_every
     if prefill_chunk_size is not None:
         payload["prefill_chunk_size_override"] = prefill_chunk_size
     if defer_verify_hidden is not None:
         payload["defer_verify_hidden_eval_override"] = defer_verify_hidden == "1"
     if verify_hidden_mode and verify_hidden_mode != verify_hidden_mode_requested:
         payload["verify_hidden_mode_override"] = verify_hidden_mode
+    if batch_target_arrays is not None:
+        payload["batch_target_arrays_override"] = batch_target_arrays == "1"
     if prefill_stock_cache_only and not prefill_stock_cache_only_requested:
         payload["prefill_stock_cache_only_override"] = True
 
@@ -909,6 +1011,8 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
         )
         generation_mode = getattr(args, "generation_mode", None) or "mtp"
         depth = int(getattr(args, "speculative_depth", 0) or 3)
+        seed_base = int(getattr(args, "seed", None) or 0)
+        vary_seed_by_context = bool(getattr(args, "vary_seed_by_context", False))
         for index, context_tokens in enumerate(contexts):
             try:
                 import mlx.core as mx
@@ -933,13 +1037,14 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
                     first_token_s = time.perf_counter()
 
             request_started_s = time.perf_counter()
+            row_seed = seed_base + index if vary_seed_by_context else seed_base
             if generation_mode == "ar":
                 out = generate_ar(
                     rt,
                     prompt_ids,
                     max_tokens=int(getattr(args, "max_tokens", 128)),
                     sampler=sampler,
-                    seed=int(getattr(args, "seed", None) or 0) + index,
+                    seed=row_seed,
                     stop_token_ids=set(),
                     token_callback=record_first,
                 )
@@ -951,7 +1056,7 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
                     sampler=sampler,
                     draft_sampler=draft_sampler,
                     speculative_depth=depth,
-                    seed=int(getattr(args, "seed", None) or 0) + index,
+                    seed=row_seed,
                     mtp_hidden_variant="post_norm",
                     mtp_cache_policy="persistent",
                     mtp_history_policy="committed",
@@ -968,6 +1073,7 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
             )
             row.update(prompt.metadata)
             row["requested_prefill_layout"] = prefill_layout
+            row["seed"] = row_seed
             payload["rows"].append(row)
     finally:
         if max_session is not None:

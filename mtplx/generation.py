@@ -37,6 +37,7 @@ from .fast_sampling import (
 from .gdn_capture import resolve_gdn_capture_backend
 from .graphbank import SpecDecodeGraphBank, cache_array_tree, promote_kv_cache_offsets
 from .native_mlp import set_native_mlp_context
+from .profiles import resolve_long_context_mtp_depth
 from .runtime import MTPLXRuntime
 from .sampling import (
     SamplerConfig,
@@ -220,12 +221,20 @@ def _attach_runtime_diagnostics(
     stats.prefill_chunks = int(counters.get("prefill_chunks", 0))
     stats.prefill_chunk_size = _prefill_chunk_size()
     stats.prefill_chunk_cache_cleanup_enabled = _prefill_chunk_cache_cleanup_enabled()
+    stats.prefill_chunk_cache_cleanup_every = _prefill_chunk_cache_cleanup_every()
     stats.prefill_chunk_cache_cleanup_events = int(
         counters.get("prefill_chunk_cache_cleanup_events", 0)
     )
     stats.prefill_stock_cache_only_enabled = _prefill_stock_cache_only_enabled()
     stats.prefill_stock_cache_only_calls = int(
         counters.get("prefill_stock_cache_only_calls", 0)
+    )
+    stats.prefill_omlx_external_enabled = _prefill_omlx_external_enabled()
+    stats.prefill_omlx_external_calls = int(
+        counters.get("prefill_omlx_external_calls", 0)
+    )
+    stats.prefill_external_cache_only_calls = int(
+        counters.get("prefill_external_cache_only_calls", 0)
     )
     owned_attn = stats.owned_attn_kv if isinstance(stats.owned_attn_kv, dict) else {}
     stats.paged_kv_capacity_tokens = int(owned_attn.get("capacity") or 0)
@@ -302,9 +311,30 @@ def _prefill_chunk_cache_cleanup_enabled() -> bool:
     return _env_truthy("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP")
 
 
+def _prefill_chunk_cache_cleanup_every() -> int:
+    raw = os.environ.get("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY")
+    if raw is None or not str(raw).strip():
+        return 1
+    raw_text = str(raw).strip().lower()
+    if raw_text == "auto":
+        return 2 if _sustained_prefill_layout() == "contiguous_then_repage" else 1
+    try:
+        return max(1, int(raw_text))
+    except ValueError:
+        return 1
+
+
 def _prefill_chunk_cache_cleanup(rt: MTPLXRuntime) -> float:
     if not _prefill_chunk_cache_cleanup_enabled():
         return 0.0
+    every = _prefill_chunk_cache_cleanup_every()
+    pending = int(
+        rt.diagnostic_counters.get("_prefill_chunks_since_cache_cleanup", 0)
+    ) + 1
+    rt.diagnostic_counters["_prefill_chunks_since_cache_cleanup"] = pending
+    if pending < every:
+        return 0.0
+    rt.diagnostic_counters["_prefill_chunks_since_cache_cleanup"] = 0
     started = time.perf_counter()
     try:
         mx.synchronize()
@@ -321,8 +351,16 @@ def _prefill_stock_cache_only_enabled() -> bool:
     )
 
 
+def _prefill_omlx_external_enabled() -> bool:
+    return _env_truthy("MTPLX_PREFILL_OMLX_EXTERNAL")
+
+
+def _prefill_external_cache_only_enabled() -> bool:
+    return _prefill_omlx_external_enabled() or _prefill_stock_cache_only_enabled()
+
+
 def _prefill_cache_only_forward(rt: MTPLXRuntime, token_ids: list[int], cache: Any) -> Any:
-    if not _prefill_stock_cache_only_enabled():
+    if not _prefill_external_cache_only_enabled():
         return rt.forward_ar(
             mx.array([token_ids]),
             cache=cache,
@@ -331,7 +369,11 @@ def _prefill_cache_only_forward(rt: MTPLXRuntime, token_ids: list[int], cache: A
         )
     unused_logits = rt.model(mx.array([token_ids]), cache=cache)
     del unused_logits
-    _runtime_count(rt, "prefill_stock_cache_only_calls")
+    _runtime_count(rt, "prefill_external_cache_only_calls")
+    if _prefill_stock_cache_only_enabled():
+        _runtime_count(rt, "prefill_stock_cache_only_calls")
+    if _prefill_omlx_external_enabled():
+        _runtime_count(rt, "prefill_omlx_external_calls")
     return None
 
 
@@ -996,9 +1038,13 @@ class GenerationStats:
     prefill_chunk_size: int = 0
     prefill_chunks: int = 0
     prefill_chunk_cache_cleanup_enabled: bool = False
+    prefill_chunk_cache_cleanup_every: int = 1
     prefill_chunk_cache_cleanup_events: int = 0
     prefill_stock_cache_only_enabled: bool = False
     prefill_stock_cache_only_calls: int = 0
+    prefill_omlx_external_enabled: bool = False
+    prefill_omlx_external_calls: int = 0
+    prefill_external_cache_only_calls: int = 0
     paged_kv_capacity_tokens: int = 0
     paged_kv_num_blocks: int = 0
     paged_active_array_calls: int = 0
@@ -1102,6 +1148,8 @@ class GenerationStats:
     online_hidden_corrector_time_s: float = 0.0
     peak_memory_bytes: int = 0
     speculative_depth: int = 0
+    requested_speculative_depth: int = 0
+    long_context_mtp_depth_policy: dict[str, object] = field(default_factory=dict)
     accepted_by_depth: list[int] = field(default_factory=list)
     drafted_by_depth: list[int] = field(default_factory=list)
     accept_probability_sum_by_depth: list[float] = field(default_factory=list)
@@ -2772,10 +2820,18 @@ def generate_mtpk(
     """
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtpk requires an MTP-enabled runtime")
-    if speculative_depth < 1:
+    requested_speculative_depth = int(speculative_depth)
+    if requested_speculative_depth < 1:
         raise ValueError("speculative_depth must be >= 1")
     if min_speculative_depth < 0:
         raise ValueError("min_speculative_depth must be >= 0")
+    if min_speculative_depth > requested_speculative_depth:
+        raise ValueError("min_speculative_depth cannot exceed speculative_depth")
+    speculative_depth, long_context_depth_policy = resolve_long_context_mtp_depth(
+        prompt_tokens=len(prompt_ids),
+        requested_depth=requested_speculative_depth,
+        min_depth=min_speculative_depth,
+    )
     if min_speculative_depth > speculative_depth:
         raise ValueError("min_speculative_depth cannot exceed speculative_depth")
     if mtp_cache_policy not in {"persistent", "fresh"}:
@@ -3514,7 +3570,7 @@ def generate_mtpk(
             "primary": primary,
             "primary_already_emitted": primary_already_emitted,
             "depth": planned_depth,
-            "requested_depth": speculative_depth,
+            "requested_depth": requested_speculative_depth,
             "drafts": [],
             "accepted_depths": 0,
             "rejected_at_depth": None,
@@ -3530,6 +3586,8 @@ def generate_mtpk(
                 "before": int(late_depth_before),
                 "after": int(late_depth_after),
             }
+        if long_context_depth_policy.get("active"):
+            event["long_context_mtp_depth_policy"] = long_context_depth_policy
         if mtp_position_mode not in {"", "0", "off", "false", "default", "cache"}:
             event["mtp_position"] = {
                 "mode": mtp_position_mode,
@@ -4548,6 +4606,8 @@ def generate_mtpk(
         online_hidden_corrector_time_s=online_hidden_corrector_time,
         peak_memory_bytes=mx.get_peak_memory(),
         speculative_depth=speculative_depth,
+        requested_speculative_depth=requested_speculative_depth,
+        long_context_mtp_depth_policy=long_context_depth_policy,
         accepted_by_depth=accepted_by_depth,
         drafted_by_depth=drafted_by_depth,
         accept_probability_sum_by_depth=accept_probability_sum_by_depth,

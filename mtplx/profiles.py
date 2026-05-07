@@ -66,8 +66,15 @@ SUSTAINED_PREFILL_ENV = {
     "MTPLX_PREFILL_CHUNK_SIZE": "auto",
     "MTPLX_PREFILL_CHUNK_SIZE_DENSE": "4096",
     "MTPLX_PREFILL_CHUNK_SIZE_REPAGE": "2048",
+    "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP": "1",
+    "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY": "auto",
+    "MTPLX_PREFILL_OMLX_EXTERNAL": "1",
     "MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS": "0",
-    "MTPLX_DEFER_VERIFY_HIDDEN_EVAL": "auto",
+    "MTPLX_DEFER_VERIFY_HIDDEN_EVAL": "1",
+    "MTPLX_VERIFY_HIDDEN_MODE": "logits_first_committed_slice",
+    "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY": "auto",
+    "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD": "98304",
+    "MTPLX_LONG_CONTEXT_MTP_DEPTH": "2",
     "MTPLX_MTP_HISTORY_POLICY": "auto",
     "MTPLX_MTP_HISTORY_LAST_WINDOW": "8192",
     "MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD": "16384",
@@ -81,6 +88,81 @@ SUSTAINED_PREFILL_ENV = {
     "MTPLX_VLLM_METAL_PAGED_TURBOQUANT": "0",
     "MTPLX_CLEAR_CACHE_EVERY": "0",
 }
+
+
+def _env_int(
+    env: Mapping[str, str] | MutableMapping[str, str] | None,
+    key: str,
+    *,
+    default: int,
+) -> int:
+    source = os.environ if env is None else env
+    try:
+        return int(str(source.get(key, "") or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def resolve_long_context_mtp_depth(
+    *,
+    prompt_tokens: int,
+    requested_depth: int,
+    min_depth: int = 1,
+    env: Mapping[str, str] | MutableMapping[str, str] | None = None,
+) -> tuple[int, dict[str, object]]:
+    """Resolve Sustained's context-aware MTP depth cap.
+
+    Depth 3 is still the default because it wins at short and mid context. On the
+    M5 Max 128k path, depth 2 recovered decode while preserving exact speculative
+    sampling. This helper keeps that product policy explicit and observable.
+    """
+
+    source = os.environ if env is None else env
+    requested = max(1, int(requested_depth))
+    floor = max(1, int(min_depth))
+    policy = (
+        str(source.get("MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY", "") or "off")
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    threshold = max(
+        0,
+        _env_int(source, "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD", default=98_304),
+    )
+    cap_depth = max(
+        1,
+        _env_int(source, "MTPLX_LONG_CONTEXT_MTP_DEPTH", default=2),
+    )
+    details: dict[str, object] = {
+        "policy": policy,
+        "prompt_tokens": int(prompt_tokens),
+        "threshold": int(threshold),
+        "cap_depth": int(cap_depth),
+        "requested_depth": int(requested),
+        "min_depth": int(floor),
+        "active": False,
+        "reason": "disabled",
+    }
+    if policy in {"", "0", "off", "false", "none"}:
+        details["effective_depth"] = int(requested)
+        return requested, details
+    if policy != "auto":
+        details["reason"] = "unknown_policy"
+        details["effective_depth"] = int(requested)
+        return requested, details
+    if int(prompt_tokens) < threshold:
+        details["reason"] = "below_threshold"
+        details["effective_depth"] = int(requested)
+        return requested, details
+    effective = min(requested, max(cap_depth, floor))
+    details["effective_depth"] = int(effective)
+    if effective < requested:
+        details["active"] = True
+        details["reason"] = "long_context_depth_cap"
+    else:
+        details["reason"] = "already_within_cap"
+    return effective, details
 
 
 @dataclass(frozen=True)

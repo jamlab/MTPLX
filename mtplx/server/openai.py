@@ -1817,6 +1817,9 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "server_blank_retry_suppressed",
     "mtp_depth",
     "speculative_depth",
+    "requested_mtp_depth",
+    "requested_speculative_depth",
+    "long_context_mtp_depth_policy",
     "peak_memory_bytes",
     "reasoning_reentries",
     "reasoning_tokens",
@@ -2672,6 +2675,16 @@ def _run_generation(
             stats["sessionbank_skipped_oversized_snapshot"] = bool(
                 getattr(session_bank, "last_put_skipped_oversized_snapshot", False)
             )
+        actual_mtp_depth = int(
+            stats.get("speculative_depth")
+            or (effective_depth if effective_mode == "mtp" else 0)
+            or 0
+        )
+        requested_mtp_depth = int(
+            stats.get("requested_speculative_depth")
+            or (effective_depth if effective_mode == "mtp" else 0)
+            or 0
+        )
         envelope = _metrics_envelope(
             stats=stats,
             prompt_tokens=len(prompt_ids),
@@ -2684,12 +2697,22 @@ def _run_generation(
             session_cache_hit=session_cache_hit,
             cache_miss_reason=cache_miss_reason,
             session_restore_mode=session_restore_mode,
-            mtp_depth=effective_depth if effective_mode == "mtp" else 0,
+            mtp_depth=actual_mtp_depth if effective_mode == "mtp" else 0,
             generation_limits=generation_limits,
         )
         envelope["generation_mode"] = effective_mode
+        envelope["requested_mtp_depth"] = (
+            requested_mtp_depth if effective_mode == "mtp" else 0
+        )
+        envelope["long_context_mtp_depth_policy"] = (
+            (stats.get("long_context_mtp_depth_policy") or {})
+            if effective_mode == "mtp"
+            else {}
+        )
         if effective_mode == "ar":
             envelope["mtp_depth"] = 0
+            envelope["requested_mtp_depth"] = 0
+            envelope["long_context_mtp_depth_policy"] = {}
             envelope["verify_calls"] = 0
             envelope["verify_time_s"] = 0.0
             envelope["accepted_by_depth"] = []
@@ -4606,6 +4629,13 @@ def create_app(state: ServerState) -> FastAPI:
             ),
             "late_depth_before": os.environ.get("MTPLX_LATE_DEPTH_BEFORE"),
             "late_depth_after": os.environ.get("MTPLX_LATE_DEPTH_AFTER"),
+            "long_context_mtp_depth_policy": os.environ.get(
+                "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY"
+            ),
+            "long_context_mtp_depth_threshold": os.environ.get(
+                "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"
+            ),
+            "long_context_mtp_depth": os.environ.get("MTPLX_LONG_CONTEXT_MTP_DEPTH"),
             "mtp_position_mode": os.environ.get("MTPLX_MTP_POSITION_MODE"),
             "mtp_position_cap": os.environ.get("MTPLX_MTP_POSITION_CAP"),
             "mtp_position_period": os.environ.get("MTPLX_MTP_POSITION_PERIOD"),

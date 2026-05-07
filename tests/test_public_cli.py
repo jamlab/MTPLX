@@ -105,6 +105,8 @@ def test_bench_prefill_ladder_dry_run_json(monkeypatch, capsys):
     assert code == 0
     assert payload["kind"] == "prefill_ladder"
     assert payload["dry_run"] is True
+    assert payload["seed"] == 0
+    assert payload["vary_seed_by_context"] is False
     assert payload["contexts"] == [512, 1024]
     assert payload["rows"] == []
     assert payload["prompt"]["style"] == "coding-agent"
@@ -124,7 +126,14 @@ def test_bench_prefill_ladder_dry_run_json(monkeypatch, capsys):
     assert "--disable-thinking" in payload["recommended_plugged_in_commands"][0]
     assert payload["profile"]["env"]["MTPLX_LAZY_VERIFY_LOGITS"] == "1"
     assert payload["profile"]["env"]["MTPLX_BATCH_TARGET_ARRAYS"] == "1"
-    assert payload["profile"]["env"]["MTPLX_DEFER_VERIFY_HIDDEN_EVAL"] == "auto"
+    assert payload["profile"]["env"]["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP"] == "1"
+    assert payload["profile"]["env"]["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY"] == "auto"
+    assert payload["profile"]["env"]["MTPLX_PREFILL_OMLX_EXTERNAL"] == "1"
+    assert payload["profile"]["env"]["MTPLX_DEFER_VERIFY_HIDDEN_EVAL"] == "1"
+    assert payload["profile"]["env"]["MTPLX_VERIFY_HIDDEN_MODE"] == "logits_first_committed_slice"
+    assert payload["profile"]["env"]["MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY"] == "auto"
+    assert payload["profile"]["env"]["MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"] == "98304"
+    assert payload["profile"]["env"]["MTPLX_LONG_CONTEXT_MTP_DEPTH"] == "2"
     assert payload["profile"]["env"]["MTPLX_VLLM_METAL_PAGED_TURBOQUANT"] == "0"
 
 

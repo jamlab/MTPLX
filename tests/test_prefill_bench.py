@@ -96,6 +96,13 @@ def test_run_prefill_ladder_fake_runtime_records_release_valid_prompt(
                 "prompt_tps": 512.0,
                 "accepted_drafts": 3,
                 "drafted_tokens": 4,
+                "speculative_depth": 2,
+                "requested_speculative_depth": 3,
+                "long_context_mtp_depth_policy": {
+                    "policy": "auto",
+                    "active": True,
+                    "reason": "long_context_depth_cap",
+                },
                 "verify_calls": 1,
                 "verify_time_s": 0.01,
                 "draft_time_s": 0.02,
@@ -143,6 +150,8 @@ def test_run_prefill_ladder_fake_runtime_records_release_valid_prompt(
     assert captured["prefill_layout_env"] == "contiguous_dense_decode"
     assert payload["prefill_layout"]["requested"] == "contiguous-dense-decode"
     assert payload["prefill_layout"]["env_value"] == "contiguous_dense_decode"
+    assert payload["seed"] == 0
+    assert payload["vary_seed_by_context"] is False
     assert payload["prompt"]["release_valid"] is True
     assert payload["prompt"]["format"] == "chat"
     assert payload["prompt"]["enable_thinking"] is False
@@ -156,3 +165,7 @@ def test_run_prefill_ladder_fake_runtime_records_release_valid_prompt(
     assert row["prompt_tail_preserved"] is True
     assert row["prompt_tail_sha256"] == payload["prompt"]["tail_sha256"]
     assert row["generated_tokens"] == 2
+    assert row["seed"] == 0
+    assert row["speculative_depth"] == 2
+    assert row["requested_speculative_depth"] == 3
+    assert row["long_context_mtp_depth_policy"]["reason"] == "long_context_depth_cap"

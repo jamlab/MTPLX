@@ -11,6 +11,7 @@ from mtplx.generation import (
     _make_target_prefill_cache,
     _maybe_repage_target_prefill_cache,
     _prefill,
+    _prefill_chunk_cache_cleanup_every,
     _prefill_chunk_size,
     _prefill_committed_mtp_history_streaming,
     _sustained_prefill_layout,
@@ -178,16 +179,19 @@ def test_auto_sustained_prefill_policy_caps_dense_decode_to_64k(monkeypatch):
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "auto")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "4096")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE_REPAGE", "2048")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY", "auto")
     monkeypatch.setenv("MTPLX_DEFER_VERIFY_HIDDEN_EVAL", "auto")
 
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "65536")
     assert _sustained_prefill_layout() == "contiguous_dense_decode"
     assert _prefill_chunk_size() == 4096
+    assert _prefill_chunk_cache_cleanup_every() == 1
     assert _defer_verify_hidden_eval_enabled() is True
 
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "131072")
     assert _sustained_prefill_layout() == "contiguous_then_repage"
     assert _prefill_chunk_size() == 2048
+    assert _prefill_chunk_cache_cleanup_every() == 2
     assert _defer_verify_hidden_eval_enabled() is False
 
 
@@ -277,7 +281,26 @@ def test_sustained_prefill_stock_cache_only_is_explicit_unsafe(monkeypatch):
     assert [call["tokens"] for call in model.calls] == [2, 2, 1]
     assert [call["return_hidden"] for call in model.calls] == [False, False, True]
     assert [call["emit_logits"] for call in model.calls] == [True, True, True]
+    assert rt.diagnostic_counters["prefill_external_cache_only_calls"] == 2
     assert rt.diagnostic_counters["prefill_stock_cache_only_calls"] == 2
+
+
+def test_sustained_prefill_omlx_external_is_safe_profile_path(monkeypatch):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
+    monkeypatch.setenv("MTPLX_PREFILL_OMLX_EXTERNAL", "1")
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=True)
+
+    _prefill(rt, [10, 11, 12, 13, 14], return_hidden=True)
+
+    assert [call["tokens"] for call in model.calls] == [2, 2, 1]
+    assert [call["return_hidden"] for call in model.calls] == [False, False, True]
+    assert [call["emit_logits"] for call in model.calls] == [True, True, True]
+    assert rt.diagnostic_counters["prefill_external_cache_only_calls"] == 2
+    assert rt.diagnostic_counters["prefill_omlx_external_calls"] == 2
+    assert rt.diagnostic_counters.get("prefill_stock_cache_only_calls", 0) == 0
 
 
 def test_sustained_prefill_forwards_logits_controls_through_patched_kwargs_wrapper(monkeypatch):

@@ -3627,7 +3627,22 @@ def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str
             "context_cap_applied": budget["context_cap_applied"],
             "reasoning": reasoning_mode,
             "generation_mode": generation_mode,
-            "mtp_depth": 0 if generation_mode == GENERATION_MODE_AR else int(args.depth),
+            "mtp_depth": (
+                0
+                if generation_mode == GENERATION_MODE_AR
+                else int(getattr(out.stats, "speculative_depth", args.depth) or args.depth)
+            ),
+            "requested_mtp_depth": 0
+            if generation_mode == GENERATION_MODE_AR
+            else int(
+                getattr(out.stats, "requested_speculative_depth", args.depth)
+                or args.depth
+            ),
+            "long_context_mtp_depth_policy": (
+                {}
+                if generation_mode == GENERATION_MODE_AR
+                else dict(getattr(out.stats, "long_context_mtp_depth_policy", {}) or {})
+            ),
             "tok_s": out.stats.tok_s,
             "verify_ms_per_call": (
                 None
@@ -4319,7 +4334,31 @@ def _quickstart_generate(
         "context_cap_applied": budget["context_cap_applied"],
         "reasoning": reasoning_mode,
         "generation_mode": generation_mode,
-        "mtp_depth": 0 if generation_mode == GENERATION_MODE_AR else int(getattr(args, "depth", 3)),
+        "mtp_depth": (
+            0
+            if generation_mode == GENERATION_MODE_AR
+            else int(
+                getattr(out.stats, "speculative_depth", getattr(args, "depth", 3))
+                or getattr(args, "depth", 3)
+            )
+        ),
+        "requested_mtp_depth": (
+            0
+            if generation_mode == GENERATION_MODE_AR
+            else int(
+                getattr(
+                    out.stats,
+                    "requested_speculative_depth",
+                    getattr(args, "depth", 3),
+                )
+                or getattr(args, "depth", 3)
+            )
+        ),
+        "long_context_mtp_depth_policy": (
+            {}
+            if generation_mode == GENERATION_MODE_AR
+            else dict(getattr(out.stats, "long_context_mtp_depth_policy", {}) or {})
+        ),
         "tok_s": out.stats.tok_s,
         "end_to_end_tok_s": out.stats.tok_s,
         "elapsed_s": out.stats.elapsed_s,

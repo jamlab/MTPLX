@@ -9,6 +9,7 @@ from mtplx.profiles import (
     list_profiles,
     profile_env_status,
     restore_profile_env,
+    resolve_long_context_mtp_depth,
 )
 
 
@@ -65,12 +66,52 @@ def test_sustained_profile_is_native_mtp_long_context_path() -> None:
     assert profile.env_dict()["MTPLX_PREFILL_CHUNK_SIZE"] == "auto"
     assert profile.env_dict()["MTPLX_PREFILL_CHUNK_SIZE_DENSE"] == "4096"
     assert profile.env_dict()["MTPLX_PREFILL_CHUNK_SIZE_REPAGE"] == "2048"
+    assert profile.env_dict()["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP"] == "1"
+    assert profile.env_dict()["MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY"] == "auto"
+    assert profile.env_dict()["MTPLX_PREFILL_OMLX_EXTERNAL"] == "1"
     assert profile.env_dict()["MTPLX_LAZY_VERIFY_LOGITS"] == "1"
     assert profile.env_dict()["MTPLX_BATCH_TARGET_ARRAYS"] == "1"
-    assert profile.env_dict()["MTPLX_DEFER_VERIFY_HIDDEN_EVAL"] == "auto"
+    assert profile.env_dict()["MTPLX_DEFER_VERIFY_HIDDEN_EVAL"] == "1"
+    assert profile.env_dict()["MTPLX_VERIFY_HIDDEN_MODE"] == "logits_first_committed_slice"
+    assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY"] == "auto"
+    assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"] == "98304"
+    assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH"] == "2"
     assert profile.env_dict()["MTPLX_LAZY_MTP_HISTORY_APPEND"] == "1"
     assert profile.env_dict()["MTPLX_DROP_EVENTS"] == "1"
     assert profile.env_dict()["MTPLX_SKIP_VERIFY_SNAPSHOT"] == "1"
     assert profile.env_dict()["MTPLX_VLLM_METAL_PAGED_TURBOQUANT"] == "0"
     assert "MTPLX_TRUNK_CACHE_MATERIALIZE_EVERY" not in profile.env_dict()
     assert "MTPLX_EVAL_STATE_ROOTS_ON_COMMIT" not in profile.env_dict()
+
+
+def test_sustained_long_context_depth_policy_caps_only_128k_class() -> None:
+    env = SUSTAINED_PREFILL_ENV
+
+    depth, details = resolve_long_context_mtp_depth(
+        prompt_tokens=65536,
+        requested_depth=3,
+        env=env,
+    )
+    assert depth == 3
+    assert details["active"] is False
+    assert details["reason"] == "below_threshold"
+
+    depth, details = resolve_long_context_mtp_depth(
+        prompt_tokens=131072,
+        requested_depth=3,
+        env=env,
+    )
+    assert depth == 2
+    assert details["active"] is True
+    assert details["reason"] == "long_context_depth_cap"
+    assert details["requested_depth"] == 3
+    assert details["effective_depth"] == 2
+
+    depth, details = resolve_long_context_mtp_depth(
+        prompt_tokens=131072,
+        requested_depth=1,
+        env=env,
+    )
+    assert depth == 1
+    assert details["active"] is False
+    assert details["reason"] == "already_within_cap"
