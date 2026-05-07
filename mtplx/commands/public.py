@@ -75,7 +75,6 @@ LONG_RESPONSE_DIRECT_PROFILE = (
     "vllm_metal_paged_attn_partitioned_block_16_blocks_1024_"
     "partition_threshold_2048_impl_mlx_vector_paged"
 )
-BENCH_COLD_DEFAULT_SUITES = {"cold-long-code-192"}
 BENCH_SUSTAINED_DEFAULT_SUITES = {
     "flappy",
     "long_code_uncapped",
@@ -1212,8 +1211,6 @@ def _bench_run_profile_name(args: Any, *, suite: str) -> str:
     requested = getattr(args, "profile", None)
     if requested:
         return str(requested)
-    if suite in BENCH_COLD_DEFAULT_SUITES:
-        return "performance-cold"
     if suite in BENCH_SUSTAINED_DEFAULT_SUITES:
         return "sustained"
     try:
@@ -1470,7 +1467,7 @@ def _cmd_bench_run_direct_http(
 
 
 def _nightly_tasks(args: Any) -> list[dict[str, Any]]:
-    sustained_profile = get_profile(getattr(args, "profile", None) or "sustained").name
+    sustained_profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME).name
     return [
         {
             "label": "cold-long-code-192",
@@ -4413,7 +4410,7 @@ def _quickstart_openwebui_payload(args: Any) -> dict[str, Any]:
     port = int(getattr(args, "port", 8000))
     model_id = str(getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID)
     base = f"http://{_connect_host_for_bind(host)}:{port}"
-    profile = str(getattr(args, "profile", None) or "sustained")
+    profile = str(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     return {
         "integration": "openwebui",
         "server_url": base,
@@ -4453,7 +4450,7 @@ def _quickstart_run_openwebui(args: Any, *, runtime_model: str, inspection: dict
     serve_args = SimpleNamespace(
         model=runtime_model,
         cache_dir=getattr(args, "cache_dir", None),
-        profile=getattr(args, "profile", None) or "sustained",
+        profile=getattr(args, "profile", None) or DEFAULT_PROFILE_NAME,
         model_id=getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=True,

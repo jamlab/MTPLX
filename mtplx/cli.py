@@ -1608,7 +1608,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_flow_p.add_argument(
         "--profile",
         choices=PROFILE_CHOICES,
-        default="sustained",
+        default=DEFAULT_PROFILE_NAME,
         help="Runtime profile; start defaults to Sustained. Use --profile performance-cold --max for Burst.",
     )
     start_flow_p.add_argument("--download", action="store_true", help="Download the selected/default model if it is missing")
@@ -1718,7 +1718,7 @@ def build_parser() -> argparse.ArgumentParser:
     quickstart_server_p.add_argument(
         "--profile",
         choices=PROFILE_CHOICES,
-        default="sustained",
+        default=DEFAULT_PROFILE_NAME,
         help="Runtime profile. Direct server quickstart defaults to Sustained; use --profile performance-cold --max for Burst.",
     )
     quickstart_server_p.add_argument("--unsafe-force-unverified", action="store_true")
@@ -1955,7 +1955,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument(
         "--profile",
         choices=PROFILE_CHOICES,
-        default="sustained",
+        default=DEFAULT_PROFILE_NAME,
         help=(
             "Runtime profile. Server defaults to Sustained so long-context "
             "prefill uses the v0.1.7 fast path; use --profile performance-cold "

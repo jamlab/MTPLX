@@ -13,12 +13,12 @@ from mtplx.profiles import (
 )
 
 
-def test_profile_registry_default_is_stable() -> None:
+def test_profile_registry_default_is_sustained() -> None:
     profile = get_profile()
 
-    assert DEFAULT_PROFILE_NAME == "performance-cold"
-    assert profile.name == "performance-cold"
-    assert profile.runtime_profile == "native_mtp_60_cold"
+    assert DEFAULT_PROFILE_NAME == "sustained"
+    assert profile.name == "sustained"
+    assert profile.runtime_profile == "native_mtp_sustained"
     assert profile.product_claim_eligible is True
 
 
@@ -34,6 +34,7 @@ def test_performance_cold_is_explicit_fast_path() -> None:
 
 def test_legacy_native_mtp_60_alias_resolves_to_performance_cold() -> None:
     assert get_profile("native-mtp-60").name == "performance-cold"
+    assert get_profile("default").name == "sustained"
 
 
 def test_apply_and_restore_profile_env() -> None:

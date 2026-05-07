@@ -1123,7 +1123,7 @@ def test_public_bench_run_dry_run_records_external_kernel_env(monkeypatch, capsy
     assert payload["runtime_env"]["MTPLX_EVAL_STATE_ROOTS_INCLUDE_LIVE"] == "0"
 
 
-def test_public_bench_cold_run_defaults_to_performance_cold_mode(capsys):
+def test_public_bench_cold_run_defaults_to_sustained_mode(capsys):
     code = main(
         [
             "bench",
@@ -1142,12 +1142,14 @@ def test_public_bench_cold_run_defaults_to_performance_cold_mode(capsys):
     captured = capsys.readouterr().out
     payload = json.loads(captured)
     assert code == 0
-    assert payload["profile"]["name"] == "performance-cold"
-    assert payload["harness"] == "depth-sweep"
-    assert payload["seed"] == 0
-    assert payload["runtime_profile"] == "native_mtp_60_cold"
-    assert payload["runtime_env"]["MTPLX_LAZY_VERIFY_LOGITS"] == "1"
-    assert "MTPLX_TARGET_LAYER_EVAL_SCHEDULE" not in payload["runtime_env"]
+    assert payload["profile"]["name"] == "sustained"
+    assert payload["harness"] == "direct-http"
+    assert payload["seed"] == 42
+    assert payload["runtime_profile"] == "native_mtp_sustained"
+    assert payload["runtime_env"]["MTPLX_SUSTAINED_PREFILL"] == "1"
+    assert payload["runtime_env"]["MTPLX_PREFILL_OMLX_EXTERNAL"] == "1"
+    assert payload["runtime_env"]["MTPLX_VLLM_METAL_PAGED_TURBOQUANT"] == "0"
+    assert payload["direct_http_command"] is not None
 
 
 def test_public_bench_performance_cold_is_explicit(capsys):
@@ -1390,7 +1392,7 @@ def test_bench_compare_envelopes_detects_cold_regression(tmp_path, capsys):
     assert payload["comparisons"][0]["gates"]["cold_floor_ge_59"] is False
 
 
-def test_chat_and_serve_default_to_performance_cold_mode():
+def test_chat_and_serve_default_to_sustained_mode():
     parser = build_parser()
 
     run_args = parser.parse_args(["run", "hello", "--cache-dir", "/tmp/mtplx-models"])
@@ -1399,15 +1401,15 @@ def test_chat_and_serve_default_to_performance_cold_mode():
     serve_max_args = parser.parse_args(["serve", "--max"])
     serve_no_footer_args = parser.parse_args(["serve", "--no-stats-footer"])
 
-    assert run_args.profile == "performance-cold"
+    assert run_args.profile == "sustained"
     assert run_args.prompt_arg == "hello"
     assert run_args.cache_dir == "/tmp/mtplx-models"
     assert run_args.max_tokens is None
     assert run_args.reasoning is None
-    assert chat_args.profile == "performance-cold"
+    assert chat_args.profile == "sustained"
     assert chat_args.max_tokens is None
     assert chat_args.reasoning is None
-    assert serve_args.profile == "performance-cold"
+    assert serve_args.profile == "sustained"
     assert serve_args.reasoning is None
     assert serve_args.stock_ar is False
     assert serve_max_args.max is True
@@ -2381,7 +2383,7 @@ def test_profiles_command_lists_default_without_mlx(capsys):
 
     payload = json.loads(capsys.readouterr().out)
     assert code == 0
-    assert payload["default"] == "performance-cold"
+    assert payload["default"] == "sustained"
     assert [profile["name"] for profile in payload["profiles"]] == [
         "stable",
         "performance-cold",

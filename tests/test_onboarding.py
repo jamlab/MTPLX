@@ -11,8 +11,6 @@ import builtins
 import json
 from pathlib import Path
 
-import pytest
-
 from mtplx.ui import onboarding
 
 
@@ -538,7 +536,7 @@ def test_start_invokes_onboarding_when_no_explicit_flags(tmp_path, monkeypatch):
     args = argparse.Namespace(
         target=None,
         model="/some/configured/path",  # pre-filled from config.toml
-        profile="performance-cold",  # parser default
+        profile="sustained",  # parser default
         max=False,
         prompt=None,
         dry_run=False,

@@ -25,7 +25,7 @@ def test_diagnostics_payload_has_production_checks(tmp_path) -> None:
     assert payload["support_matrix"]["supported"]["default_model"] == (
         "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
     )
-    assert payload["support_matrix"]["supported"]["default_profile"] == "performance-cold"
+    assert payload["support_matrix"]["supported"]["default_profile"] == "sustained"
     ids = {check["id"] for check in payload["checks"]}
     assert {
         "os.macos_version",

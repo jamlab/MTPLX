@@ -227,7 +227,7 @@ def test_init_dry_run_without_mlx_does_not_write_config(tmp_path: Path) -> None:
     assert payload["wrote_config"] is False
     assert payload["model"] == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
     assert payload["model_dir"] == str(model_dir)
-    assert payload["profile"]["name"] == "performance-cold"
+    assert payload["profile"]["name"] == "sustained"
     assert payload["hardware"]["system"]
     assert payload["commands"]["pull"].startswith("mtplx pull ")
     assert not config.exists()
@@ -274,7 +274,7 @@ def test_profiles_without_mlx(tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     payload = json.loads(proc.stdout)
-    assert payload["default"] == "performance-cold"
+    assert payload["default"] == "sustained"
     assert [profile["name"] for profile in payload["profiles"]] == [
         "stable",
         "performance-cold",

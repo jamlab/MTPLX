@@ -14,7 +14,7 @@ from typing import Mapping, MutableMapping
 
 ProfileName = str
 
-DEFAULT_PROFILE_NAME = "performance-cold"
+DEFAULT_PROFILE_NAME = "sustained"
 PROFILE_CHOICES = (
     "stable",
     "performance-cold",
@@ -303,7 +303,7 @@ SUSTAINED_PROFILE = RuntimeProfile(
     ),
     env=_items(SUSTAINED_PREFILL_ENV),
     caveats=(
-        "User-selected; no automatic profile switching.",
+        "Default product path for long-context coding and agent use.",
         "Targets long-context memory safety while preserving most Burst TPS.",
         "Does not include v0.2 decode-state eval scheduling flags.",
     ),
@@ -346,7 +346,7 @@ PROFILES: dict[ProfileName, RuntimeProfile] = {
 }
 
 PROFILE_ALIASES = {
-    "default": "performance-cold",
+    "default": "sustained",
     "safe": "stable",
     "native-mtp-60": "performance-cold",
     "native_mtp_60": "performance-cold",

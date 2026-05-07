@@ -230,7 +230,7 @@ Custom Metal kernels we shipped on top of the fork:
 - **GraphBank.** A cache of `mx.compile`-compiled verify graphs, keyed by `(suffix_length, depth, profile)`. Each verify shape gets one compiled graph reused across cycles — no per-cycle Python dispatch overhead. Capture-commit + GraphBank together hit `capture_commit_time_s ≈ 0.073 ms` per cycle (vs `verify_time_s ≈ 47 ms` per cycle), i.e. the commit step is three orders of magnitude smaller than the verify itself.
 - **Draft-only 4-bit / 3-bit LM head** built in memory by `scripts/probe_draft_lm_head_requant.py`. The target's `lm_head` stays at the model's actual precision (BF16 / INT4 affine); the drafter gets a separate, much smaller LM-head requantized for proposal use only. Cuts draft time by ~29% without touching target accuracy.
 
-Runtime knobs that ship on by default in `performance-cold`:
+Runtime knobs that are enabled when `performance-cold` is explicitly selected:
 
 - `MTPLX_LAZY_VERIFY_LOGITS=1` · `MTPLX_BATCH_TARGET_ARRAYS=1` · `MTPLX_LAZY_MTP_HISTORY_APPEND=1` · `MTPLX_DROP_EVENTS=1` · `MTPLX_SKIP_VERIFY_SNAPSHOT=1`.
 

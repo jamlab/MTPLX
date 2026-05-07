@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .hardware import inspect_hardware
-from .profiles import apply_profile_env, get_profile
+from .profiles import DEFAULT_PROFILE_NAME, apply_profile_env, get_profile
 
 
 DEFAULT_CONTEXTS = (512, 1024, 2048, 4096, 8192, 16384, 32768)
@@ -831,7 +831,7 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
 
 def run_prefill_ladder(args: Any) -> dict[str, Any]:
     contexts = parse_contexts(getattr(args, "contexts", None), full=bool(getattr(args, "full", False)))
-    profile = get_profile(getattr(args, "profile", None) or "sustained")
+    profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     prompt_style = str(getattr(args, "prompt_style", None) or DEFAULT_PROMPT_STYLE)
     prompt_format = _normalize_prompt_format(
         str(getattr(args, "prompt_format", None) or DEFAULT_PROMPT_FORMAT)

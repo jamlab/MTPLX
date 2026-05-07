@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from . import DraftTokens, ModelState, MTPBackend, VerifyOutput
-from mtplx.profiles import get_profile
+from mtplx.profiles import DEFAULT_PROFILE_NAME, get_profile
 
 
 class Qwen3NextMTPBackend(MTPBackend):
@@ -34,7 +34,7 @@ class Qwen3NextMTPBackend(MTPBackend):
         raise NotImplementedError("Qwen3NextMTPBackend.propose is wired through generation.py in v0.1")
 
     def recommended_profile(self) -> str:
-        return "stable"
+        return DEFAULT_PROFILE_NAME
 
     def health(self) -> dict[str, Any]:
         profile = get_profile("performance-cold")
