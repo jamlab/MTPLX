@@ -4,6 +4,20 @@ All notable user-facing changes are recorded here.
 
 ## Unreleased
 
+### Fixed
+
+- Fixed `_ToolAwareContentStreamTranslator` so it correctly handles assistant
+  responses that emit preamble text *before* a `<tool_call>` block. Previously
+  the splitter locked into `mode="content"` on the first non-marker byte and
+  never re-checked, so a response shaped like `"Let me investigate. <tool_call>...`
+  would emit the entire payload (including the tool_call markup) as
+  `delta.content` text. OpenAI-compatible clients then saw zero
+  `delta.tool_calls`, no tools were dispatched, and the agent loop exited
+  with no work done. The translator now also scans incoming text in `content`
+  mode for `<tool_call>` markers (with proper handling of partial markers
+  spanning multiple stream chunks). Tool-only responses and pure-text
+  responses are unchanged. Closes #20.
+
 ## v0.2.0
 
 ### Added
