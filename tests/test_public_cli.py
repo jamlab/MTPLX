@@ -278,6 +278,7 @@ def test_start_help_is_a_user_journey(capsys):
     assert "mtplx start --fresh" in captured
     assert "mtplx start --max" in captured
     assert "mtplx start cli" in captured
+    assert "mtplx start pi" in captured
     assert "mtplx start --download" in captured
     assert "/speed" in captured
     assert "Aliases:" in captured
@@ -342,7 +343,7 @@ def test_start_default_target_is_browser(monkeypatch, tmp_path):
 
 
 def test_start_target_aliases_route_correctly(monkeypatch, tmp_path, capsys):
-    """`web`, `openwebui`, `open-webui` -> openwebui; `cli`, `terminal` -> terminal."""
+    """Target aliases normalize to the surface MTPLX actually starts."""
     monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
 
     def run(target: str | None) -> dict:
@@ -362,6 +363,8 @@ def test_start_target_aliases_route_correctly(monkeypatch, tmp_path, capsys):
     assert run("open-webui")["target"] == "openwebui"
     assert run("cli")["target"] == "terminal"
     assert run("terminal")["target"] == "terminal"
+    assert run("pi")["target"] == "pi"
+    assert run("pie")["target"] == "pi"
 
 
 def test_terminal_quickstart_max_uses_verified_max_session(monkeypatch):
@@ -484,7 +487,7 @@ def test_one_shot_max_uses_verified_max_session(monkeypatch):
 def test_start_parser_accepts_target_choices():
     """Parser must accept the new `web` and `cli` target literals."""
     parser = build_parser()
-    for target in ("web", "cli", "openwebui", "open-webui", "terminal"):
+    for target in ("web", "cli", "openwebui", "open-webui", "terminal", "pi", "pie"):
         args = parser.parse_args(["start", target, "--dry-run"])
         assert args.target == target
     # Default target (no positional) is now None — the absence of an explicit
@@ -947,6 +950,128 @@ def test_quickstart_openwebui_dry_run_json(monkeypatch, tmp_path, capsys):
     assert "--profile sustained" in payload["openwebui"]["server_command"]
     assert "--no-stats-footer" in payload["openwebui"]["server_command"]
     assert "--open-browser" in payload["openwebui"]["server_command"]
+
+
+def test_quickstart_pi_dry_run_json(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    monkeypatch.setenv("MTPLX_PI_MODELS_JSON", str(tmp_path / "pi" / "models.json"))
+
+    code = main(
+        [
+            "start",
+            "pi",
+            "--dry-run",
+            "--json",
+            "--model",
+            "models/example",
+            "--port",
+            "18012",
+            "--yes",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["target"] == "pi"
+    assert payload["terminal_chat"] is False
+    assert payload["pi"]["base_url"] == "http://127.0.0.1:18012/v1"
+    assert payload["pi"]["model_ref"] == "mtplx/mtplx-qwen36-27b-optimized-speed"
+    assert payload["pi"]["launch_command"] == "pi --model mtplx/mtplx-qwen36-27b-optimized-speed"
+    assert payload["pi"]["provider"]["api"] == "openai-completions"
+    assert payload["pi"]["provider"]["authHeader"] is True
+    assert payload["pi"]["provider"]["compat"]["supportsDeveloperRole"] is False
+    assert payload["pi"]["provider"]["compat"]["supportsReasoningEffort"] is False
+    assert payload["pi"]["provider"]["compat"]["maxTokensField"] == "max_tokens"
+    assert "--api-key mtplx-local" in payload["pi"]["server_command"]
+
+
+def test_pi_models_config_merge_preserves_other_providers(tmp_path):
+    from mtplx.pi import write_pi_models_config
+
+    config_path = tmp_path / "models.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "other": {
+                        "baseUrl": "https://example.invalid/v1",
+                        "api": "openai-completions",
+                        "apiKey": "OTHER_KEY",
+                        "models": [{"id": "other-model"}],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = write_pi_models_config(
+        base_url="http://127.0.0.1:18012/v1",
+        model_id="mtplx-test-model",
+        path=config_path,
+    )
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert result["config_path"] == str(config_path)
+    assert payload["providers"]["other"]["models"][0]["id"] == "other-model"
+    assert payload["providers"]["mtplx"]["baseUrl"] == "http://127.0.0.1:18012/v1"
+    assert payload["providers"]["mtplx"]["models"][0]["id"] == "mtplx-test-model"
+
+
+def test_start_pi_handoff_writes_config_and_starts_authenticated_server(
+    monkeypatch,
+    tmp_path,
+):
+    config_path = tmp_path / "pi" / "models.json"
+    monkeypatch.setenv("MTPLX_PI_MODELS_JSON", str(config_path))
+    monkeypatch.setattr(public.shutil, "which", lambda _name: "/usr/local/bin/pi")
+    captured: dict[str, object] = {}
+
+    def fake_serve(serve_args):
+        captured["api_key"] = serve_args.api_key
+        captured["quickstart_pi"] = serve_args.quickstart_pi
+        captured["open_browser"] = serve_args.open_browser
+        captured["stats_footer"] = serve_args.stats_footer
+        return 0
+
+    monkeypatch.setattr(public, "cmd_serve_public", fake_serve)
+    args = SimpleNamespace(
+        host="127.0.0.1",
+        port=18012,
+        model="/models/qwen",
+        model_id="mtplx-test-model",
+        profile="sustained",
+        max=False,
+        api_key=None,
+        cache_dir=None,
+        unsafe_force_unverified=False,
+        depth=3,
+        no_mtp=False,
+        rate_limit=0,
+        stream_interval=1,
+        warmup_tokens=16,
+        max_response_tokens=None,
+        temperature=0.6,
+        top_p=0.95,
+        reasoning=None,
+        reasoning_parser="qwen3",
+        strict_warmup=False,
+        strict_fast_path=False,
+        max_idle_min=15,
+    )
+
+    rc = public._quickstart_run_pi(args, runtime_model="/models/qwen", inspection={})
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert rc == 0
+    assert captured == {
+        "api_key": "mtplx-local",
+        "quickstart_pi": True,
+        "open_browser": False,
+        "stats_footer": False,
+    }
+    assert payload["providers"]["mtplx"]["baseUrl"] == "http://127.0.0.1:18012/v1"
+    assert payload["providers"]["mtplx"]["models"][0]["id"] == "mtplx-test-model"
 
 
 def test_run_json_model_summary_excludes_heavy_inspect_fields():

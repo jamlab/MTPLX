@@ -1,6 +1,6 @@
 """Interactive onboarding flow for ``mtplx start``.
 
-Three screens for first-time users (model -> mode -> interface), and a
+Three screens for first-time users (model -> mode -> interface/client), and a
 "same as last time?" prompt for returning users. Choices persist to
 ``~/.mtplx/quickstart.json`` so the next run can offer the same defaults.
 
@@ -741,7 +741,7 @@ def _print_welcome() -> None:
     body.append("Three quick questions to get you set up:\n", style="")
     body.append("  1. Which model?\n", style="dim")
     body.append("  2. Which runtime mode?\n", style="dim")
-    body.append("  3. Browser chat or terminal chat?\n\n", style="dim")
+    body.append("  3. Browser chat, terminal chat, or Pi?\n\n", style="dim")
     body.append("For each step, type the number of your choice and press Enter.", style="italic")
     panel = Panel(
         body,
@@ -1055,7 +1055,7 @@ def screen_mode() -> tuple[str, bool]:
 
 
 def screen_interface() -> str:
-    """Return the target string (``openwebui`` or ``terminal``)."""
+    """Return the target string (``openwebui``, ``terminal``, or ``pi``)."""
 
     _step_panel(
         step=3,
@@ -1072,10 +1072,19 @@ def screen_interface() -> str:
                 "CLI [this terminal]",
                 "Streamed answers with rich styling and a stats footer.",
             ),
+            (
+                "3",
+                "Connect to Pi [coding agent]",
+                "Writes Pi's MTPLX model config and starts the local OpenAI-compatible server.",
+            ),
         ],
     )
-    choice = _prompt_choice("Select", ["1", "2"], default="1")
-    return "openwebui" if choice == "1" else "terminal"
+    choice = _prompt_choice("Select", ["1", "2", "3"], default="1")
+    if choice == "1":
+        return "openwebui"
+    if choice == "2":
+        return "terminal"
+    return "pi"
 
 
 def screen_server_surface(
@@ -1243,7 +1252,6 @@ def _print_install_result(result: dict) -> None:
     message = result.get("message") or ("ThermalForge installed." if ok else "Install failed.")
 
     try:
-        from rich.console import Console
         from rich.panel import Panel
         from rich.text import Text
     except ImportError:
@@ -1297,7 +1305,7 @@ def _quickstart_state_is_reusable(last: dict) -> bool:
         return False
     if profile not in {"performance-cold", "sustained"}:
         return False
-    if target not in {"openwebui", "open-webui", "web", "terminal", "cli"}:
+    if target not in {"openwebui", "open-webui", "web", "terminal", "cli", "pi", "pie"}:
         return False
     if not model or "\n" in model or "\r" in model:
         return False
@@ -1505,4 +1513,6 @@ def interface_label(target: str | None) -> str:
         return "API server  ·  no browser"
     if target in ("cli", "terminal"):
         return "CLI  ·  this terminal"
+    if target in ("pi", "pie"):
+        return "Pi  ·  coding agent"
     return target or "?"

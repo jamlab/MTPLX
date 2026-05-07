@@ -61,7 +61,7 @@ NATIVE_MTP_60_MODEL = DEFAULT_MODEL_ID
 
 
 PUBLIC_COMMANDS = (
-    ("start", "Interactive setup → chat (model · mode · web/CLI)"),
+    ("start", "Interactive setup → chat (model · mode · web/CLI/Pi)"),
     ("help", "Detailed help; `help commands` / `help flags` / `help <name>`"),
     ("setup", "Prepare config and the model cache"),
     ("quickstart", "Run the local OpenAI/Anthropic server"),
@@ -176,6 +176,7 @@ def _format_public_help() -> str:
   mtplx start                       Interactive setup, then chat
   mtplx start --fresh               Re-run the onboarding (new model/mode/surface)
   mtplx start --max --port 8000       Sustained Max browser chat with fan boost
+  mtplx start pi --port 8000           Configure Pi, then start the local server
   mtplx quickstart --profile sustained --port 8000  API server only, no chat
 
   {footer}
@@ -212,17 +213,18 @@ def _format_start_help() -> str:
     return f"""{_heading("MTPLX start")}
 
 Interactive end-to-end setup. On first run MTPLX walks you through three
-quick choices: model, runtime mode, and where to chat (browser or terminal).
+quick choices: model, runtime mode, and where to chat (browser, terminal, or Pi).
 On later runs it offers "same as last time?" so the chat is one keypress away.
 
 What gets asked:
   1. Model — your configured model, the verified default, custom HF, or local
   2. Mode  — Sustained, Sustained Max, or Burst (Stable remains available via --profile safe)
-  3. Where — Web UI (default) or terminal CLI
+  3. Where — Web UI (default), terminal CLI, or Pi coding agent
 
 Power-user shortcuts (any of these skip the onboarding wizard):
   mtplx start --fresh                 Walk the onboarding again from scratch
   mtplx start cli                     Skip onboarding; terminal chat directly
+  mtplx start pi                      Configure Pi, then serve MTPLX for Pi
   mtplx start --max                   Sustained Max: long-context mode with ThermalForge fan boost
   mtplx start --profile performance-cold --max
                                       Burst: old max-fan lane, max 8K context
@@ -255,6 +257,7 @@ Inside terminal chat:
 Aliases:
   `web` and `openwebui` -> browser chat (same as default)
   `terminal`            -> terminal chat (same as `cli`)
+  `pi`                  -> Pi coding-agent connection
 """
 
 
@@ -1587,16 +1590,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     start_flow_p = sub.add_parser(
         "start",
-        help="Interactive setup → chat (model · mode · web/CLI)",
-        usage="mtplx start [cli|web] [--fresh] [--max] [--profile sustained] [--model PATH_OR_REPO] [--prompt TEXT]",
-        description="Walk through model / mode / surface in three quick steps, then chat. Returning users get a 'same as last time?' prompt. Use --fresh to redo the onboarding, or pass any of --model / --profile / --max / cli|web to skip it entirely.",
+        help="Interactive setup → chat (model · mode · web/CLI/Pi)",
+        usage="mtplx start [cli|web|pi] [--fresh] [--max] [--profile sustained] [--model PATH_OR_REPO] [--prompt TEXT]",
+        description="Walk through model / mode / surface in three quick steps, then chat. Returning users get a 'same as last time?' prompt. Use --fresh to redo the onboarding, or pass any of --model / --profile / --max / cli|web|pi to skip it entirely.",
     )
     start_flow_p.add_argument(
         "target",
         nargs="?",
-        choices=["web", "openwebui", "open-webui", "cli", "terminal"],
+        choices=["web", "openwebui", "open-webui", "cli", "terminal", "pi", "pie"],
         default=None,
-        help="Web chat or terminal chat. Without this argument, MTPLX runs an interactive onboarding (or the 'same as last time?' prompt) on first run.",
+        help="Web chat, terminal chat, or Pi coding-agent connection. Without this argument, MTPLX runs an interactive onboarding (or the 'same as last time?' prompt) on first run.",
     )
     start_flow_p.add_argument(
         "--fresh",

@@ -63,6 +63,7 @@ def test_interface_label_covers_all_targets():
     assert "API server" in onboarding.interface_label("server")
     assert "CLI" in onboarding.interface_label("cli")
     assert "CLI" in onboarding.interface_label("terminal")
+    assert "Pi" in onboarding.interface_label("pi")
 
 
 def test_run_onboarding_screens_with_stubbed_input(monkeypatch, capsys):
@@ -107,6 +108,17 @@ def test_run_onboarding_sustained_mode_is_explicit(monkeypatch):
     assert state["profile"] == "sustained"
     assert state["max"] is False
     assert state["target"] == "openwebui"
+
+
+def test_run_onboarding_can_select_pi(monkeypatch):
+    answers = iter(["1", "1", "3"])
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    state = onboarding.run_onboarding_screens()
+
+    assert state["profile"] == "sustained"
+    assert state["max"] is False
+    assert state["target"] == "pi"
 
 
 def test_run_serve_onboarding_screens_defaults_to_api_server(monkeypatch):
@@ -267,7 +279,7 @@ def test_run_quickstart_flow_returning_user_says_same(tmp_path, monkeypatch):
                 "model": "mtplx/foo",
                 "profile": "sustained",
                 "max": False,
-                "target": "openwebui",
+                "target": "pi",
             }
     )
     # Returning-user prompt: empty answer (default Y) should reuse last state.
@@ -276,7 +288,7 @@ def test_run_quickstart_flow_returning_user_says_same(tmp_path, monkeypatch):
     state = onboarding.run_quickstart_flow(fresh=False)
     assert state is not None
     assert state["model"] == "mtplx/foo"
-    assert state["target"] == "openwebui"
+    assert state["target"] == "pi"
 
 
 def test_run_quickstart_flow_returning_user_reuses_sustained(tmp_path, monkeypatch):

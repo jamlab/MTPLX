@@ -70,7 +70,7 @@ QUICKSTART_SPEED_PROMPT = (
     "Create a compact single-file HTML5 Canvas Flappy Bird game. "
     "Draw visuals procedurally, include physics, score, restart, and no prose."
 )
-QUICKSTART_TARGETS = {"terminal", "openwebui", "open-webui"}
+QUICKSTART_TARGETS = {"terminal", "openwebui", "open-webui", "pi"}
 LONG_RESPONSE_DIRECT_PROFILE = (
     "vllm_metal_paged_attn_partitioned_block_16_blocks_1024_"
     "partition_threshold_2048_impl_mlx_vector_paged"
@@ -3155,6 +3155,19 @@ def cmd_serve_public(args: Any) -> int:
         return depth_error
     _print_serve_start_banner(args)
     if _port_is_busy(str(getattr(args, "host", "127.0.0.1")), int(getattr(args, "port", 8000))):
+        if bool(getattr(args, "quickstart_pi", False)):
+            base = _server_url(str(getattr(args, "host", "127.0.0.1")), int(getattr(args, "port", 8000)))
+            health = _http_json(base + "/health", timeout=1.5)
+            if health.get("ok"):
+                from mtplx.pi import pi_launch_command, pi_model_ref
+
+                model_id = health.get("model") or getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID
+                _print_serve_start_line("MTPLX is already running.")
+                _print_serve_start_line(f"OpenAI API Base URL: {base}/v1")
+                _print_serve_start_line(f"Pi model: {pi_model_ref(str(model_id))}")
+                _print_serve_start_line(f"Start Pi: {pi_launch_command(str(model_id))}")
+                _print_serve_start_line("Use the existing server, or stop that terminal with Ctrl-C to restart.")
+                return 0
         if bool(getattr(args, "quickstart_openwebui", False)):
             base = _server_url(str(getattr(args, "host", "127.0.0.1")), int(getattr(args, "port", 8000)))
             health = _http_json(base + "/health", timeout=1.5)
@@ -4435,6 +4448,62 @@ def _quickstart_openwebui_payload(args: Any) -> dict[str, Any]:
     }
 
 
+def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str, Any]:
+    from mtplx.pi import (
+        PI_LOCAL_API_KEY,
+        build_pi_provider_config,
+        pi_launch_command,
+        pi_model_ref,
+        pi_models_json_path,
+        write_pi_models_config,
+    )
+
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = int(getattr(args, "port", 8000))
+    model_id = str(getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID)
+    base_url = f"http://{_connect_host_for_bind(host)}:{port}/v1"
+    api_key = str(getattr(args, "api_key", None) or PI_LOCAL_API_KEY)
+    provider = build_pi_provider_config(
+        base_url=base_url,
+        model_id=model_id,
+        model_name=f"MTPLX {model_id}",
+        api_key=api_key,
+    )
+    payload = {
+        "integration": "pi",
+        "server_url": f"http://{_connect_host_for_bind(host)}:{port}",
+        "base_url": base_url,
+        "api_base_url": base_url,
+        "model_id": model_id,
+        "model_ref": pi_model_ref(model_id),
+        "api_key": api_key,
+        "config_path": str(pi_models_json_path()),
+        "provider": provider,
+        "launch_command": pi_launch_command(model_id),
+        "server_command": (
+            f"mtplx quickstart --host {host} --port {port} "
+            f"--model {shlex.quote(str(getattr(args, 'model', DEFAULT_RUNTIME_MODEL_DIR)))} "
+            f"--profile {str(getattr(args, 'profile', None) or DEFAULT_PROFILE_NAME)} "
+            f"{'--max ' if bool(getattr(args, 'max', False)) else ''}"
+            f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
+            f"--api-key {shlex.quote(api_key)} --no-stats-footer"
+        ),
+        "pi_steps": [
+            f"Pi config: {pi_models_json_path()}",
+            f"Model in Pi: {pi_model_ref(model_id)}",
+            f"Start Pi: {pi_launch_command(model_id)}",
+        ],
+    }
+    if write_config:
+        payload["config_write"] = write_pi_models_config(
+            base_url=base_url,
+            model_id=model_id,
+            model_name=f"MTPLX {model_id}",
+            api_key=api_key,
+        )
+    return payload
+
+
 def _quickstart_print_openwebui_handoff(args: Any, *, runtime_model: str) -> None:
     # The full banner + status panel are rendered by `_print_serve_start_banner`
     # inside `cmd_serve_public`, so this hand-off only emits a brief progress
@@ -4442,6 +4511,29 @@ def _quickstart_print_openwebui_handoff(args: Any, *, runtime_model: str) -> Non
     _quickstart_line("[2/3] Starting local MTPLX server for the browser chat...")
     _quickstart_line(f"      Loading model: {runtime_model}")
     _quickstart_line("      Keep this terminal open. The next step is the model load.")
+    _quickstart_line()
+
+
+def _quickstart_print_pi_handoff(args: Any, *, runtime_model: str, pi: dict[str, Any]) -> None:
+    _quickstart_line("[2/3] Connecting MTPLX to Pi...")
+    config_write = pi.get("config_write") if isinstance(pi.get("config_write"), dict) else {}
+    config_path = config_write.get("config_path") or pi.get("config_path")
+    backup_path = config_write.get("backup_path")
+    _quickstart_line(f"      Pi config: {config_path}")
+    if backup_path:
+        _quickstart_line(f"      Backed up unreadable old Pi config: {backup_path}")
+    _quickstart_line(f"      Pi model: {pi.get('model_ref')}")
+    _quickstart_line(f"      Loading model: {runtime_model}")
+    _quickstart_line("      Keep this terminal open for the MTPLX server.")
+    pi_binary = shutil.which("pi")
+    if pi_binary:
+        _quickstart_line(f"      In another terminal: {pi.get('launch_command')}")
+    else:
+        _quickstart_line(
+            "      Pi is not on PATH yet. Install it with: "
+            "npm install -g @earendil-works/pi-coding-agent"
+        )
+        _quickstart_line(f"      Then run: {pi.get('launch_command')}")
     _quickstart_line()
 
 
@@ -4472,6 +4564,45 @@ def _quickstart_run_openwebui(args: Any, *, runtime_model: str, inspection: dict
         strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
         quickstart_openwebui=True,
         open_browser=True,
+        max=bool(getattr(args, "max", False)),
+        max_idle_min=int(getattr(args, "max_idle_min", 15)),
+    )
+    return cmd_serve_public(serve_args)
+
+
+def _quickstart_run_pi(args: Any, *, runtime_model: str, inspection: dict[str, Any]) -> int:
+    if not getattr(args, "api_key", None):
+        from mtplx.pi import PI_LOCAL_API_KEY
+
+        args.api_key = PI_LOCAL_API_KEY
+    pi = _quickstart_pi_payload(args, write_config=True)
+    _quickstart_print_pi_handoff(args, runtime_model=runtime_model, pi=pi)
+    serve_args = SimpleNamespace(
+        model=runtime_model,
+        cache_dir=getattr(args, "cache_dir", None),
+        profile=getattr(args, "profile", None) or DEFAULT_PROFILE_NAME,
+        model_id=getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID,
+        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
+        yes=True,
+        host=str(getattr(args, "host", "127.0.0.1")),
+        port=int(getattr(args, "port", 8000)),
+        api_key=getattr(args, "api_key", None),
+        depth=int(getattr(args, "depth", 3)),
+        no_mtp=bool(getattr(args, "no_mtp", False)),
+        rate_limit=int(getattr(args, "rate_limit", 0)),
+        stream_interval=int(getattr(args, "stream_interval", 1)),
+        warmup_tokens=int(getattr(args, "warmup_tokens", 16)),
+        max_response_tokens=getattr(args, "max_response_tokens", None),
+        temperature=float(getattr(args, "temperature", 0.6)),
+        top_p=float(getattr(args, "top_p", 0.95)),
+        reasoning=getattr(args, "reasoning", None),
+        reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
+        stats_footer=False,
+        strict_warmup=bool(getattr(args, "strict_warmup", False)),
+        strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
+        quickstart_openwebui=False,
+        quickstart_pi=True,
+        open_browser=False,
         max=bool(getattr(args, "max", False)),
         max_idle_min=int(getattr(args, "max_idle_min", 15)),
     )
@@ -4800,6 +4931,8 @@ def cmd_quickstart_public(args: Any) -> int:
         target = "openwebui"
     elif raw_target in {"cli", "terminal"}:
         target = "terminal"
+    elif raw_target in {"pi", "pie"}:
+        target = "pi"
     else:
         target = raw_target
     if target not in QUICKSTART_TARGETS:
@@ -4814,6 +4947,7 @@ def cmd_quickstart_public(args: Any) -> int:
     cache_dir = getattr(args, "cache_dir", None)
     if getattr(args, "dry_run", False):
         openwebui = _quickstart_openwebui_payload(args) if target == "openwebui" else None
+        pi = _quickstart_pi_payload(args) if target == "pi" else None
         payload = {
             "action": _start_command_name(args),
             "target": target,
@@ -4825,8 +4959,15 @@ def cmd_quickstart_public(args: Any) -> int:
             "download_if_missing": download,
             "terminal_chat": target == "terminal",
             "openwebui": openwebui,
+            "pi": pi,
             "stats_visible": bool(getattr(args, "show_stats", True)),
-            "next": _start_invocation(args) if target == "openwebui" else _start_invocation(args, " cli"),
+            "next": (
+                _start_invocation(args)
+                if target == "openwebui"
+                else _start_invocation(args, " pi")
+                if target == "pi"
+                else _start_invocation(args, " cli")
+            ),
         }
         if getattr(args, "json", False):
             _print(payload)
@@ -4845,6 +4986,10 @@ def cmd_quickstart_public(args: Any) -> int:
             _quickstart_line(f"download if missing: {str(download).lower()}")
             if target == "openwebui":
                 _quickstart_line(f"then: start local server -> open browser chat at {openwebui['chat_url']}")
+            elif target == "pi":
+                _quickstart_line(
+                    f"then: write Pi config -> start local server -> run {pi['launch_command']}"
+                )
             else:
                 _quickstart_line("then: load once -> chat in this terminal -> stream output -> show speed stats")
         return 0
@@ -4944,6 +5089,9 @@ def cmd_quickstart_public(args: Any) -> int:
             if target == "openwebui":
                 args.model = runtime_model
                 return _quickstart_run_openwebui(args, runtime_model=runtime_model, inspection=inspection)
+            if target == "pi":
+                args.model = runtime_model
+                return _quickstart_run_pi(args, runtime_model=runtime_model, inspection=inspection)
             return _quickstart_run_terminal_chat(args, runtime_model=runtime_model, inspection=inspection)
         detail = (resolution.get("error") or {}).get("detail") if isinstance(resolution.get("error"), dict) else None
         _quickstart_line("model is not available locally")
@@ -4977,6 +5125,9 @@ def cmd_quickstart_public(args: Any) -> int:
     if target == "openwebui":
         args.model = runtime_model
         return _quickstart_run_openwebui(args, runtime_model=runtime_model, inspection=inspection)
+    if target == "pi":
+        args.model = runtime_model
+        return _quickstart_run_pi(args, runtime_model=runtime_model, inspection=inspection)
     return _quickstart_run_terminal_chat(args, runtime_model=runtime_model, inspection=inspection)
 
 
