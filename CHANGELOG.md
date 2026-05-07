@@ -4,6 +4,18 @@ All notable user-facing changes are recorded here.
 
 ## Unreleased
 
+### Added
+
+- Added two operator-tunable environment variables for SessionBank capacity:
+  `MTPLX_SESSION_BANK_MAX_BYTES` (overrides `DEFAULT_MAX_BYTES`, default 24 GiB) and
+  `MTPLX_SESSION_BANK_PER_SESSION_BYTES` (overrides `DEFAULT_PER_SESSION_MAX_BYTES`, default 8 GiB).
+  Both accept plain integers (interpreted as bytes) and the suffixes `K`, `M`, `G`, `T`
+  (powers of 1024), e.g. `MTPLX_SESSION_BANK_PER_SESSION_BYTES=16G`. Useful when a single
+  long-running session's prefix state grows past the per-session cap and gets evicted
+  prematurely - common with tool-using subagent fan-out where one subagent can accumulate
+  50K+ tokens of context. Defaults are unchanged, so existing deployments see no behaviour
+  difference.
+
 ## v0.2.0
 
 ### Added
@@ -152,5 +164,5 @@ All notable user-facing changes are recorded here.
 
 ### Roadmap
 
-- Next: kernel ladder for sustained no-fan throughput.
-- Later: additional MTP architectures and broader serving polish.
+- v0.2: kernel ladder for sustained no-fan throughput.
+- v0.3: additional MTP architectures and broader serving polish.

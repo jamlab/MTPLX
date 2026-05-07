@@ -8,11 +8,31 @@ state explicit before the generation loop accepts warm prompt state directly.
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Iterator, Mapping
+
+
+def _bank_bytes_from_env(name: str, default: int) -> int:
+    """Read a SessionBank byte-cap override from the environment.
+
+    Supports plain integers (interpreted as bytes) and the suffixes K, M, G,
+    T (powers of 1024). Returns the default if unset or unparseable.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        s = raw.strip().upper()
+        suffixes = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+        if s and s[-1] in suffixes:
+            return int(float(s[:-1]) * suffixes[s[-1]])
+        return int(s)
+    except (ValueError, IndexError):
+        return default
 
 from .session_bank import (
     CacheMissReason,
@@ -259,9 +279,17 @@ class EngineSessionManager:
         bank: SessionBank | None = None,
         idle_ttl_s: float = DEFAULT_IDLE_TTL_S,
     ) -> None:
+        # Bank caps default to the constants in session_bank.py. Operators
+        # running into per-session eviction at large contexts can override
+        # via MTPLX_SESSION_BANK_PER_SESSION_BYTES (e.g. "16G" for 16 GiB)
+        # or MTPLX_SESSION_BANK_MAX_BYTES.
         self.bank = bank or SessionBank(
-            max_bytes=DEFAULT_MAX_BYTES,
-            per_session_max_bytes=DEFAULT_PER_SESSION_MAX_BYTES,
+            max_bytes=_bank_bytes_from_env(
+                "MTPLX_SESSION_BANK_MAX_BYTES", DEFAULT_MAX_BYTES
+            ),
+            per_session_max_bytes=_bank_bytes_from_env(
+                "MTPLX_SESSION_BANK_PER_SESSION_BYTES", DEFAULT_PER_SESSION_MAX_BYTES
+            ),
             idle_ttl_s=idle_ttl_s,
         )
         self.idle_ttl_s = float(idle_ttl_s)
