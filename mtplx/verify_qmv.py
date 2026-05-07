@@ -1066,7 +1066,8 @@ def multi3_swiglu_down_qmv4_matmul(
     module: nn.QuantizedLinear,
 ) -> mx.array:
     """Compute ``module(nn.silu(gate) * up)`` with fused activation input."""
-    fallback = lambda: module(nn.silu(gate) * up)
+    def fallback() -> mx.array:
+        return module(nn.silu(gate) * up)
     if gate.shape != up.shape:
         return fallback()
     if not is_multi3_qmv4_eligible(module):

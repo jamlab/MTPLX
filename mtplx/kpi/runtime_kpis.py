@@ -12,7 +12,6 @@ from typing import Any
 
 from mtplx.benchmarks.schema import now_run_id
 from mtplx.profiles import (
-    EXACT_PAGED_ATTENTION_ENV,
     LONG_RESPONSE_STAGED_ENV,
     NATIVE_MTP_60_FAST_PATH_ENV,
     get_profile,
@@ -106,6 +105,9 @@ def exact_paged_attention_env(
     if partitioned:
         env["MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN"] = "1"
     return env
+
+
+EXACT_PAGED_ATTENTION_ENV = exact_paged_attention_env()
 
 
 def long_response_staged_env() -> dict[str, str]:

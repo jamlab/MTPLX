@@ -4,15 +4,55 @@ All notable user-facing changes are recorded here.
 
 ## Unreleased
 
+## v0.2.0
+
+### Added
+
+- Added the `mtplx bench prefill-ladder` release-QA command for measuring
+  prompt-prefill TPS, decode TPS, TTFT, memory, acceptance, and fallback
+  counters across long-context ladders.
+- Added `mtplx hardware inspect --json` for Apple Silicon / MLX acceleration
+  eligibility reporting. This release does not claim direct M5 Neural
+  Accelerator use without profiling evidence.
+- Added `mtplx start pi`, plus the onboarding option "Connect to Pi", so users
+  can configure Pi and start the MTPLX OpenAI-compatible server from the normal
+  start wizard.
+- Added live server-console controls for Pi mode: `/reasoning`, `/mtp`,
+  `/stats`, and `/help` remain available in the original MTPLX terminal while
+  Pi runs as the client.
+
+### Changed
+
+- Made Sustained the default public long-context path for `mtplx start`,
+  `quickstart`, `serve`, and benchmark commands unless users explicitly choose
+  Burst / `performance-cold`.
+- Packaged the local Metal paged-attention support used by the long-context
+  Sustained route so installs no longer depend on a private reference checkout.
+
 ### Fixed
 
+- Fixed long-context Sustained prompt prefill so 32K/64K/128K prompts use the
+  bounded fast-prefill route without returning to the old 32K memory bloat.
 - Fixed OpenAI chat streaming when `tools` are present so normal assistant text
   still streams incrementally instead of buffering until the request completes.
   The unified streaming path now translates generated `<tool_call>` blocks into
   OpenAI `delta.tool_calls` chunks only when the response is actually a tool
   call, while preserving normal `delta.content` streaming for Pi, OpenWebUI,
   Zed, and coding-agent clients that include a `tools` array on every request.
-- Fixed `_schedule_idle_postcommit_snapshot` to actually run the retokenized SessionBank commit when the foreground goes idle. Previously the function was a no-op (it logged `abandoned_foreground_busy` and returned without ever calling `_store_retokenized_history_snapshot`), so any response the generation-final compatibility check rejected as unsafe - most commonly responses containing `tool_calls` - never made it into the bank. Tool-using OpenAI-compatible clients (opencode, Codex, Claude Code, Aider) therefore paid full cold prefill on every turn even when their session id was stable. After this fix, tool-call responses are committed asynchronously after the request stream completes; subsequent turns hit `cached_tokens > 0` and TTFT drops in proportion to the cached prefix length. Bounded `MAX_WAIT_S = 30s` deadline preserves the original "do not block foreground latency" contract.
+- Fixed `_schedule_idle_postcommit_snapshot` to actually run the retokenized
+  SessionBank commit when the foreground goes idle. Previously the function was
+  a no-op for unsafe compatibility cases such as tool-call responses, so
+  tool-using OpenAI-compatible clients paid full cold prefill on later turns
+  even with a stable session id. The async path now commits after the stream
+  completes while preserving the "do not block foreground latency" contract.
+
+### Release Notes
+
+- v0.2.0 is the fast-prefill and agent-client release: PP/TPS Sustained QA,
+  Pi onboarding, and OpenAI tools streaming are the user-visible themes.
+- Issues #9, #13, and #15 are the target issue closeouts for this release.
+- No Gemma assistant-pair runtime claim, broad continuous-batching claim, or
+  direct M5 Neural Accelerator claim is included in this release.
 
 ## v0.1.6
 
@@ -26,7 +66,7 @@ All notable user-facing changes are recorded here.
 
 - This is a small production hotfix over v0.1.5.
 - No Gemma assistant-pair runtime, model-weight, sampler, or benchmark-result claims are included in this release.
-- This release does not claim the v0.2 no-fan long-response decay target or a proven 200K-token production ceiling.
+- This release does not claim the future no-fan long-response decay target or a proven 200K-token production ceiling.
 
 ## v0.1.5
 
@@ -47,7 +87,7 @@ All notable user-facing changes are recorded here.
 
 - Sustained is the default long-context native-MTP user path. Sustained Max adds explicit fan boost. Burst remains the old performance-cold max-fan headline lane for short prompts and benchmarks.
 - Real QA showed the 32K Sustained path staying below the 35 GiB hard guard and the 16K Sustained Max decode gap recovering to within the release budget.
-- This release does not claim the v0.2 no-fan long-response decay target or a proven 200K-token production ceiling.
+- This release does not claim the future no-fan long-response decay target or a proven 200K-token production ceiling.
 
 ## v0.1.4
 
@@ -61,7 +101,7 @@ All notable user-facing changes are recorded here.
 
 - Issue #7 and issue #8 are the user-visible fixes in this release.
 - No sampler, decode-loop, MTP acceptance, kernel, or model-weight behavior changed for this release.
-- Sustained no-fan long-context throughput remains the v0.2 performance track; v0.1.4 fixes serving liveness and release packaging, not the thermal/decay target.
+- Sustained no-fan long-context throughput remains a future performance track; v0.1.4 fixes serving liveness and release packaging, not the thermal/decay target.
 
 ## v0.1.0-preview.3
 
@@ -112,5 +152,5 @@ All notable user-facing changes are recorded here.
 
 ### Roadmap
 
-- v0.2: kernel ladder for sustained no-fan throughput.
-- v0.3: additional MTP architectures and broader serving polish.
+- Next: kernel ladder for sustained no-fan throughput.
+- Later: additional MTP architectures and broader serving polish.

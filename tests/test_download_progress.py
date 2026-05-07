@@ -15,8 +15,6 @@ from __future__ import annotations
 import builtins
 import sys
 
-import pytest
-
 from mtplx.ui.download_progress import (
     RichDownloadProgress,
     from_progress_event_callback,

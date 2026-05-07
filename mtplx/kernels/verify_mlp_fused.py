@@ -280,7 +280,8 @@ def gate_up_swiglu_qmv4_activation(
     """
     from mlx_lm.models.qwen3_next import swiglu
 
-    fallback = lambda: swiglu(gate_module(x), up_module(x))
+    def fallback() -> mx.array:
+        return swiglu(gate_module(x), up_module(x))
     if not is_gate_up_swiglu_qmv4_eligible(x, gate_module, up_module):
         return fallback()
 
@@ -513,7 +514,8 @@ def gate_up_swiglu_qmv4_activation_rowwise(
     """Row-parallel exact qmv fusion for ``swiglu(gate(x), up(x))``."""
     from mlx_lm.models.qwen3_next import swiglu
 
-    fallback = lambda: swiglu(gate_module(x), up_module(x))
+    def fallback() -> mx.array:
+        return swiglu(gate_module(x), up_module(x))
     if not is_gate_up_swiglu_qmv4_eligible(x, gate_module, up_module):
         return fallback()
     if results_per_simdgroup not in {4, 8, 16}:
@@ -746,7 +748,8 @@ def gate_up_swiglu_qmv4_activation_split(
     """
     from mlx_lm.models.qwen3_next import swiglu
 
-    fallback = lambda: swiglu(gate_module(x), up_module(x))
+    def fallback() -> mx.array:
+        return swiglu(gate_module(x), up_module(x))
     if not is_gate_up_swiglu_qmv4_eligible(x, gate_module, up_module):
         return fallback()
 
@@ -905,7 +908,8 @@ def _small_m_qmm4_kernel(group_size: int, dtype: mx.Dtype):
 
 def small_m_qmm4_matmul(x: mx.array, module: nn.QuantizedLinear) -> mx.array:
     """Compute ``module(x)`` with a BM=8 dflash-style qmm prototype."""
-    fallback = lambda: module(x)
+    def fallback() -> mx.array:
+        return module(x)
     if not is_small_m_qmm4_eligible(x, module):
         return fallback()
 

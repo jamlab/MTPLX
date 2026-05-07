@@ -830,7 +830,7 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
                 exit_code=EXIT_INCOMPATIBLE_ARCHITECTURE,
                 message=(
                     f"{arch_id} runtime contract detected; not supported in "
-                    "v0.1.6. Planned for a later backend."
+                    "v0.2.0. Planned for a later backend."
                 ),
                 runtime_contract=contract,
                 runtime_contract_path=contract_path,
@@ -1059,7 +1059,7 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
         exit_code=EXIT_INCOMPATIBLE_ARCHITECTURE,
         message=(
             f"{detected_arch_id or 'generic MTP'} detected; not supported in "
-            "v0.1.6 because no supported native MLX runtime family "
+            "v0.2.0 because no supported native MLX runtime family "
             "matched this artifact."
         ),
         mtp_supported="partial",

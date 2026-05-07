@@ -1754,7 +1754,6 @@ def forward_with_gdn_capture(
         if layer_eval_enabled and (layer_idx + 1) % layer_eval_every == 0:
             mx.eval(hidden_states)
 
-    pre_norm = hidden_states
     post_norm = inner.norm(hidden_states)
     logits = inner.embed_tokens.as_linear(post_norm) if text_model.args.tie_word_embeddings else text_model.lm_head(post_norm)
     if return_hidden:

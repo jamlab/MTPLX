@@ -10,7 +10,6 @@ stubbing both ``_http_json`` and ``set_thermal_profile``.
 
 from __future__ import annotations
 
-import threading
 import time
 
 import pytest
