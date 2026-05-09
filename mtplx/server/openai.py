@@ -2634,6 +2634,21 @@ def _store_retokenized_history_snapshot(
             "reason": "model_lock_busy_before_retokenized_commit",
             "elapsed_s": time.perf_counter() - started,
         }
+    # Pass `session_bank` (and the matching identity / policy fingerprints)
+    # so the postcommit re-prefill reuses the longest matching prefix from
+    # a prior turn instead of re-prefilling the full ~18K-token history
+    # from scratch. On consecutive tool-calling turns this collapses
+    # postcommit cost from ~27 s (full re-prefill) to ~1 s (suffix forward
+    # only). The next foreground request, which the model_scheduler admits
+    # only after this idle task completes, therefore queues ~1 s instead
+    # of ~30 s behind the postcommit.
+    #
+    # The bank already contains an entry for the previous turn's history
+    # (this same function stored it on the prior postcommit). The new
+    # turn's history starts with that previous-turn prefix verbatim
+    # (chat-template encoding is deterministic for the same messages and
+    # tools), so `longest_prefix` matches and only the new user turn +
+    # assistant turn need to be forward-AR'd.
     try:
         with attention_phase("postcommit"):
             prompt_state = restore_or_prefill_prompt_state(
@@ -2641,6 +2656,10 @@ def _store_retokenized_history_snapshot(
                 history_ids,
                 mtp_hidden_variant="post_norm",
                 mtp_history_policy="committed",
+                session_bank=state.sessions.bank,
+                template_hash=state.template_hash,
+                draft_head_identity=state.draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
             )
         mtp_snapshot = (
             snapshot_cache(prompt_state.committed_mtp_cache)
@@ -2681,6 +2700,18 @@ def _store_retokenized_history_snapshot(
         "nbytes": entry.nbytes,
         "elapsed_s": time.perf_counter() - started,
         "token_hash": entry.token_hash,
+        # Observability for the prefix-reuse shortcut: lets operators tell
+        # at a glance (in the `[mtplx] idle async session postcommit ...`
+        # log line) whether a given postcommit hit the warm-prefix path or
+        # had to do a full re-prefill, and if it missed, why. Without
+        # cache_miss_reason a regression where the shortcut stops firing
+        # (e.g. policy mismatch, template mismatch, snapshot desync, or
+        # genuine prefix divergence) is invisible in production logs - all
+        # that surfaces is `elapsed_s` drifting back to ~30 s.
+        "cache_hit": bool(getattr(prompt_state, "cache_hit", False)),
+        "cached_tokens": int(getattr(prompt_state, "cached_tokens", 0) or 0),
+        "suffix_tokens": int(getattr(prompt_state, "suffix_tokens", 0) or 0),
+        "cache_miss_reason": getattr(prompt_state, "cache_miss_reason", None),
     }
 
 
