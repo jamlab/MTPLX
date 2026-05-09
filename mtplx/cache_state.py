@@ -535,6 +535,48 @@ def _load_vllm_metal_ops():
     )
 
 
+# Module-level latch so we only warn once per process when the optional
+# vllm-metal external ops can't load. Subsequent calls stay silent.
+_VLLM_METAL_OPS_UNAVAILABLE_WARNED = False
+
+
+def _warn_vllm_metal_ops_unavailable(exc: BaseException, *, context: str) -> None:
+    """Emit a single, plain-stderr warning when external ops are missing.
+
+    We deliberately avoid the ``warnings`` module here because MTPLX runs under
+    request-scoped warning filters that can swallow the message; a direct
+    ``print`` to stderr is what the operator actually sees in the server log.
+    """
+
+    global _VLLM_METAL_OPS_UNAVAILABLE_WARNED
+    if _VLLM_METAL_OPS_UNAVAILABLE_WARNED:
+        return
+    _VLLM_METAL_OPS_UNAVAILABLE_WARNED = True
+    print(
+        f"mtplx: vllm-metal external ops unavailable ({context}): {exc}; "
+        "falling back to packaged paged-attention path. Install nanobind and "
+        "build vllm_metal/paged_ops.cpp, or set MTPLX_VLLM_METAL_REPO, to "
+        "re-enable the external ops.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _load_vllm_metal_ops_optional(*, context: str):
+    """Load vllm-metal ops if available; return ``None`` (and warn once) if not.
+
+    Use this on the graceful-fallback paths where the caller has a valid
+    in-tree alternative.  Use ``_load_vllm_metal_ops`` directly only for
+    diagnostic / explicitly-required paths.
+    """
+
+    try:
+        return _load_vllm_metal_ops()
+    except RuntimeError as exc:
+        _warn_vllm_metal_ops_unavailable(exc, context=context)
+        return None
+
+
 class VllmMetalPagedKVCache:
     """Preallocated full-attention KV pages backed by vLLM-Metal primitives.
 
@@ -681,6 +723,17 @@ class VllmMetalPagedKVCache:
                 )
             return
         n_kv_heads, k_head_dim, v_head_dim = shape
+        # Defense-in-depth: if a TurboQuant cache reaches first allocation but
+        # the external vllm-metal ops can't load, gracefully degrade to the
+        # plain paged layout instead of crashing the in-flight request. The
+        # install-time path already drops turboquant_config when ops are
+        # missing, but downstream callers (e.g. snapshot restore) may still
+        # construct a TurboQuant cache without going through that gate.
+        if self.turboquant and _load_vllm_metal_ops_optional(
+            context="TurboQuant cache allocation"
+        ) is None:
+            self.turboquant = False
+            self.turboquant_config = None
         if self.turboquant:
             from .turboquant import (
                 CENTROIDS_3BIT,
@@ -770,9 +823,44 @@ class VllmMetalPagedKVCache:
             ):
                 raise RuntimeError("TurboQuant scale caches were not allocated")
             cfg = self.turboquant_config
-            ops = _load_vllm_metal_ops()
-            if not hasattr(ops, "tq_encode"):
-                raise RuntimeError("local vLLM-Metal ops do not expose tq_encode")
+            ops = _load_vllm_metal_ops_optional(context="TurboQuant tq_encode")
+            if ops is None or not hasattr(ops, "tq_encode"):
+                # Graceful fallback: external ops are missing or stripped down.
+                # Drop the TurboQuant snapshot path for this cache and reroute
+                # to the plain paged layout. The cache is still empty for this
+                # write (no prior tq_encode could have succeeded without ops),
+                # so it is safe to re-allocate.
+                if ops is not None and not hasattr(ops, "tq_encode"):
+                    _warn_vllm_metal_ops_unavailable(
+                        RuntimeError(
+                            "local vLLM-Metal ops do not expose tq_encode"
+                        ),
+                        context="TurboQuant tq_encode",
+                    )
+                self.turboquant = False
+                self.turboquant_config = None
+                self.key_cache = None
+                self.value_cache = None
+                self.key_scale_cache = None
+                self.value_scale_cache = None
+                self.key_zero_cache = None
+                self._shape = None
+                self._dtypes = None
+                self._ensure_allocated(keys, values)
+                flat_k = self.key_cache.reshape(
+                    -1, int(keys.shape[1]), int(keys.shape[3])
+                )
+                flat_v = self.value_cache.reshape(
+                    -1, int(values.shape[1]), int(values.shape[3])
+                )
+                flat_k[slot_mapping] = k_3d
+                flat_v[slot_mapping] = v_3d
+                self.key_cache = flat_k.reshape(self.key_cache.shape)
+                self.value_cache = flat_v.reshape(self.value_cache.shape)
+                self.offset += steps
+                self.update_calls += 1
+                self.cache_write_time_s += time.perf_counter() - started
+                return
             (
                 self.key_cache,
                 self.value_cache,
@@ -1522,9 +1610,14 @@ class VllmMetalPagedKVCache:
                 or self.key_zero_cache is None
             ):
                 return bailout("turboquant_unsupported")
+            tq_ops = _load_vllm_metal_ops_optional(
+                context="TurboQuant paged_attention_primitive"
+            )
+            if tq_ops is None or not hasattr(tq_ops, "paged_attention_primitive"):
+                return bailout("turboquant_unsupported")
             cfg = self.turboquant_config
             out = mx.array(0)
-            _load_vllm_metal_ops().paged_attention_primitive(
+            tq_ops.paged_attention_primitive(
                 q_3d,
                 self.key_cache,
                 self.value_cache,
@@ -1553,7 +1646,28 @@ class VllmMetalPagedKVCache:
         if partitioned_enabled and int(self.offset) >= partition_threshold:
             return run_partitioned_paged(force_fp32_paged=force_fp32_paged)
         out = mx.array(0)
-        _load_vllm_metal_ops().paged_attention_primitive(
+        # The bare vllm_metal default path needs external ops. If they aren't
+        # available (no nanobind, no JIT-built paged_ops.so, no
+        # MTPLX_VLLM_METAL_REPO), fall through to the in-tree split-sdpa
+        # fallback used by the partitioned/turboquant paths so the request
+        # does not crash mid-stream. Operators who want the optimal kernel
+        # install nanobind + run vllm_metal/metal/build.py.
+        ops = _load_vllm_metal_ops_optional(
+            context="vllm_metal default paged_attention"
+        )
+        if ops is None:
+            split_out = self._large_q_split_sdpa_fallback(
+                queries,
+                scale=scale,
+                sliding_window=int(sliding_window),
+                mask=mask,
+            )
+            if split_out is not None:
+                self.paged_attention_calls += 1
+                self.attention_time_s += time.perf_counter() - started
+                return split_out
+            return bailout("vllm_metal_ops_unavailable")
+        ops.paged_attention_primitive(
             q_3d,
             kernel_key_cache,
             kernel_value_cache,
@@ -2343,8 +2457,34 @@ def install_vllm_metal_paged_attention_kv_cache(
     # actually dispatch into the external vLLM-Metal ops. The packaged
     # mlx_vector_paged and sdpa_2pass_paged paths are in-tree and must survive a
     # clean product checkout without REFERENCES:TOOLS.
+    #
+    # When the install is for a TurboQuant snapshot but external ops can't be
+    # loaded (no nanobind, no JIT-built paged_ops.so, no MTPLX_VLLM_METAL_REPO),
+    # we MUST NOT raise: that would crash any in-flight request that triggered
+    # the install. Instead, downgrade gracefully to the plain paged-cache
+    # layout. The cache stays functional via the in-tree mlx_vector_paged /
+    # sdpa_2pass_paged kernels, just without the TurboQuant compression.
     if external_ops_required:
-        _load_vllm_metal_ops()
+        try:
+            _load_vllm_metal_ops()
+        except RuntimeError as exc:
+            if turboquant_config is not None:
+                _warn_vllm_metal_ops_unavailable(
+                    exc, context="TurboQuant install"
+                )
+                turboquant_config = None
+                stats["mode"] = "vllm_metal_paged"
+                stats["turboquant"] = 0
+                stats["external_ops_required"] = int(
+                    _paged_attention_requires_external_ops(
+                        turboquant_config=None,
+                    )
+                )
+                stats["turboquant_disabled_reason"] = "vllm_metal_ops_unavailable"
+                stats.pop("turboquant_k_quant", None)
+                stats.pop("turboquant_v_quant", None)
+            else:
+                raise
     for idx, entry in enumerate(cache or []):
         if entry is None:
             stats["skipped"] = int(stats["skipped"]) + 1
