@@ -3033,11 +3033,21 @@ def _schedule_idle_postcommit_snapshot(
                 }
             )
 
-    _submit_idle_postcommit_model_work(
+    future = _submit_idle_postcommit_model_work(
         state,
         async_postcommit,
         batch_key=f"postcommit:{session_id or 'stateless'}",
     )
+    # Stash the future on the EngineSession so the next request in this
+    # session can wait briefly for it before acquiring the session lock.
+    # The wait is bounded and best-effort: if the postcommit raises or
+    # times out the next request just falls through to a cold prefill.
+    if session is not None:
+        try:
+            session.set_pending_postcommit(future)
+        except BaseException:
+            # Telemetry plumbing must never break the request path.
+            pass
     return pending
 
 
@@ -5836,6 +5846,39 @@ def create_app(state: ServerState) -> FastAPI:
                 ),
             )
             generated["stats"]["session_postcommit_snapshot"] = postcommit
+
+        # Bounded wait for the prior turn's postcommit to land before we
+        # admit this request to the model scheduler. Done HERE - off the
+        # scheduler-owner thread, before any foreground submit and before
+        # the session lock is acquired - so a slow postcommit cannot deadlock
+        # against this request. The wait is best-effort: timeouts fall
+        # through to a cold prefill, never a hang.
+        postcommit_wait_outcome: dict[str, Any] | None = None
+        if session is not None:
+            postcommit_wait_outcome = await asyncio.to_thread(
+                session.wait_for_pending_postcommit
+            )
+            request_observability["postcommit_wait"] = postcommit_wait_outcome
+            if (
+                postcommit_wait_outcome is not None
+                and postcommit_wait_outcome.get("waited")
+                and not _server_console_enabled(state)
+            ):
+                try:
+                    print(
+                        "[mtplx] postcommit-wait "
+                        + json.dumps(
+                            {
+                                "session_id": session_id,
+                                **postcommit_wait_outcome,
+                            },
+                            sort_keys=True,
+                            default=str,
+                        ),
+                        flush=True,
+                    )
+                except BaseException:
+                    pass
 
         if request.stream:
 

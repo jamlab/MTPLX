@@ -153,6 +153,27 @@ def is_background_request(
     )
 
 
+_DEFAULT_POSTCOMMIT_WAIT_TIMEOUT_S = 10.0
+
+
+def _postcommit_wait_timeout_s() -> float:
+    """Read MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S from the environment.
+
+    Defaults to 10s. Values <= 0 disable the wait (returns 0.0). Bad values
+    fall back to the default so a typo does not leave the server hanging.
+    """
+    raw = os.environ.get("MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S")
+    if raw is None:
+        return _DEFAULT_POSTCOMMIT_WAIT_TIMEOUT_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_POSTCOMMIT_WAIT_TIMEOUT_S
+    if value < 0:
+        return 0.0
+    return value
+
+
 class EngineSession:
     def __init__(self, session_id: str, *, idle_ttl_s: float = DEFAULT_IDLE_TTL_S) -> None:
         self.session_id = str(session_id)
@@ -170,6 +191,24 @@ class EngineSession:
         self.bytes_estimate = 0
         self.revision = 0
         self._lock = Lock()
+        # Reference to the most recent postcommit work scheduled for this
+        # session. The next request in this session waits briefly on this
+        # before acquiring the session lock so the SessionBank entry is
+        # available when its prefix lookup runs - avoiding the cold-prefill
+        # cascade documented in PR #34. Always written/read while NOT holding
+        # the session lock to preserve the no-deadlock ordering. Type kept as
+        # Any to avoid pulling concurrent.futures into hot import paths.
+        self.pending_postcommit: Any = None
+        # Per-session lock guarding `pending_postcommit` reads/writes. This is
+        # SEPARATE from `_lock` (which guards `in_flight_generation`) so that
+        # `wait_for_pending_postcommit` can serialize access to the future
+        # field without ever contending with the foreground/in-flight lock,
+        # preserving the no-deadlock ordering callers rely on. The lock is
+        # only held while reading or mutating `pending_postcommit` itself,
+        # never while awaiting on the future.
+        self._postcommit_lock = Lock()
+        # Last wait outcome, exposed via to_admin_dict for the metrics endpoint.
+        self.last_postcommit_wait: dict[str, Any] | None = None
 
     @property
     def prefix_len(self) -> int:
@@ -181,6 +220,144 @@ class EngineSession:
     def is_stale(self, *, now_s: float | None = None) -> bool:
         now = time.time() if now_s is None else float(now_s)
         return now - self.last_access_s > self.idle_ttl_s
+
+    def set_pending_postcommit(self, future: Any) -> None:
+        """Record a reference to in-flight postcommit work for this session.
+
+        The next request in this session calls wait_for_pending_postcommit()
+        before acquiring the session lock so the prior turn's SessionBank
+        entry is visible at lookup time. Older references are dropped on each
+        new commit; only the most recent matters for the next turn's lookup.
+
+        The write is guarded by `_postcommit_lock` so it cannot race with a
+        concurrent `wait_for_pending_postcommit` reading the field.
+        """
+        with self._postcommit_lock:
+            self.pending_postcommit = future
+
+    def wait_for_pending_postcommit(
+        self,
+        *,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Bounded wait for the prior postcommit job to land.
+
+        Returns a small telemetry dict the caller can attach to request stats:
+            {"waited": bool, "elapsed_s": float, "outcome": str,
+             "timeout_s": float}
+
+        `outcome` is one of:
+            - "no_pending"     : nothing was scheduled, no wait performed
+            - "completed"      : the future resolved within the timeout
+            - "timeout"        : the future did not resolve in time; the
+                                 request should fall through to a cold
+                                 prefill rather than hang
+            - "error:<Type>"   : the future raised; we swallow it because the
+                                 postcommit's job is best-effort caching, not
+                                 correctness
+            - "disabled"       : timeout_s <= 0; wait short-circuits
+
+        CRITICAL: This must be called WITHOUT the session lock (`_lock`)
+        held. The postcommit work runs on the model scheduler's owner thread;
+        a foreground request that holds the session lock and then waits on
+        scheduler-bound work risks priority inversion against other
+        same-session commits queued behind it. Callers should invoke this
+        before entering `in_flight_generation()`.
+
+        Concurrency contract (the bug fix from PR #37 review):
+
+        Two concurrent same-session waiters MUST observe the SAME active
+        future and either both report "completed" (on resolve) or both
+        report "timeout" (on timeout). Neither must ever observe
+        "no_pending" while a real postcommit is still in flight.
+
+        We achieve that by capturing the current future under
+        `_postcommit_lock`, releasing the lock BEFORE awaiting on the
+        future (so other same-session waiters can observe the same future),
+        then re-acquiring the lock after the wait and clearing
+        `pending_postcommit` ONLY if it is still the same future identity
+        (`is` comparison). If a newer commit superseded the future while we
+        were waiting, the newer reference belongs to the next caller and we
+        leave it alone.
+        """
+        if timeout_s is None:
+            timeout_s = _postcommit_wait_timeout_s()
+        timeout_s = float(timeout_s)
+        # Capture the current future under the lock so a concurrent
+        # `set_pending_postcommit` cannot tear our read. The lock is released
+        # immediately - we MUST NOT hold it while awaiting on the future, and
+        # leaving it visible on the session is the whole point: a second
+        # same-session waiter must observe the same future, not "no_pending".
+        with self._postcommit_lock:
+            future = self.pending_postcommit
+        if future is None:
+            outcome = {
+                "waited": False,
+                "elapsed_s": 0.0,
+                "outcome": "no_pending",
+                "timeout_s": timeout_s,
+            }
+            self.last_postcommit_wait = outcome
+            return outcome
+        if not hasattr(future, "result"):
+            # Defensive: anything stashed on the session that does not look
+            # like a future is treated as "nothing to wait on". We do NOT
+            # clear it - the field will be overwritten on the next legitimate
+            # set_pending_postcommit call.
+            outcome = {
+                "waited": False,
+                "elapsed_s": 0.0,
+                "outcome": "no_pending",
+                "timeout_s": timeout_s,
+            }
+            self.last_postcommit_wait = outcome
+            return outcome
+        if timeout_s <= 0.0:
+            # Disabled mode: do NOT touch `pending_postcommit`. Operators
+            # toggle this dynamically via MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S; if
+            # they re-enable later we want the existing future still visible
+            # so it is not silently dropped.
+            outcome = {
+                "waited": False,
+                "elapsed_s": 0.0,
+                "outcome": "disabled",
+                "timeout_s": timeout_s,
+            }
+            self.last_postcommit_wait = outcome
+            return outcome
+        t0 = time.monotonic()
+        # We catch BaseException because any failure in the postcommit must
+        # not propagate into the foreground request: the wait is a best-effort
+        # cache warmup, not a correctness dependency. Timeout is the most
+        # common non-success outcome and is reported distinctly so operators
+        # can spot a stuck postcommit lane.
+        try:
+            future.result(timeout=timeout_s)
+            outcome = {
+                "waited": True,
+                "elapsed_s": time.monotonic() - t0,
+                "outcome": "completed",
+                "timeout_s": timeout_s,
+            }
+        except BaseException as exc:
+            label = "timeout" if type(exc).__name__ == "TimeoutError" else f"error:{type(exc).__name__}"
+            outcome = {
+                "waited": True,
+                "elapsed_s": time.monotonic() - t0,
+                "outcome": label,
+                "timeout_s": timeout_s,
+            }
+        # Clear the reference ONLY if it is still the same future we
+        # observed. A concurrent same-session commit may have superseded it
+        # while we were waiting; in that case the newer future belongs to
+        # the next caller and we must not stomp it. Identity check (`is`)
+        # is required: equality could collapse two distinct futures with
+        # the same result.
+        with self._postcommit_lock:
+            if self.pending_postcommit is future:
+                self.pending_postcommit = None
+        self.last_postcommit_wait = outcome
+        return outcome
 
     @contextmanager
     def in_flight_generation(self) -> Iterator["EngineSession"]:
@@ -267,6 +444,8 @@ class EngineSession:
             "in_flight_started_s": self.in_flight_started_s,
             "last_cache_miss_reason": self.last_cache_miss_reason,
             "last_restore_mode": self.last_restore_mode,
+            "last_postcommit_wait": self.last_postcommit_wait,
+            "pending_postcommit": bool(self.pending_postcommit is not None),
             "boundaries": [
                 {
                     "kind": boundary.kind,
