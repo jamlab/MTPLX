@@ -801,6 +801,7 @@ class ServerState:
         _startup_line(f"[5/6] Context window: {self.context_window} tokens")
         self.sessions = EngineSessionManager()
         self.last_metrics: list[dict[str, Any]] = []
+        self.tool_parse_counters = {key: 0 for key in _TOOL_PARSE_COUNTER_KEYS}
         # Activity timestamps used by the parent-process thermal watchdog to
         # decide when to drop fans back to auto after an idle period.
         self.last_request_started_at: float = 0.0
@@ -1280,10 +1281,86 @@ _TOOL_PARAMETER_BLOCK_RE = re.compile(
     r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
     re.IGNORECASE | re.DOTALL,
 )
+_MTPLX_TOOL_CONTRACT_SENTINEL = "MTPLX tool contract:"
+_TOOL_PARSE_COUNTER_KEYS = (
+    "tool_parse_success",
+    "tool_parse_fallback",
+    "unknown_tool_name",
+    "malformed_tool_call",
+    "unclosed_tool_call",
+)
 
 
 def _tool_protocol_error(message: str) -> HTTPException:
     return HTTPException(status_code=422, detail=f"malformed tool_call: {message}")
+
+
+def _tool_protocol_reason(exc: BaseException) -> str:
+    detail = getattr(exc, "detail", None)
+    text = str(detail if detail is not None else exc)
+    prefix = "malformed tool_call: "
+    if text.startswith(prefix):
+        return text[len(prefix) :]
+    return text
+
+
+def _tool_parse_counter_key(reason: str) -> str:
+    lowered = reason.lower()
+    if "unknown tool" in lowered:
+        return "unknown_tool_name"
+    if "unclosed" in lowered:
+        return "unclosed_tool_call"
+    return "malformed_tool_call"
+
+
+def _tool_parse_counters_for(state: Any) -> dict[str, int] | None:
+    if state is None:
+        return None
+    counters = getattr(state, "tool_parse_counters", None)
+    if not isinstance(counters, dict):
+        counters = {key: 0 for key in _TOOL_PARSE_COUNTER_KEYS}
+        try:
+            setattr(state, "tool_parse_counters", counters)
+        except Exception:
+            return None
+    for key in _TOOL_PARSE_COUNTER_KEYS:
+        counters.setdefault(key, 0)
+    return counters
+
+
+def _record_tool_parse_event(
+    state: Any,
+    *,
+    event: str,
+    reason: str | None = None,
+    response_id: str | None = None,
+    stream: bool | None = None,
+) -> None:
+    counters = _tool_parse_counters_for(state)
+    if counters is not None:
+        counters[event] = int(counters.get(event, 0) or 0) + 1
+        if event in {"unknown_tool_name", "malformed_tool_call", "unclosed_tool_call"}:
+            counters["tool_parse_fallback"] = (
+                int(counters.get("tool_parse_fallback", 0) or 0) + 1
+            )
+    if event == "tool_parse_success" or _server_console_enabled(state):
+        return
+    try:
+        print(
+            json.dumps(
+                {
+                    "event": "mtplx_tool_parse_fallback",
+                    "response_id": response_id,
+                    "stream": bool(stream),
+                    "reason": reason,
+                    "kind": event,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    except BaseException:
+        pass
 
 
 def _tool_spec_name(tool: dict[str, Any]) -> str | None:
@@ -1296,6 +1373,43 @@ def _tool_spec_name(tool: dict[str, Any]) -> str | None:
         return None
     text = str(name).strip()
     return text or None
+
+
+def _tool_names(tools: list[dict[str, Any]] | None) -> list[str]:
+    return [name for tool in (tools or []) if (name := _tool_spec_name(tool))]
+
+
+def _mtplx_tool_contract_text(tools: list[dict[str, Any]]) -> str:
+    names = _tool_names(tools)
+    allowed = ", ".join(names) if names else "(none)"
+    example = names[0] if names else "tool_name"
+    return (
+        f"{_MTPLX_TOOL_CONTRACT_SENTINEL} use only declared tools: {allowed}. "
+        "For a tool call emit exactly "
+        f'<tool_call>{{"name":"{example}","arguments":{{...}}}}</tool_call>. '
+        "Never invent tool names or emit undeclared Agent/task/Explore tools. "
+        "If no declared tool applies, answer normally."
+    )
+
+
+def _with_mtplx_tool_contract(
+    normalized: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    if not tools:
+        return normalized
+    contract = _mtplx_tool_contract_text(tools)
+    if not normalized:
+        return [{"role": "system", "content": contract}]
+    messages = [dict(item) for item in normalized]
+    first = messages[0]
+    if first.get("role") == "system":
+        content = str(first.get("content") or "")
+        if _MTPLX_TOOL_CONTRACT_SENTINEL not in content:
+            first["content"] = f"{content.rstrip()}\n\n{contract}".strip()
+        return messages
+    return [{"role": "system", "content": contract}, *messages]
 
 
 def _normalize_tool_specs(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -1492,6 +1606,36 @@ def _parse_generated_tool_calls(
     return calls
 
 
+def _parse_generated_tool_calls_or_content(
+    text: str,
+    *,
+    tools: list[dict[str, Any]],
+    state: Any | None = None,
+    response_id: str | None = None,
+    stream: bool = False,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    try:
+        tool_calls = _parse_generated_tool_calls(text, tools=tools)
+    except HTTPException as exc:
+        reason = _tool_protocol_reason(exc)
+        _record_tool_parse_event(
+            state,
+            event=_tool_parse_counter_key(reason),
+            reason=reason,
+            response_id=response_id,
+            stream=stream,
+        )
+        return None, reason
+    if tool_calls:
+        _record_tool_parse_event(
+            state,
+            event="tool_parse_success",
+            response_id=response_id,
+            stream=stream,
+        )
+    return tool_calls, None
+
+
 def _stream_tool_call_deltas(
     tool_calls: list[dict[str, Any]],
     *,
@@ -1544,6 +1688,7 @@ class _ToolAwareContentStreamTranslator:
         self._trailing = ""
         self._mode = "passthrough" if not tools else "undecided"
         self.tool_calls: list[dict[str, Any]] | None = None
+        self.fallback_reason: str | None = None
 
     @property
     def has_tool_calls(self) -> bool:
@@ -1641,7 +1786,11 @@ class _ToolAwareContentStreamTranslator:
             return self._tool_deltas_if_complete(final=True)
         if self._mode == "done":
             if self._trailing.strip():
-                raise _tool_protocol_error("text after tool_call block")
+                self.fallback_reason = "text after tool_call block"
+                trailing = self._trailing
+                self._trailing = ""
+                self._mode = "content"
+                return [{"content": trailing}]
             return []
         if self._pending:
             content = self._pending
@@ -1653,7 +1802,14 @@ class _ToolAwareContentStreamTranslator:
     def _tool_deltas_if_complete(self, *, final: bool) -> list[dict[str, Any]]:
         if not final:
             return []
-        tool_calls = _parse_generated_tool_calls(self._pending, tools=self._tools)
+        try:
+            tool_calls = _parse_generated_tool_calls(self._pending, tools=self._tools)
+        except HTTPException as exc:
+            self.fallback_reason = _tool_protocol_reason(exc)
+            content = self._pending
+            self._pending = ""
+            self._mode = "content"
+            return [{"content": content}]
         if not tool_calls:
             if final:
                 content = self._pending
@@ -1790,6 +1946,7 @@ def _encode_messages(
             normalized.append(item)
     if not normalized:
         normalized = [{"role": "user", "content": ""}]
+    normalized = _with_mtplx_tool_contract(normalized, tools=tools)
     template_kwargs: dict[str, Any] = {
         "tokenize": True,
         "add_generation_prompt": add_generation_prompt,
@@ -1852,6 +2009,7 @@ def _render_messages_for_postcommit(
     enable_thinking: bool,
     tools: list[dict[str, Any]] | None,
 ) -> str | None:
+    normalized = _with_mtplx_tool_contract(normalized, tools=tools)
     template_kwargs: dict[str, Any] = {
         "tokenize": False,
         "add_generation_prompt": False,
@@ -2396,6 +2554,10 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "reasoning_reentries",
     "reasoning_tokens",
     "answer_tokens",
+    "tool_parse_success",
+    "tool_parse_fallback",
+    "tool_parse_fallback_reason",
+    "tool_parse_fallback_kind",
 )
 PUBLIC_POSTCOMMIT_KEYS = (
     "stored",
@@ -5619,6 +5781,9 @@ def create_app(state: ServerState) -> FastAPI:
         return {
             "latest": state.last_metrics[-1] if state.last_metrics else None,
             "recent": state.last_metrics[-32:],
+            "tool_parse_counters": dict(
+                getattr(state, "tool_parse_counters", {}) or {}
+            ),
         }
 
     @app.get("/admin/sessions")
@@ -6391,7 +6556,32 @@ def create_app(state: ServerState) -> FastAPI:
                                 yield mark_sse_sent(chunk)
                             assistant_tool_calls = tool_stream.tool_calls
                             if assistant_tool_calls:
+                                _record_tool_parse_event(
+                                    state,
+                                    event="tool_parse_success",
+                                    response_id=response_id,
+                                    stream=True,
+                                )
+                                generated["stats"]["tool_parse_success"] = True
                                 generated["finish_reason"] = "tool_calls"
+                            elif tool_stream.fallback_reason:
+                                fallback_kind = _tool_parse_counter_key(
+                                    tool_stream.fallback_reason
+                                )
+                                _record_tool_parse_event(
+                                    state,
+                                    event=fallback_kind,
+                                    reason=tool_stream.fallback_reason,
+                                    response_id=response_id,
+                                    stream=True,
+                                )
+                                generated["stats"]["tool_parse_fallback"] = True
+                                generated["stats"]["tool_parse_fallback_reason"] = (
+                                    tool_stream.fallback_reason
+                                )
+                                generated["stats"]["tool_parse_fallback_kind"] = (
+                                    fallback_kind
+                                )
                             if session is not None:
                                 assistant_history_content = streamed_history_content()
                                 commit_state["assistant_history_content"] = (
@@ -6542,13 +6732,20 @@ def create_app(state: ServerState) -> FastAPI:
             )
         except EngineSessionBusy as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        tool_calls = (
-            _parse_generated_tool_calls(str(generated["text"]), tools=tool_specs)
-            if tools_active
-            else None
-        )
+        tool_fallback_reason: str | None = None
+        if tools_active:
+            tool_calls, tool_fallback_reason = _parse_generated_tool_calls_or_content(
+                str(generated["text"]),
+                tools=tool_specs,
+                state=state,
+                response_id=response_id,
+                stream=False,
+            )
+        else:
+            tool_calls = None
         if tool_calls:
             generated["finish_reason"] = "tool_calls"
+            generated["stats"]["tool_parse_success"] = True
             await store_postcommit_snapshot(
                 generated,
                 assistant_content="",
@@ -6566,6 +6763,11 @@ def create_app(state: ServerState) -> FastAPI:
                 generated,
                 thinking_enabled=thinking_enabled,
             )
+            if tool_fallback_reason:
+                fallback_kind = _tool_parse_counter_key(tool_fallback_reason)
+                generated["stats"]["tool_parse_fallback"] = True
+                generated["stats"]["tool_parse_fallback_reason"] = tool_fallback_reason
+                generated["stats"]["tool_parse_fallback_kind"] = fallback_kind
             await store_postcommit_snapshot(
                 generated,
                 assistant_content=display_text,

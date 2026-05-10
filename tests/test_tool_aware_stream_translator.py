@@ -160,3 +160,25 @@ def test_leading_whitespace_before_marker_still_dropped():
     finish_deltas = t.finish()
     assert t.has_tool_calls is True
     assert any("tool_calls" in d for d in finish_deltas)
+
+
+def test_unknown_tool_name_falls_back_to_content():
+    t = _make()
+    text = (
+        "<tool_call>\n<function=Agent>\n"
+        "<parameter=description>\nList files\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    assert t.feed("content", text) == []
+    assert t.finish() == [{"content": text}]
+    assert t.has_tool_calls is False
+    assert t.fallback_reason == "unknown tool 'Agent'"
+
+
+def test_unclosed_tool_call_falls_back_to_content():
+    t = _make()
+    text = "<tool_call>\n<function=lookup>\n"
+    assert t.feed("content", text) == []
+    assert t.finish() == [{"content": text}]
+    assert t.has_tool_calls is False
+    assert t.fallback_reason == "unclosed <tool_call> block"

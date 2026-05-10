@@ -811,7 +811,10 @@ def test_chat_tools_are_passed_to_qwen_template_and_disable_default_thinking(
     )
 
     assert response.status_code == 200
-    _messages, kwargs = state.runtime.tokenizer.calls[0]
+    messages, kwargs = state.runtime.tokenizer.calls[0]
+    assert messages[0]["role"] == "system"
+    assert "MTPLX tool contract:" in messages[0]["content"]
+    assert "session_status" in messages[0]["content"]
     assert kwargs["tools"] == [_tool_schema()]
     assert kwargs["enable_thinking"] is False
 
@@ -1179,8 +1182,10 @@ def test_chat_stream_emits_heartbeat_during_alive_silence(monkeypatch):
     assert "data: [DONE]" in response.text
 
 
-def test_chat_tools_malformed_tool_call_returns_422(monkeypatch):
-    client = TestClient(create_app(_fake_state()))
+def test_chat_tools_malformed_tool_call_falls_back_to_content(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
     monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
     monkeypatch.setattr(
         openai,
@@ -1199,8 +1204,132 @@ def test_chat_tools_malformed_tool_call_returns_422(monkeypatch):
         },
     )
 
-    assert response.status_code == 422
-    assert response.json()["detail"].startswith("malformed tool_call")
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == "<tool_call>not json</tool_call>"
+    assert "tool_calls" not in choice["message"]
+    stats = response.json()["mtplx_stats"]
+    assert stats["tool_parse_fallback"] is True
+    assert stats["tool_parse_fallback_kind"] == "malformed_tool_call"
+    assert state.tool_parse_counters["malformed_tool_call"] == 1
+    assert state.tool_parse_counters["tool_parse_fallback"] == 1
+
+
+def test_chat_tools_unknown_generated_tool_falls_back_to_content(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    text = (
+        "<tool_call>\n<function=Agent>\n"
+        "<parameter=description>\nList files\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: _fake_generation(text),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Status."}],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "max_tokens": 16,
+        },
+    )
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == text
+    assert "tool_calls" not in choice["message"]
+    stats = response.json()["mtplx_stats"]
+    assert stats["tool_parse_fallback"] is True
+    assert stats["tool_parse_fallback_kind"] == "unknown_tool_name"
+    assert "unknown tool 'Agent'" in stats["tool_parse_fallback_reason"]
+
+
+def test_chat_stream_unknown_generated_tool_falls_back_to_content(monkeypatch):
+    state = _fake_state()
+    state.args.stream_interval = 1
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    text = (
+        "<tool_call>\n<function=task>\n"
+        "<parameter=description>\nList files\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(text))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Status."}],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 16,
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(response.text)
+    streamed_content = "".join(
+        payload["choices"][0]["delta"].get("content", "") for payload in payloads
+    )
+    assert streamed_content == text
+    assert not any(
+        payload["choices"][0]["delta"].get("tool_calls") for payload in payloads
+    )
+    final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
+    assert final[-1]["choices"][0]["finish_reason"] == "stop"
+    stats = final[-1]["mtplx_stats"]
+    assert stats["tool_parse_fallback"] is True
+    assert stats["tool_parse_fallback_kind"] == "unknown_tool_name"
+    assert "data: [DONE]" in response.text
+
+
+def test_chat_stream_unclosed_tool_call_falls_back_and_finishes(monkeypatch):
+    state = _fake_state()
+    state.args.stream_interval = 1
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    text = "<tool_call>\n<function=session_status>\n"
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(text))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Status."}],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 16,
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(response.text)
+    streamed_content = "".join(
+        payload["choices"][0]["delta"].get("content", "") for payload in payloads
+    )
+    assert streamed_content == text
+    assert not any(
+        payload["choices"][0]["delta"].get("tool_calls") for payload in payloads
+    )
+    final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
+    assert final[-1]["choices"][0]["finish_reason"] == "stop"
+    assert final[-1]["mtplx_stats"]["tool_parse_fallback_kind"] == "unclosed_tool_call"
+    assert "data: [DONE]" in response.text
 
 
 def test_server_state_emits_startup_progress(monkeypatch, capsys):
