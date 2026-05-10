@@ -3036,16 +3036,22 @@ _PROFILE_SHORT_SUMMARIES = {
 }
 
 
-def _runtime_mode_display(profile_name: str, *, max_mode: bool = False) -> str:
+def _runtime_mode_display(
+    profile_name: str,
+    *,
+    max_mode: bool = False,
+    generation_mode: str | None = None,
+) -> str:
+    mode = "AR" if str(generation_mode or "").lower() == GENERATION_MODE_AR else "MTP"
     if profile_name == "sustained" and max_mode:
-        return "Sustained Max MTP"
+        return f"Sustained Max {mode}"
     if profile_name == "sustained":
-        return "Sustained MTP"
+        return f"Sustained {mode}"
     if profile_name == "performance-cold" and max_mode:
-        return "Burst MTP"
+        return f"Burst {mode}"
     if profile_name == "performance-cold":
-        return "Performance-cold MTP"
-    return str(profile_name)
+        return f"Performance-cold {mode}"
+    return f"{profile_name} {mode}"
 
 
 def _print_serve_start_banner(args: Any) -> None:
@@ -3056,7 +3062,12 @@ def _print_serve_start_banner(args: Any) -> None:
     port = int(getattr(args, "port", 8000))
     profile_name = getattr(args, "profile", None) or DEFAULT_PROFILE_NAME
     warmup_tokens = int(getattr(args, "warmup_tokens", 16) or 0)
-    mode_label = _runtime_mode_display(profile_name, max_mode=bool(getattr(args, "max", False)))
+    generation_mode = _generation_mode_from_args(args)
+    mode_label = _runtime_mode_display(
+        profile_name,
+        max_mode=bool(getattr(args, "max", False)),
+        generation_mode=generation_mode,
+    )
     model_label = getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID
     runtime_model = getattr(args, "model", DEFAULT_RUNTIME_MODEL_DIR)
     api_url = f"{_server_url(host, port)}/v1"
@@ -4805,7 +4816,11 @@ def _quickstart_run_terminal_chat_body(args: Any, *, runtime_model: str, inspect
                 "AR target-only"
                 if generation_mode == GENERATION_MODE_AR
                 else
-                _runtime_mode_display(profile.name, max_mode=bool(getattr(args, "max", False)))
+                _runtime_mode_display(
+                    profile.name,
+                    max_mode=bool(getattr(args, "max", False)),
+                    generation_mode=generation_mode,
+                )
             ),
             extra_lines=[
                 ("Sampler", (
@@ -5138,6 +5153,7 @@ def cmd_quickstart_public(args: Any) -> int:
                 + _runtime_mode_display(
                     str(payload["profile"]),
                     max_mode=bool(payload["max"]),
+                    generation_mode=str(payload["generation_mode"]),
                 )
             )
             _quickstart_line(f"generation: {_generation_mode_label(payload['generation_mode'])}")

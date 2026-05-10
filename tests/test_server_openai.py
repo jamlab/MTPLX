@@ -626,8 +626,68 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
     assert "already in flight" not in second.text
 
 
-def test_streaming_ar_keeps_retokenized_postcommit_path(monkeypatch):
+def test_streaming_ar_schedules_async_postcommit_in_default_mode(monkeypatch):
     state = _fake_streaming_session_state()
+    scheduled: list[dict] = []
+
+    def fail_retokenized(*_args, **_kwargs):
+        raise AssertionError("AR streaming must not retokenize inline by default")
+
+    def fake_schedule(*_args, **kwargs):
+        scheduled.append(kwargs)
+        return {
+            "stored": False,
+            "mode": "async_pending",
+            "reason": kwargs["unsafe_reason"],
+        }
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        token_callback = kwargs.get("token_callback")
+        tokens = [ord("A"), ord("R")]
+        if token_callback is not None:
+            token_callback(tokens)
+        return {
+            "text": "AR",
+            "tokens": tokens,
+            "stats": {
+                "generation_mode": "ar",
+                "mtp_depth": 0,
+                "completion_tokens": 2,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 2,
+            "finish_reason": "stop",
+            "_final_state": None,
+        }
+
+    monkeypatch.setattr(openai, "_store_retokenized_history_snapshot", fail_retokenized)
+    monkeypatch.setattr(openai, "_schedule_idle_postcommit_snapshot", fake_schedule)
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-session-id": "ar-session"},
+            json={
+                "messages": [{"role": "user", "content": "Say AR"}],
+                "enable_thinking": False,
+                "generation_mode": "ar",
+                "stream": True,
+                "max_tokens": 4,
+            },
+        )
+
+    assert response.status_code == 200
+    assert scheduled
+    assert scheduled[0]["unsafe_reason"] == "missing_generation_final_state"
+    assert '"mode": "async_pending"' in response.text
+    assert '"reason": "missing_generation_final_state"' in response.text
+    assert '"generation_mode": "ar"' in response.text
+
+
+def test_streaming_ar_honors_explicit_inline_postcommit_mode(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.args.session_postcommit_mode = "inline"
     retokenized_calls: list[dict] = []
 
     def fake_retokenized(*_args, **kwargs):
@@ -664,7 +724,7 @@ def test_streaming_ar_keeps_retokenized_postcommit_path(monkeypatch):
     with TestClient(create_app(state)) as client:
         response = client.post(
             "/v1/chat/completions",
-            headers={"x-mtplx-session-id": "ar-session"},
+            headers={"x-mtplx-session-id": "ar-inline-session"},
             json={
                 "messages": [{"role": "user", "content": "Say AR"}],
                 "enable_thinking": False,

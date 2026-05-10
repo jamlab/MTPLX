@@ -32,6 +32,22 @@ def test_version_command_without_subcommand(capsys):
     assert f"mtplx {DISPLAY_VERSION} ({__version__})" in captured
 
 
+def test_runtime_mode_display_respects_ar_mode():
+    assert public._runtime_mode_display("sustained") == "Sustained MTP"
+    assert (
+        public._runtime_mode_display("sustained", generation_mode="ar")
+        == "Sustained AR"
+    )
+    assert (
+        public._runtime_mode_display(
+            "sustained",
+            max_mode=True,
+            generation_mode="ar",
+        )
+        == "Sustained Max AR"
+    )
+
+
 def test_empty_cli_shows_friendly_consumer_help(capsys):
     code = main([])
 

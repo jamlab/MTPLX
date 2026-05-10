@@ -688,10 +688,11 @@ class ServerState:
         self.rate_limiter = _RateLimiter(args.rate_limit)
         self.metal_memory_caps = _apply_metal_memory_caps()
         self.profile = get_profile(args.profile)
-        runtime_label = {
-            "performance-cold": "Burst MTP",
-            "sustained": "Sustained MTP",
-        }.get(self.profile.name, self.profile.name)
+        runtime_label = _health_runtime_mode_label(
+            self.profile.name,
+            getattr(args, "generation_mode", None),
+            fan_boost_active=bool(getattr(args, "max", False)),
+        )
         _startup_line(f"[4/6] Preparing {runtime_label} runtime")
         if args.generation_mode == "mtp" and not args.load_mtp:
             raise ValueError("--generation-mode mtp requires --load-mtp")
@@ -6592,7 +6593,6 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 commit_state["retokenize_inline"] = (
                                     state.args.session_postcommit_mode == "inline"
-                                    or request_generation_mode == "ar"
                                 )
                                 commit_state["commit"] = True
                                 commit_event.set()
