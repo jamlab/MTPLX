@@ -34,6 +34,7 @@ from mtplx.default_models import (
     select_default_model,
 )
 from mtplx.profiles import DEFAULT_HF_MODEL_ID
+from mtplx.server_urls import bind_label, is_wildcard_bind, local_url_for_bind
 
 DEFAULT_HF_MODEL = DEFAULT_HF_MODEL_ID
 STATE_PATH = Path("~/.mtplx/quickstart.json").expanduser()
@@ -1120,8 +1121,12 @@ def screen_server_surface(
     """Return whether the server flow should open the browser chat."""
 
     raw_host = str(host or "").strip()
-    display_host = "127.0.0.1" if raw_host in {"", "0.0.0.0", "::"} else raw_host
-    base = f"http://{display_host}:{int(port)}"
+    base = local_url_for_bind(raw_host, int(port))
+    surface = (
+        f"{bind_label(raw_host, int(port))} · local {base}"
+        if is_wildcard_bind(raw_host)
+        else base
+    )
     _step_panel(
         step=3,
         total=3,
@@ -1129,12 +1134,12 @@ def screen_server_surface(
         options=[
             (
                 "1",
-                f"API server only [{base}/v1]",
+                f"API server only [{surface}/v1]",
                 "Starts the OpenAI-compatible endpoint and leaves this terminal attached to the server logs.",
             ),
             (
                 "2",
-                f"Open browser chat too [{base}/]",
+                f"Open browser chat too [{surface}/]",
                 "Starts the same server and opens the local MTPLX chat UI after startup.",
             ),
         ],

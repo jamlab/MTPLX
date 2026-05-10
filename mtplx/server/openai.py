@@ -57,6 +57,7 @@ from mtplx.profiles import (
     profile_env_status,
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
+from mtplx.server_urls import bind_label, is_wildcard_bind, local_url_for_bind
 
 try:
     from mtplx.generation import (
@@ -390,10 +391,17 @@ def _startup_line(text: str = "") -> None:
 
 
 def _startup_server_url(args: argparse.Namespace) -> str:
-    host = str(getattr(args, "host", "127.0.0.1"))
-    if host.strip() in {"", "0.0.0.0", "::"}:
-        host = "127.0.0.1"
-    return f"http://{host}:{int(getattr(args, 'port', 8000))}"
+    return local_url_for_bind(
+        str(getattr(args, "host", "127.0.0.1")),
+        int(getattr(args, "port", 8000)),
+    )
+
+
+def _startup_bind_label(args: argparse.Namespace) -> str:
+    return bind_label(
+        str(getattr(args, "host", "127.0.0.1")),
+        int(getattr(args, "port", 8000)),
+    )
 
 
 def _startup_openai_base_url(args: argparse.Namespace) -> str:
@@ -7001,10 +7009,18 @@ def main(argv: list[str] | None = None) -> None:
 
     _startup_line()
     _startup_line("MTPLX is ready.")
-    _startup_line("Chat UI: " + _startup_chat_url(args))
-    _startup_line("OpenAI API Base URL: " + _startup_openai_base_url(args))
+    if is_wildcard_bind(getattr(args, "host", None)):
+        _startup_line("Listening: " + _startup_bind_label(args))
+        _startup_line("Local Chat UI: " + _startup_chat_url(args))
+        _startup_line("Local OpenAI API Base URL: " + _startup_openai_base_url(args))
+    else:
+        _startup_line("Chat UI: " + _startup_chat_url(args))
+        _startup_line("OpenAI API Base URL: " + _startup_openai_base_url(args))
     _startup_line("Model: " + str(args.model_id))
-    _startup_line("API key: leave blank for localhost")
+    if getattr(args, "api_key", None):
+        _startup_line("API key: required")
+    else:
+        _startup_line("API key: leave blank for localhost")
     _startup_line("Health check: " + _startup_server_url(args) + "/health")
     _startup_line("Keep this terminal open. Press Ctrl-C to stop MTPLX.")
     if args.server_console:

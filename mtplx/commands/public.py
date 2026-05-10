@@ -68,6 +68,12 @@ from mtplx.profiles import (
     apply_profile_env,
     get_profile,
 )
+from mtplx.server_urls import (
+    bind_label,
+    connect_host_for_bind,
+    is_wildcard_bind,
+    local_url_for_bind,
+)
 
 
 DEFAULT_CHAMPION = "models/Qwen3.6-27B-MTPLX-Optimized-Speed"
@@ -2898,8 +2904,7 @@ def cmd_max_public(args: Any) -> int:
 
 
 def _server_url(host: str, port: int) -> str:
-    display_host = "127.0.0.1" if str(host).strip() in {"", "0.0.0.0", "::"} else str(host)
-    return f"http://{display_host}:{int(port)}"
+    return local_url_for_bind(host, int(port))
 
 
 def _chat_url(host: str, port: int) -> str:
@@ -2959,10 +2964,7 @@ def _open_browser_url(url: str) -> None:
 
 
 def _connect_host_for_bind(host: str) -> str:
-    normalized = str(host or "").strip().lower().strip("[]")
-    if normalized in {"", "0.0.0.0", "::", "localhost"}:
-        return "127.0.0.1"
-    return str(host)
+    return connect_host_for_bind(host)
 
 
 def _port_is_busy(host: str, port: int) -> bool:
@@ -3063,6 +3065,7 @@ def _print_serve_start_banner(args: Any) -> None:
     api_note = "API key required" if api_key else "API key: leave blank for localhost"
 
     extra_lines: list[tuple[str, str]] = [
+        ("Listening", bind_label(host, port)),
         ("Loading", str(runtime_model)),
         ("Warmup", f"{warmup_tokens} tokens"),
         ("Auth", api_note),
@@ -3082,7 +3085,18 @@ def _print_serve_start_banner(args: Any) -> None:
 
 
 def _print_serve_handoff(args: Any, runtime_model: str, profile_name: str) -> None:
-    _print_serve_start_line(f"[1/6] Server config ready: {_server_url(args.host, int(args.port))}/v1")
+    if is_wildcard_bind(getattr(args, "host", None)):
+        _print_serve_start_line(
+            "[1/6] Server config ready: listening on "
+            f"{bind_label(args.host, int(args.port))}"
+        )
+        _print_serve_start_line(
+            f"      Local API Base URL: {_server_url(args.host, int(args.port))}/v1"
+        )
+    else:
+        _print_serve_start_line(
+            f"[1/6] Server config ready: {_server_url(args.host, int(args.port))}/v1"
+        )
     _print_serve_start_line(f"[2/6] Model resolved: {runtime_model}")
     _print_serve_start_line("[3/6] Runtime contract verified")
     _print_serve_start_line("      Loading the model can take about a minute on first start.")

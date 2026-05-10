@@ -1860,6 +1860,71 @@ def test_serve_dispatches_packaged_openai_server(monkeypatch, capsys):
     assert "--strict-warmup" in calls["cmd"]
 
 
+def test_serve_wildcard_host_displays_bind_and_forwards_host(monkeypatch, capsys):
+    calls = {}
+
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda model, cache_dir=None: (model, None),
+    )
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda model, unsafe_force_unverified=False, yes=False: (
+            {"compatibility": {"tier": "verified", "can_run": True, "exit_code": 0}},
+            None,
+        ),
+    )
+    monkeypatch.setattr(public, "_port_is_busy", lambda host, port: False)
+
+    def fake_execvpe(executable, cmd, env):
+        calls["cmd"] = cmd
+        raise SystemExit(0)
+
+    monkeypatch.setattr(public.os, "execvpe", fake_execvpe)
+    args = SimpleNamespace(
+        model="models/example",
+        cache_dir=None,
+        profile="sustained",
+        unsafe_force_unverified=False,
+        yes=True,
+        host="0.0.0.0",
+        port=8000,
+        depth=3,
+        api_key="test-key",
+        rate_limit=0,
+        stream_interval=1,
+        max_response_tokens=None,
+        temperature=0.6,
+        top_p=0.95,
+        reasoning=None,
+        reasoning_parser="qwen3",
+        stats_footer=False,
+        warmup_tokens=0,
+        strict_warmup=False,
+        strict_fast_path=False,
+        max=False,
+        open_browser=False,
+        stock_ar=False,
+        _cli_flags={"model", "host", "api_key"},
+    )
+
+    try:
+        public.cmd_serve_public(args)
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    captured = capsys.readouterr().out
+    assert "Listening  0.0.0.0:8000 (all interfaces)" in captured
+    assert (
+        "[1/6] Server config ready: listening on 0.0.0.0:8000 (all interfaces)"
+        in captured
+    )
+    assert "Local API Base URL: http://127.0.0.1:8000/v1" in captured
+    assert calls["cmd"][calls["cmd"].index("--host") + 1] == "0.0.0.0"
+
+
 def test_serve_uses_quality_public_model_id_for_quality_local_path(monkeypatch):
     calls = {}
     quality_path = "/tmp/Qwen3.6-27B-MTPLX-Optimized-Quality"

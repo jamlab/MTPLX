@@ -42,6 +42,14 @@ def test_runtime_mode_label_distinguishes_sustained_max_and_burst():
     )
 
 
+def test_startup_urls_distinguish_wildcard_bind_from_local_url():
+    args = SimpleNamespace(host="0.0.0.0", port=8000)
+
+    assert openai._startup_bind_label(args) == "0.0.0.0:8000 (all interfaces)"
+    assert openai._startup_server_url(args) == "http://127.0.0.1:8000"
+    assert openai._startup_openai_base_url(args) == "http://127.0.0.1:8000/v1"
+
+
 class FakeExecutor:
     def submit(self, fn, *args, **kwargs):
         future: Future = Future()
