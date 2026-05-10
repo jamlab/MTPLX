@@ -22,6 +22,14 @@ PROFILE_CHOICES = (
     "exact",
     "max-diagnostic",
 )
+PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
+    {
+        "MTPLX_MTP_HISTORY_POLICY",
+        "MTPLX_VLLM_METAL_PAGED_TURBOQUANT",
+        "MTPLX_VLLM_METAL_PAGED_TURBOQUANT_K_QUANT",
+        "MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT",
+    }
+)
 
 DEFAULT_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
 DEFAULT_FP16_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16"
@@ -396,6 +404,8 @@ def apply_profile_env(
     profile = get_profile(name)
     previous = {key: target.get(key) for key in profile.env_dict()}
     for key, value in profile.env:
+        if key in PROFILE_ENV_USER_OVERRIDE_KEYS and str(target.get(key) or "").strip():
+            continue
         target[key] = value
     return previous
 
@@ -424,7 +434,12 @@ def profile_env_status(
         key: {
             "expected": expected,
             "observed": target.get(key),
-            "ok": target.get(key) == expected,
+            "override_allowed": key in PROFILE_ENV_USER_OVERRIDE_KEYS,
+            "ok": target.get(key) == expected
+            or (
+                key in PROFILE_ENV_USER_OVERRIDE_KEYS
+                and bool(str(target.get(key) or "").strip())
+            ),
         }
         for key, expected in profile.env
     }

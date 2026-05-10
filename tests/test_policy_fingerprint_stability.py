@@ -181,3 +181,20 @@ def test_resolve_mtp_history_policy_does_flip_at_default_threshold(monkeypatch):
     # And the policy compat helper says these are interchangeable, which is
     # the load-bearing invariant for the SessionBank cliff fix.
     assert _mtp_history_policy_compatible(just_under, just_over) is True
+
+
+def test_resolve_mtp_history_policy_env_override_applies_to_auto(monkeypatch):
+    monkeypatch.setenv("MTPLX_MTP_HISTORY_POLICY", "committed")
+
+    from mtplx.generation import _resolve_mtp_history_policy
+
+    assert _resolve_mtp_history_policy("auto", 32_768) == "committed"
+
+
+def test_resolve_mtp_history_policy_explicit_non_default_wins(monkeypatch):
+    monkeypatch.setenv("MTPLX_MTP_HISTORY_POLICY", "committed")
+
+    from mtplx.generation import _resolve_mtp_history_policy
+
+    assert _resolve_mtp_history_policy("last_window", 1) == "last_window"
+    assert _resolve_mtp_history_policy("cycle", 32_768) == "cycle"

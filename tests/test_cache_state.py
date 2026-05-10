@@ -732,6 +732,30 @@ def test_long_context_dense_fallback_guard_accepts_new_override(monkeypatch):
     assert paged.state[0] is not None
 
 
+def test_sustained_product_flag_does_not_forbid_dense_fallback(monkeypatch):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD", "4")
+    monkeypatch.delenv("MTPLX_ASSERT_NO_PAGED_ACTIVE_ARRAYS", raising=False)
+    paged = VllmMetalPagedKVCache(block_size=4, num_blocks=4)
+    keys = mx.zeros((1, 2, 4, 3), dtype=mx.float32)
+    values = mx.zeros((1, 2, 4, 3), dtype=mx.float32)
+    paged.update_without_fetch(keys, values)
+
+    assert paged.long_context_dense_fallback_forbidden() is False
+
+
+def test_paged_active_array_assertion_still_forbids_dense_fallback(monkeypatch):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_ASSERT_NO_PAGED_ACTIVE_ARRAYS", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD", "4")
+    paged = VllmMetalPagedKVCache(block_size=4, num_blocks=4)
+    keys = mx.zeros((1, 2, 4, 3), dtype=mx.float32)
+    values = mx.zeros((1, 2, 4, 3), dtype=mx.float32)
+    paged.update_without_fetch(keys, values)
+
+    assert paged.long_context_dense_fallback_forbidden() is True
+
+
 def test_configure_vllm_metal_paged_cache_mlx_vector_is_packaged(monkeypatch):
     from mlx_lm.models.cache import KVCache
 

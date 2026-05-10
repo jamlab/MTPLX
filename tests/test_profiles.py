@@ -50,6 +50,37 @@ def test_apply_and_restore_profile_env() -> None:
     assert environ == {}
 
 
+def test_apply_profile_env_preserves_mtp_history_policy_override() -> None:
+    environ = {"MTPLX_MTP_HISTORY_POLICY": "committed"}
+
+    previous = apply_profile_env("sustained", environ=environ)
+
+    assert previous["MTPLX_MTP_HISTORY_POLICY"] == "committed"
+    assert environ["MTPLX_MTP_HISTORY_POLICY"] == "committed"
+    assert profile_env_status("sustained", environ=environ)["MTPLX_MTP_HISTORY_POLICY"][
+        "ok"
+    ] is True
+
+    restore_profile_env(previous, environ=environ)
+    assert environ["MTPLX_MTP_HISTORY_POLICY"] == "committed"
+
+
+def test_apply_profile_env_preserves_turboquant_overrides() -> None:
+    environ = {
+        "MTPLX_VLLM_METAL_PAGED_TURBOQUANT": "1",
+        "MTPLX_VLLM_METAL_PAGED_TURBOQUANT_K_QUANT": "q8_0",
+        "MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT": "q3_0",
+    }
+
+    apply_profile_env("sustained", environ=environ)
+
+    assert environ["MTPLX_VLLM_METAL_PAGED_TURBOQUANT"] == "1"
+    assert environ["MTPLX_VLLM_METAL_PAGED_TURBOQUANT_K_QUANT"] == "q8_0"
+    assert environ["MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT"] == "q3_0"
+    status = profile_env_status("sustained", environ=environ)
+    assert status["MTPLX_VLLM_METAL_PAGED_TURBOQUANT"]["ok"] is True
+
+
 def test_list_profiles_includes_all_public_modes() -> None:
     names = [profile["name"] for profile in list_profiles()]
 
