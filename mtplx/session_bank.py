@@ -21,6 +21,7 @@ from .cache_state import CacheSnapshot, _clone_tree, restore_cache, snapshot_cac
 from .runtime import MTPLXRuntime
 
 GIB = 1024**3
+DEFAULT_MAX_ENTRIES = 8
 DEFAULT_MAX_BYTES = 24 * GIB
 DEFAULT_PER_SESSION_MAX_BYTES = 8 * GIB
 DEFAULT_IDLE_TTL_S = 60 * 60
@@ -142,7 +143,7 @@ class SessionBank:
     def __init__(
         self,
         *,
-        max_entries: int = 8,
+        max_entries: int = DEFAULT_MAX_ENTRIES,
         max_bytes: int = DEFAULT_MAX_BYTES,
         per_session_max_bytes: int = DEFAULT_PER_SESSION_MAX_BYTES,
         idle_ttl_s: float = DEFAULT_IDLE_TTL_S,
