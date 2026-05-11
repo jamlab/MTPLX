@@ -495,6 +495,23 @@ def _add_reasoning_arg(parser: argparse.ArgumentParser, *, default: str | None =
     )
 
 
+def _add_preserve_thinking_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--preserve-thinking",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help=(
+            "Preserve prior assistant reasoning in Qwen chat-template history. "
+            "Default auto preserves it for reasoning-capable templates; off is a speed/debug mode."
+        ),
+    )
+    parser.add_argument(
+        "--strip-assistant-reasoning-history",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+
+
 def _add_mtp_toggle_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--mtp",
@@ -1652,6 +1669,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mtp_toggle_args(start_flow_p)
     start_flow_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(start_flow_p)
+    _add_preserve_thinking_arg(start_flow_p)
     start_flow_p.add_argument("--no-stats", action="store_false", dest="show_stats", default=True, help="Hide speed stats after responses")
     start_flow_p.add_argument("--host", default="127.0.0.1", help="Open WebUI server host for `mtplx start openwebui`")
     start_flow_p.add_argument("--port", type=int, default=8000, help="Server port for `mtplx start`; OpenCode examples use 18083 to avoid browser-chat collisions")
@@ -1748,6 +1766,7 @@ def build_parser() -> argparse.ArgumentParser:
     quickstart_server_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
     quickstart_server_p.add_argument("--host", default="127.0.0.1")
     quickstart_server_p.add_argument("--port", type=int, default=8000)
+    quickstart_server_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID, help="Served OpenAI model id; defaults to the loaded artifact identity")
     quickstart_server_p.add_argument("--depth", type=int, default=3)
     _add_mtp_toggle_args(quickstart_server_p)
     quickstart_server_p.add_argument(
@@ -1762,6 +1781,7 @@ def build_parser() -> argparse.ArgumentParser:
     quickstart_server_p.add_argument("--default-top-p", dest="top_p", type=float, default=0.95)
     _add_reasoning_arg(quickstart_server_p)
     quickstart_server_p.add_argument("--reasoning-parser", choices=["qwen3", "none"], default="qwen3")
+    _add_preserve_thinking_arg(quickstart_server_p)
     quickstart_server_p.add_argument(
         "--stats-footer",
         action="store_true",
@@ -2024,6 +2044,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--default-top-p", dest="top_p", type=float, default=0.95)
     _add_reasoning_arg(serve_p)
     serve_p.add_argument("--reasoning-parser", choices=["qwen3", "none"], default="qwen3")
+    _add_preserve_thinking_arg(serve_p)
+    serve_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID, help="Served OpenAI model id; defaults to the loaded artifact identity")
     serve_p.add_argument(
         "--no-stats-footer",
         action="store_false",

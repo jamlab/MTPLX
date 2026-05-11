@@ -28,6 +28,7 @@ from mtplx.server.openai import (
     _policy_fingerprint,
     _public_mtplx_stats,
     _raise_if_stream_cancelled,
+    _render_messages_for_postcommit,
     _repair_streamed_generation_stats,
     _request_is_authorized,
     _schedule_idle_postcommit_snapshot,
@@ -63,6 +64,27 @@ class ChatTemplateTokenizer(TinyTokenizer):
 
 def _ids(text: str) -> list[int]:
     return [ord(ch) for ch in text]
+
+
+def test_parse_args_preserve_thinking_defaults_to_safe_auto():
+    args = parse_args(["--model", "dummy"])
+
+    assert args.preserve_thinking == "auto"
+    assert args.strip_assistant_reasoning_history is False
+
+
+def test_parse_args_preserve_thinking_off_strips_assistant_reasoning_history():
+    args = parse_args(["--model", "dummy", "--preserve-thinking", "off"])
+
+    assert args.preserve_thinking == "off"
+    assert args.strip_assistant_reasoning_history is True
+
+
+def test_parse_args_strip_assistant_reasoning_history_alias_sets_preserve_off():
+    args = parse_args(["--model", "dummy", "--strip-assistant-reasoning-history"])
+
+    assert args.preserve_thinking == "off"
+    assert args.strip_assistant_reasoning_history is True
 
 
 class RecordingBank:
@@ -720,6 +742,20 @@ def test_encode_messages_can_strip_assistant_reasoning_context_when_requested():
     )
 
     assert tokenizer.normalized == [{"role": "assistant", "content": "Visible answer."}]
+    assert tokenizer.kwargs["preserve_thinking"] is False
+
+
+def test_postcommit_render_uses_same_preserve_thinking_policy():
+    tokenizer = RecordingTokenizer()
+
+    _render_messages_for_postcommit(
+        tokenizer,
+        [{"role": "assistant", "content": "<think>old</think>\nVisible."}],
+        enable_thinking=True,
+        preserve_thinking=False,
+        tools=None,
+    )
+
     assert tokenizer.kwargs["preserve_thinking"] is False
 
 

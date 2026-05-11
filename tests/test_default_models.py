@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from mtplx.default_models import (
@@ -7,11 +9,19 @@ from mtplx.default_models import (
     QUALITY_MODEL_ENV,
     is_verified_default_model_ref,
     optimized_quality_model_ref,
+    public_model_id_for_ref,
     select_default_model,
 )
 from mtplx import hardware as hardware_module
 from mtplx.hardware import classify_apple_silicon_generation, detect_apple_silicon
-from mtplx.profiles import DEFAULT_FP16_HF_MODEL_ID, DEFAULT_HF_MODEL_ID
+from mtplx.profiles import (
+    DEFAULT_FP16_HF_MODEL_ID,
+    DEFAULT_FP16_PUBLIC_MODEL_ID,
+    DEFAULT_HF_MODEL_ID,
+    DEFAULT_PUBLIC_MODEL_ID,
+    LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    QUALITY_PUBLIC_MODEL_ID,
+)
 
 
 @pytest.mark.parametrize(
@@ -157,3 +167,46 @@ def test_optimized_quality_prefers_complete_local_env_model(tmp_path, monkeypatc
     monkeypatch.setenv(QUALITY_MODEL_ENV, str(local_quality))
 
     assert optimized_quality_model_ref() == str(local_quality)
+
+
+@pytest.mark.parametrize(
+    ("model_ref", "expected"),
+    [
+        (
+            "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+            DEFAULT_PUBLIC_MODEL_ID,
+        ),
+        (
+            "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
+            DEFAULT_FP16_PUBLIC_MODEL_ID,
+        ),
+        (
+            "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized-Quality",
+            QUALITY_PUBLIC_MODEL_ID,
+        ),
+        (
+            "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized",
+            LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+        ),
+    ],
+)
+def test_public_model_id_for_ref_maps_known_local_names(model_ref, expected):
+    assert public_model_id_for_ref(model_ref) == expected
+
+
+def test_public_model_id_for_ref_uses_runtime_metadata_before_folder_name(tmp_path):
+    model = tmp_path / "whatever-local-folder"
+    model.mkdir()
+    (model / "mtplx_runtime.json").write_text(
+        json.dumps({"artifact_role": "optimized-quality"}),
+        encoding="utf-8",
+    )
+
+    assert public_model_id_for_ref(model) == QUALITY_PUBLIC_MODEL_ID
+
+
+def test_public_model_id_for_ref_maps_unknown_local_name_to_sanitized_id():
+    assert (
+        public_model_id_for_ref("/tmp/My Custom Local Model!")
+        == "my-custom-local-model"
+    )

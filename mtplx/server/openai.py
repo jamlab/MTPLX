@@ -2109,6 +2109,7 @@ def _render_messages_for_postcommit(
     normalized: list[dict[str, Any]],
     *,
     enable_thinking: bool,
+    preserve_thinking: bool,
     tools: list[dict[str, Any]] | None,
 ) -> str | None:
     normalized = _with_mtplx_tool_contract(normalized, tools=tools)
@@ -2116,7 +2117,7 @@ def _render_messages_for_postcommit(
         "tokenize": False,
         "add_generation_prompt": False,
         "enable_thinking": enable_thinking,
-        "preserve_thinking": True,
+        "preserve_thinking": preserve_thinking,
     }
     if tools:
         template_kwargs["tools"] = tools
@@ -2225,6 +2226,7 @@ def _postcommit_next_turn_prefix_ids(
         tokenizer,
         normalized,
         enable_thinking=enable_thinking,
+        preserve_thinking=not strip_assistant_reasoning_history,
         tools=tools,
     )
     if not rendered:
@@ -5487,6 +5489,19 @@ def _normalize_reasoning_mode(value: Any, *, default: str = "auto") -> str:
     return mode
 
 
+def _normalize_preserve_thinking_policy(value: Any, *, default: str = "auto") -> str:
+    mode = str(value or default).strip().lower()
+    if mode not in {"auto", "on", "off"}:
+        raise ValueError("preserve_thinking must be one of: auto, on, off")
+    return mode
+
+
+def _preserve_thinking_effective(args: argparse.Namespace) -> bool:
+    return _normalize_preserve_thinking_policy(
+        getattr(args, "preserve_thinking", "auto")
+    ) in {"auto", "on"}
+
+
 def _set_server_reasoning_mode(state: ServerState, mode: str) -> None:
     normalized = _normalize_reasoning_mode(mode)
     state.args.reasoning = normalized
@@ -5504,6 +5519,8 @@ def _server_settings_payload(state: ServerState) -> dict[str, Any]:
         "ok": True,
         "reasoning": reasoning,
         "enable_thinking": bool(getattr(state.args, "enable_thinking", True)),
+        "preserve_thinking": getattr(state.args, "preserve_thinking", "auto"),
+        "preserve_thinking_effective": _preserve_thinking_effective(state.args),
         "reasoning_parser": state.args.reasoning_parser,
         "generation_mode": state.args.generation_mode,
         "depth": state.args.depth,
@@ -5748,6 +5765,11 @@ def create_app(state: ServerState) -> FastAPI:
             "reasoning": getattr(state.args, "reasoning", None)
             or ("on" if bool(state.args.enable_thinking) else "off"),
             "enable_thinking": state.args.enable_thinking,
+            "preserve_thinking": getattr(state.args, "preserve_thinking", "auto"),
+            "preserve_thinking_effective": _preserve_thinking_effective(state.args),
+            "strip_assistant_reasoning_history": bool(
+                state.args.strip_assistant_reasoning_history
+            ),
             "context_window": state.context_window,
             "max_response_tokens": state.args.max_response_tokens,
             "api_key_required": bool(state.args.api_key),
@@ -7248,11 +7270,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Parser for streamed reasoning tags. Use 'none' to stream all text as content.",
     )
     parser.add_argument(
+        "--preserve-thinking",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help=(
+            "Preserve prior assistant <think>/reasoning blocks in chat-template "
+            "history. Default auto preserves them for Qwen reasoning templates."
+        ),
+    )
+    parser.add_argument(
         "--strip-assistant-reasoning-history",
         action="store_true",
         help=(
-            "Opt-in speed/debug mode: remove prior assistant <think>/reasoning blocks "
-            "before re-encoding chat history. Default preserves reasoning context."
+            "Backward-compatible alias for --preserve-thinking off."
         ),
     )
     parser.add_argument(
@@ -7374,6 +7404,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.enable_thinking = False
     elif args.reasoning == "on":
         args.enable_thinking = True
+    args.preserve_thinking = _normalize_preserve_thinking_policy(
+        "off" if args.strip_assistant_reasoning_history else args.preserve_thinking
+    )
+    args.strip_assistant_reasoning_history = not _preserve_thinking_effective(args)
     return args
 
 
@@ -7407,6 +7441,11 @@ def main(argv: list[str] | None = None) -> None:
         _startup_line("Chat UI: " + _startup_chat_url(args))
         _startup_line("OpenAI API Base URL: " + _startup_openai_base_url(args))
     _startup_line("Model: " + str(args.model_id))
+    _startup_line(
+        "Reasoning history: "
+        + ("preserve" if _preserve_thinking_effective(args) else "strip")
+        + f" (policy {getattr(args, 'preserve_thinking', 'auto')})"
+    )
     if getattr(args, "api_key", None):
         _startup_line("API key: required")
     else:

@@ -10,7 +10,12 @@ import pytest
 
 from mtplx.cli import build_parser, main
 from mtplx.commands import public
-from mtplx.profiles import DEFAULT_FP16_HF_MODEL_ID, QUALITY_PUBLIC_MODEL_ID
+from mtplx.profiles import (
+    DEFAULT_FP16_HF_MODEL_ID,
+    DEFAULT_PUBLIC_MODEL_ID,
+    LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    QUALITY_PUBLIC_MODEL_ID,
+)
 from mtplx.version import DISPLAY_VERSION, __version__
 
 
@@ -369,6 +374,25 @@ def test_quality_model_ref_uses_quality_public_model_id():
     )
 
     assert value == QUALITY_PUBLIC_MODEL_ID
+
+
+def test_legacy_optimized_model_ref_uses_neutral_public_model_id():
+    value = public._public_model_id_for_ref(
+        "/tmp/Qwen3.6-27B-MTPLX-Optimized",
+        default_model_id=DEFAULT_PUBLIC_MODEL_ID,
+    )
+
+    assert value == LEGACY_OPTIMIZED_PUBLIC_MODEL_ID
+
+
+def test_explicit_model_id_wins_over_loaded_artifact_identity():
+    args = SimpleNamespace(
+        model="/tmp/Qwen3.6-27B-MTPLX-Optimized-Quality",
+        model_id="custom-served-id",
+        _cli_flags={"model-id"},
+    )
+
+    assert public._public_model_id_for_args(args, args.model) == "custom-served-id"
 
 
 def test_start_default_target_is_browser(monkeypatch, tmp_path):
@@ -1067,8 +1091,8 @@ def test_quickstart_pi_dry_run_json(monkeypatch, tmp_path, capsys):
     assert payload["target"] == "pi"
     assert payload["terminal_chat"] is False
     assert payload["pi"]["base_url"] == "http://127.0.0.1:18012/v1"
-    assert payload["pi"]["model_ref"] == "mtplx/mtplx-qwen36-27b-optimized-speed"
-    assert payload["pi"]["launch_command"] == "pi --model mtplx/mtplx-qwen36-27b-optimized-speed"
+    assert payload["pi"]["model_ref"] == "mtplx/example"
+    assert payload["pi"]["launch_command"] == "pi --model mtplx/example"
     assert payload["pi"]["provider"]["api"] == "openai-completions"
     assert payload["pi"]["provider"]["authHeader"] is True
     assert payload["pi"]["provider"]["compat"]["supportsDeveloperRole"] is False
@@ -1935,7 +1959,7 @@ def test_serve_dispatches_packaged_openai_server(monkeypatch, capsys):
     assert calls["cmd"][calls["cmd"].index("--rate-limit") + 1] == "120"
     assert calls["cmd"][calls["cmd"].index("--stream-interval") + 1] == "4"
     assert calls["cmd"][calls["cmd"].index("--max-response-tokens") + 1] == "512"
-    assert calls["cmd"][calls["cmd"].index("--model-id") + 1] == "mtplx-qwen36-27b-optimized-speed"
+    assert calls["cmd"][calls["cmd"].index("--model-id") + 1] == "example"
     assert calls["cmd"][calls["cmd"].index("--generation-mode") + 1] == "mtp"
     assert "--no-enable-thinking" in calls["cmd"]
     assert "--no-stats-footer" in calls["cmd"]
@@ -2062,6 +2086,67 @@ def test_serve_uses_quality_public_model_id_for_quality_local_path(monkeypatch):
 
     assert exc.value.code == 0
     assert calls["cmd"][calls["cmd"].index("--model-id") + 1] == QUALITY_PUBLIC_MODEL_ID
+
+
+def test_serve_uses_legacy_public_model_id_for_legacy_optimized_local_path(monkeypatch):
+    calls = {}
+    legacy_path = "/tmp/Qwen3.6-27B-MTPLX-Optimized"
+
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda model, cache_dir=None: (model, None),
+    )
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda model, unsafe_force_unverified=False, yes=False: (
+            {"compatibility": {"tier": "verified", "can_run": True, "exit_code": 0}},
+            None,
+        ),
+    )
+    monkeypatch.setattr(public, "_port_is_busy", lambda host, port: False)
+
+    def fake_execvpe(_executable, cmd, _env):
+        calls["cmd"] = cmd
+        raise SystemExit(0)
+
+    monkeypatch.setattr(public.os, "execvpe", fake_execvpe)
+    args = SimpleNamespace(
+        model=legacy_path,
+        model_id=DEFAULT_PUBLIC_MODEL_ID,
+        cache_dir=None,
+        profile="sustained",
+        unsafe_force_unverified=False,
+        yes=True,
+        host="127.0.0.1",
+        port=8000,
+        depth=3,
+        no_mtp=False,
+        api_key=None,
+        rate_limit=0,
+        stream_interval=1,
+        max_response_tokens=None,
+        temperature=0.6,
+        top_p=0.95,
+        reasoning="off",
+        preserve_thinking="auto",
+        reasoning_parser="qwen3",
+        stats_footer=False,
+        warmup_tokens=0,
+        strict_warmup=False,
+        strict_fast_path=False,
+        max=False,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        public.cmd_serve_public(args)
+
+    assert exc.value.code == 0
+    assert (
+        calls["cmd"][calls["cmd"].index("--model-id") + 1]
+        == LEGACY_OPTIMIZED_PUBLIC_MODEL_ID
+    )
 
 
 def test_serve_uses_model_contract_depth_when_depth_not_explicit(monkeypatch):
@@ -2286,7 +2371,7 @@ def test_quickstart_pi_passes_launch_command_to_server(monkeypatch):
     assert "--launch-pi" in calls["cmd"]
     assert "--server-console" in calls["cmd"]
     command = calls["cmd"][calls["cmd"].index("--pi-launch-command") + 1]
-    assert command == "pi --model mtplx/mtplx-qwen36-27b-optimized-speed"
+    assert command == "pi --model mtplx/example"
 
 
 def test_launch_pi_in_terminal_does_not_false_positive_on_server_command(monkeypatch):

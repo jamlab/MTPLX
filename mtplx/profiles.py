@@ -37,7 +37,9 @@ QUALITY_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality"
 QUALITY_MODEL_ID = QUALITY_HF_MODEL_ID
 DEFAULT_MODEL_ID = DEFAULT_HF_MODEL_ID
 DEFAULT_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized-speed"
+DEFAULT_FP16_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized-speed-fp16"
 QUALITY_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized-quality"
+LEGACY_OPTIMIZED_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized"
 NATIVE_MTP_60_MLX_FORK_COMMIT = "2377a99f"
 NATIVE_MTP_60_MLX_FORK_FRAGMENT = "mlx-mtplx-0.31.2-qmm"
 

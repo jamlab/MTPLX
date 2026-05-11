@@ -32,9 +32,9 @@ from mtplx.benchmarks.validators.basic import (
 from mtplx.constants import DEFAULT_RUNTIME_MODEL_DIR
 from mtplx.default_models import (
     OPTIMIZED_QUALITY_DESCRIPTION,
-    is_optimized_quality_model_ref,
     is_verified_default_model_ref,
     optimized_quality_model_ref,
+    public_model_id_for_ref,
     select_default_model,
 )
 from mtplx.env import collect_environment
@@ -591,6 +591,14 @@ def _reasoning_mode(args: Any, *, default: str = "on") -> str:
     if mode not in {"auto", "on", "off"}:
         return default
     return mode
+
+
+def _preserve_thinking_policy(args: Any) -> str:
+    if bool(getattr(args, "strip_assistant_reasoning_history", False)):
+        return "off"
+    raw = getattr(args, "preserve_thinking", None)
+    mode = str(raw or "auto").strip().lower()
+    return mode if mode in {"auto", "on", "off"} else "auto"
 
 
 def _enable_thinking_for_reasoning(mode: str) -> bool | None:
@@ -3262,12 +3270,10 @@ def cmd_serve_public(args: Any) -> int:
     depth_error = _validate_public_depth(args, printer=_print_serve_start_line)
     if depth_error is not None:
         return depth_error
-    early_model_id = getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID
-    if early_model_id == DEFAULT_PUBLIC_MODEL_ID:
-        args.model_id = _public_model_id_for_ref(
-            str(getattr(args, "model", "")),
-            default_model_id=early_model_id,
-        )
+    args.model_id = _public_model_id_for_args(
+        args,
+        str(getattr(args, "model", "")),
+    )
     _print_serve_start_banner(args)
     if _port_is_busy(str(getattr(args, "host", "127.0.0.1")), int(getattr(args, "port", 8000))):
         if bool(getattr(args, "quickstart_pi", False)):
@@ -3414,9 +3420,7 @@ def cmd_serve_public(args: Any) -> int:
                 _print_serve_start_line("     (without --strict-fast-path, MTPLX starts in stock-MLX compatibility)")
                 return 2
             relax_mlx_fork_assert = True
-    model_id = getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID
-    if model_id == DEFAULT_PUBLIC_MODEL_ID:
-        model_id = _public_model_id_for_ref(str(runtime_model), default_model_id=model_id)
+    model_id = _public_model_id_for_args(args, str(runtime_model))
     args.model_id = model_id
     _print_serve_handoff(args, runtime_model, profile.name)
     cmd = [
@@ -3437,6 +3441,8 @@ def cmd_serve_public(args: Any) -> int:
         profile.name,
         "--reasoning-mode",
         _reasoning_mode(args, default="auto"),
+        "--preserve-thinking",
+        _preserve_thinking_policy(args),
         "--verify-strategy",
         "capture_commit",
         "--verify-core",
@@ -4579,20 +4585,24 @@ def _quickstart_generate(
 
 
 def _public_model_id_for_ref(model_ref: str, *, default_model_id: str) -> str:
-    if is_optimized_quality_model_ref(model_ref):
-        return QUALITY_PUBLIC_MODEL_ID
-    return default_model_id
+    return public_model_id_for_ref(model_ref, default_model_id=default_model_id)
+
+
+def _public_model_id_for_args(args: Any, model_ref: str | None) -> str:
+    model_id = str(getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID)
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if "model-id" in cli_flags or model_id != DEFAULT_PUBLIC_MODEL_ID:
+        return model_id
+    return _public_model_id_for_ref(
+        str(model_ref or ""),
+        default_model_id=DEFAULT_PUBLIC_MODEL_ID,
+    )
 
 
 def _quickstart_openwebui_payload(args: Any) -> dict[str, Any]:
     host = str(getattr(args, "host", "127.0.0.1"))
     port = int(getattr(args, "port", 8000))
-    model_id = str(getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID)
-    if model_id == DEFAULT_PUBLIC_MODEL_ID:
-        model_id = _public_model_id_for_ref(
-            str(getattr(args, "model", "")),
-            default_model_id=model_id,
-        )
+    model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
     base = f"http://{_connect_host_for_bind(host)}:{port}"
     profile = str(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     return {
@@ -4631,12 +4641,7 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
 
     host = str(getattr(args, "host", "127.0.0.1"))
     port = int(getattr(args, "port", 8000))
-    model_id = str(getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID)
-    if model_id == DEFAULT_PUBLIC_MODEL_ID:
-        model_id = _public_model_id_for_ref(
-            str(getattr(args, "model", "")),
-            default_model_id=model_id,
-        )
+    model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
     base_url = f"http://{_connect_host_for_bind(host)}:{port}/v1"
     api_key = str(getattr(args, "api_key", None) or PI_LOCAL_API_KEY)
     provider = build_pi_provider_config(
@@ -4727,12 +4732,7 @@ def _quickstart_opencode_payload(
 
     host = str(getattr(args, "host", "127.0.0.1"))
     port = int(getattr(args, "port", 8000))
-    model_id = str(getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID)
-    if model_id == DEFAULT_PUBLIC_MODEL_ID:
-        model_id = _public_model_id_for_ref(
-            str(getattr(args, "model", "")),
-            default_model_id=model_id,
-        )
+    model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
     base_url = f"http://{_connect_host_for_bind(host)}:{port}/v1"
     context_window = _inspection_context_window(inspection)
     provider_fragment = build_opencode_provider_config(
@@ -4951,6 +4951,7 @@ def _quickstart_run_openwebui(args: Any, *, runtime_model: str, inspection: dict
         temperature=float(getattr(args, "temperature", 0.6)),
         top_p=float(getattr(args, "top_p", 0.95)),
         reasoning=getattr(args, "reasoning", None),
+        preserve_thinking=_preserve_thinking_policy(args),
         reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),
@@ -4989,6 +4990,7 @@ def _quickstart_run_pi(args: Any, *, runtime_model: str, inspection: dict[str, A
         temperature=float(getattr(args, "temperature", 0.6)),
         top_p=float(getattr(args, "top_p", 0.95)),
         reasoning=getattr(args, "reasoning", None),
+        preserve_thinking=_preserve_thinking_policy(args),
         reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),
@@ -5034,6 +5036,7 @@ def _quickstart_run_opencode(args: Any, *, runtime_model: str, inspection: dict[
         temperature=float(getattr(args, "temperature", 0.6)),
         top_p=float(getattr(args, "top_p", 0.95)),
         reasoning="on",
+        preserve_thinking=_preserve_thinking_policy(args),
         reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),

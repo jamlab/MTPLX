@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -10,10 +12,14 @@ from typing import Any, Mapping
 from mtplx.constants import DEFAULT_RUNTIME_MODEL_DIR
 from mtplx.hardware import classify_apple_silicon_generation, detect_apple_silicon
 from mtplx.profiles import (
+    DEFAULT_FP16_PUBLIC_MODEL_ID,
     DEFAULT_FP16_HF_MODEL_ID,
     DEFAULT_HF_MODEL_ID,
     DEFAULT_MODEL_ID,
+    DEFAULT_PUBLIC_MODEL_ID,
+    LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
     QUALITY_HF_MODEL_ID,
+    QUALITY_PUBLIC_MODEL_ID,
 )
 
 
@@ -114,6 +120,112 @@ def is_optimized_quality_model_ref(model: str | Path | None) -> bool:
     if text == QUALITY_HF_MODEL_ID:
         return True
     return "qwen3.6-27b-mtplx-optimized-quality" in text.lower()
+
+
+def _read_json(path: Path) -> Mapping[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _artifact_role_model_id(role: str) -> str | None:
+    normalized = role.strip().lower().replace("_", "-")
+    if not normalized:
+        return None
+    if "quality" in normalized:
+        return QUALITY_PUBLIC_MODEL_ID
+    if "fp16" in normalized or "float16" in normalized:
+        return DEFAULT_FP16_PUBLIC_MODEL_ID
+    if "speed" in normalized or "flat4" in normalized or "maximum-speed" in normalized:
+        return DEFAULT_PUBLIC_MODEL_ID
+    return None
+
+
+def _public_model_id_from_metadata(path: Path) -> str | None:
+    runtime = _read_json(path / "mtplx_runtime.json")
+    for key in ("public_model_id", "served_model_id", "model_id"):
+        value = runtime.get(key)
+        if isinstance(value, str) and value.strip():
+            return _sanitize_public_model_id(value)
+    precision = runtime.get("precision_variant")
+    if isinstance(precision, str) and precision.strip().lower() in {"fp16", "float16"}:
+        return DEFAULT_FP16_PUBLIC_MODEL_ID
+    role = runtime.get("artifact_role")
+    if isinstance(role, str):
+        inferred = _artifact_role_model_id(role)
+        if inferred:
+            return inferred
+
+    config = _read_json(path / "config.json")
+    quantization = config.get("quantization") or config.get("quantization_config")
+    if isinstance(quantization, dict):
+        text = json.dumps(quantization, sort_keys=True).lower()
+        if "bits\": 8" in text and "language_model" in text:
+            return QUALITY_PUBLIC_MODEL_ID
+        bits = quantization.get("bits")
+        if bits == 4:
+            return DEFAULT_PUBLIC_MODEL_ID
+    return None
+
+
+def _sanitize_public_model_id(value: str) -> str:
+    lowered = str(value).strip().lower()
+    lowered = lowered.replace("_", "-")
+    lowered = re.sub(r"[^a-z0-9.-]+", "-", lowered)
+    lowered = re.sub(r"-{2,}", "-", lowered).strip("-.")
+    return lowered or DEFAULT_PUBLIC_MODEL_ID
+
+
+def _public_model_id_from_name(value: str) -> str | None:
+    text = value.strip()
+    if not text:
+        return None
+    lowered = text.replace("\\", "/").lower()
+    if "qwen3.6-27b-mtplx-optimized-quality" in lowered:
+        return QUALITY_PUBLIC_MODEL_ID
+    if "qwen3.6-27b-mtplx-optimized-speed-fp16" in lowered:
+        return DEFAULT_FP16_PUBLIC_MODEL_ID
+    if "qwen3.6-27b-mtplx-optimized-speed" in lowered:
+        return DEFAULT_PUBLIC_MODEL_ID
+    legacy_names = {
+        "qwen3.6-27b-mtplx-optimized",
+        "youssofal--qwen3.6-27b-mtplx-optimized",
+    }
+    basename = Path(text).name.lower()
+    if basename in legacy_names or lowered.endswith("/qwen3.6-27b-mtplx-optimized"):
+        return LEGACY_OPTIMIZED_PUBLIC_MODEL_ID
+    return None
+
+
+def public_model_id_for_ref(
+    model: str | Path | None,
+    *,
+    default_model_id: str = DEFAULT_PUBLIC_MODEL_ID,
+) -> str:
+    """Return the served OpenAI model id for the selected artifact.
+
+    The default public id is only used when no model was provided. Once a
+    concrete repo/path exists, MTPLX should report that artifact instead of
+    silently claiming the speed default.
+    """
+
+    if model is None:
+        return default_model_id
+    text = str(model).strip()
+    if not text:
+        return default_model_id
+    path = Path(text).expanduser()
+    if path.is_dir():
+        inferred = _public_model_id_from_metadata(path)
+        if inferred:
+            return inferred
+    inferred = _public_model_id_from_name(text)
+    if inferred:
+        return inferred
+    basename = Path(text).name or text.split("/")[-1]
+    return _sanitize_public_model_id(basename)
 
 
 def _normalize_variant(value: str | None) -> tuple[str, str | None]:
