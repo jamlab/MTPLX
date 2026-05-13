@@ -1419,6 +1419,56 @@ def test_chat_stream_tool_calls_emit_delta_tool_calls(monkeypatch):
     assert "<tool_call>" not in response.text
 
 
+def test_chat_stream_consecutive_qwen_xml_tool_calls_emit_ordered_deltas(monkeypatch):
+    client = TestClient(create_app(_fake_state()))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    generated = (
+        "<tool_call>\n<function=write>\n<parameter=filePath>\n"
+        "one.py\n</parameter>\n<parameter=content>\nprint(1)\n</parameter>\n"
+        "</function>\n</tool_call>\n\n"
+        "<tool_call>\n<function=write>\n<parameter=filePath>\n"
+        "two.py\n</parameter>\n<parameter=content>\nprint(2)\n</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=write>\n<parameter=filePath>\n"
+        "three.py\n</parameter>\n<parameter=content>\nprint(3)\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(generated))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Write files."}],
+            "tools": [_write_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 256,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "<tool_call" not in response.text
+    assert "_call>" not in response.text
+    assert "<function=" not in response.text
+    payloads = _stream_payloads(response.text)
+    tool_deltas = [
+        item
+        for payload in payloads
+        for item in payload["choices"][0]["delta"].get("tool_calls", [])
+    ]
+    name_deltas = [
+        item
+        for item in tool_deltas
+        if item.get("function", {}).get("name") == "write"
+    ]
+    assert [item["index"] for item in name_deltas] == [0, 1, 2]
+    assert any(
+        payload["choices"][0].get("finish_reason") == "tool_calls"
+        for payload in payloads
+    )
+
+
 def test_chat_stream_tool_call_preamble_is_stored_for_postcommit(monkeypatch):
     state = _fake_streaming_session_state()
     state.args.stream_interval = 1

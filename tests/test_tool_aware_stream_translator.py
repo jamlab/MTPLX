@@ -24,6 +24,40 @@ WRITE_FILE_TOOL_SPECS = [
         },
     }
 ]
+MIXED_TOOL_SPECS = [
+    {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
+    {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}},
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "contents": {"type": "string"},
+                },
+                "required": ["path", "contents"],
+            },
+        },
+    },
+]
+OPENCODE_WRITE_TOOL_SPECS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "write",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["filePath", "content"],
+            },
+        },
+    }
+]
 
 
 def _make(*, tools=TOOL_SPECS):
@@ -39,6 +73,31 @@ def _argument_text(deltas):
         for delta in deltas
         for item in delta.get("tool_calls", [])
     )
+
+
+def _feed_in_chunks(translator, text, chunks):
+    deltas = []
+    offset = 0
+    for size in chunks:
+        if offset >= len(text):
+            break
+        deltas.extend(translator.feed("content", text[offset : offset + size]))
+        offset += size
+    if offset < len(text):
+        deltas.extend(translator.feed("content", text[offset:]))
+    deltas.extend(translator.finish())
+    return deltas
+
+
+def _content_text(deltas):
+    return "".join(delta.get("content", "") for delta in deltas)
+
+
+def _assert_no_tool_markup_leaked(content):
+    assert "<tool_call" not in content
+    assert "_call>" not in content
+    assert "<function=" not in content
+    assert "</think>" not in content
 
 
 # ---------- existing behaviour (regression coverage) ----------
@@ -281,6 +340,121 @@ def test_consecutive_qwen_xml_tool_call_close_split_does_not_leak_tail():
     assert "<tool_call" not in content
     assert t.tool_calls is not None
     assert len(t.tool_calls) == 2
+
+
+def test_qwen_xml_three_tool_calls_streamed_5char_chunks_no_leak():
+    """Regression for Daniel's in-the-wild hippo-code/OpenAI stream shape.
+
+    v0.3.3 parsed the first Qwen XML tool call and leaked the following two as
+    visible content when the stream arrived in tiny chunks. Keep this exact
+    same-name, blank-line-separated, 5-character stream shape locked down.
+    """
+    t = _make()
+    text = (
+        "<tool_call>\n<function=lookup>\n<parameter=q>\n"
+        "src/scene\n</parameter>\n</function>\n</tool_call>\n\n"
+        "<tool_call>\n<function=lookup>\n<parameter=q>\n"
+        "src/entities\n</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=lookup>\n<parameter=q>\n"
+        "src/systems\n</parameter>\n</function>\n</tool_call>"
+    )
+    out = _feed_in_chunks(t, text, [5] * ((len(text) // 5) + 1))
+
+    content = _content_text(out)
+    _assert_no_tool_markup_leaked(content)
+    assert t.tool_calls is not None
+    assert len(t.tool_calls) == 3
+    args = [json.loads(call["function"]["arguments"]) for call in t.tool_calls]
+    assert args == [
+        {"q": "src/scene"},
+        {"q": "src/entities"},
+        {"q": "src/systems"},
+    ]
+    indices = [
+        item.get("index")
+        for delta in out
+        for item in delta.get("tool_calls", [])
+        if item.get("function", {}).get("name") == "lookup"
+    ]
+    assert indices == [0, 1, 2]
+
+
+def test_qwen_xml_mixed_tool_calls_uneven_chunks_no_leak():
+    """Mixed tool names should remain ordered when chunks cut across tags."""
+    t = _make(tools=MIXED_TOOL_SPECS)
+    text = (
+        "<tool_call>\n<function=lookup>\n<parameter=q>\n"
+        "entities\n</parameter>\n</function>\n</tool_call>\n\n"
+        "<tool_call>\n<function=read_file>\n<parameter=path>\n"
+        "src/game.ts\n</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=write_file>\n<parameter=path>\n"
+        "src/out.ts\n</parameter>\n<parameter=contents>\n"
+        "export const ok = true;\n</parameter>\n</function>\n</tool_call>"
+    )
+    out = _feed_in_chunks(t, text, [1, 9, 2, 17, 4, 31, 3, 8, 5, 21])
+
+    content = _content_text(out)
+    _assert_no_tool_markup_leaked(content)
+    assert t.tool_calls is not None
+    assert [call["function"]["name"] for call in t.tool_calls] == [
+        "lookup",
+        "read_file",
+        "write_file",
+    ]
+    args = [json.loads(call["function"]["arguments"]) for call in t.tool_calls]
+    assert args == [
+        {"q": "entities"},
+        {"path": "src/game.ts"},
+        {"path": "src/out.ts", "contents": "export const ok = true;"},
+    ]
+
+
+def test_qwen_xml_opening_marker_split_after_preamble_no_leak():
+    t = _make()
+    out = []
+    out.extend(t.feed("content", "Checking sources. <too"))
+    out.extend(t.feed("content", "l_call>\n<function=lookup>\n"))
+    out.extend(t.feed("content", "<parameter=q>\nscene\n</parameter>\n"))
+    out.extend(t.feed("content", "</function>\n</tool_call>"))
+    out.extend(t.finish())
+
+    content = _content_text(out)
+    assert "Checking sources. " in content
+    _assert_no_tool_markup_leaked(content)
+    assert t.tool_calls is not None
+    assert len(t.tool_calls) == 1
+    assert json.loads(t.tool_calls[0]["function"]["arguments"]) == {"q": "scene"}
+
+
+def test_opencode_style_long_write_arguments_stream_without_raw_xml():
+    """OpenCode-style write(filePath, content) args can be large and chunked."""
+    t = _make(tools=OPENCODE_WRITE_TOOL_SPECS)
+    long_content = "\n".join(
+        [
+            "export function hello(name) {",
+            "  const payload = { quote: \"hello\", emoji: \"🌍\" };",
+            "  return `${payload.quote}, ${name}!`;",
+            "}",
+        ]
+        * 8
+    )
+    text = (
+        "<tool_call>\n<function=write>\n"
+        "<parameter=filePath>\nsrc/hello.ts\n</parameter>\n"
+        f"<parameter=content>\n{long_content}\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    out = _feed_in_chunks(t, text, [7, 13, 1, 5, 23, 3, 19, 2, 29, 11])
+
+    content = _content_text(out)
+    _assert_no_tool_markup_leaked(content)
+    assert t.tool_calls is not None
+    assert len(t.tool_calls) == 1
+    args = json.loads(t.tool_calls[0]["function"]["arguments"])
+    assert args == {"filePath": "src/hello.ts", "content": long_content}
+    streamed_args = _argument_text(out)
+    assert "\\ud83c" not in streamed_args
+    assert json.loads(streamed_args) == args
 
 
 def test_existing_json_tool_call_final_parse_still_works():
