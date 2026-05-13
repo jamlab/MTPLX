@@ -4,6 +4,19 @@ All notable user-facing changes are recorded here.
 
 ## Unreleased
 
+## v0.3.5
+
+### Fixed
+
+- Fixed OpenCode tool-result turns cold-prefilling the full conversation
+  history. Stable tool-turn prefixes now commit into SessionBank and follow-up
+  OpenCode requests can reuse cached tokens instead of sitting at `Thinking...`
+  for minutes.
+- Fixed unsafe stream postcommit prefix anchoring so streamed assistant/tool
+  histories do not poison the next cache boundary.
+- Added regression coverage for real-world consecutive Qwen XML tool calls so
+  back-to-back tool calls remain structured and do not leak raw XML.
+
 ## v0.3.4
 
 ### Added

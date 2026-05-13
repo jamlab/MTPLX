@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Git ref to build, such as v0.3.4"
+        description: "Git ref to build, such as v0.3.5"
         required: true
-        default: "v0.3.4"
+        default: "v0.3.5"
       publish_to_pypi:
         description: "Publish the built artifacts to PyPI through Trusted Publishing"
         type: boolean
