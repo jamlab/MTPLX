@@ -15,6 +15,10 @@ All notable user-facing changes are recorded here.
 - Added hardware diagnostics to `mtplx bench tune`: each AR/D1/D2/D3 candidate
   now records MX Power Gadget-style power, frequency, temperature, utilization,
   thermal-pressure, and fan samples where macOS exposes them.
+- `mtplx bench tune` now labels telemetry scope and prefers generation-window
+  power/GPU utilization when samples land inside the actual token generation
+  span; `--no-telemetry` keeps the same candidate machinery for cleaner speed
+  comparisons.
 
 ### Fixed
 
@@ -49,6 +53,9 @@ All notable user-facing changes are recorded here.
   measurement is already over.
 - Fixed served model-id detection for the installed Optimized Speed artifact so
   mixed Q4/Q8 speed configs do not get mislabeled as Optimized Quality.
+- Fixed no-argument `mtplx bench tune` confusion by printing the exact model path
+  and warning when `~/.mtplx/config.toml` selects a different artifact than the
+  verified default shown by `mtplx start`.
 
 ## v0.3.5
 

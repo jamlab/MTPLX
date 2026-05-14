@@ -6,7 +6,7 @@
 
 **~2.24× over no-MTP AR at `temp=0.6`** on Qwen3.6-27B · math-correct rejection sampling · MLX-native · zero external drafter
 
-<sub>Multiplier is hardware-independent. Absolute tok/s scales with memory bandwidth — current public record on M5 Max: **63.056 / 62.886 tok/s** D3, [`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`](https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed).</sub>
+<sub>Multiplier is measured in paired same-machine runs. Absolute tok/s scales with memory bandwidth — current public record on M5 Max: **63.056 / 62.886 tok/s** D3, [`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`](https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed).</sub>
 
 [![CI](https://github.com/youssofal/mtplx/actions/workflows/ci.yml/badge.svg)](https://github.com/youssofal/mtplx/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/mtplx?label=PyPI)](https://pypi.org/project/mtplx/)
@@ -46,7 +46,9 @@ Tune compares AR, D1, D2, and D3 with thinking disabled, keeps AR as the `1.00x`
 baseline, and only saves a recommendation when an MTP depth is actually faster.
 For hardware diagnosis, `mtplx bench tune` prints and saves per-candidate
 power, frequency, temperature, utilization, fan, and thermal-pressure telemetry
-when `thermalforge` and macOS `powermetrics` are available.
+when `thermalforge` and macOS `powermetrics` are available. Telemetry is labeled
+as `scope=generation` when samples land inside the actual generation window;
+otherwise it is reported as broader candidate-process telemetry.
 
 ---
 
@@ -54,7 +56,7 @@ when `thermalforge` and macOS `powermetrics` are available.
 
 - **Native MTP speculative decoding.** Built-in MTP heads, no external drafter, no RAM hit for a second model.
 - **Math-correct sampling at T=0.6.** Probability-ratio acceptance with residual correction. Verified `max_diff = 0.0` against reference single-token AR on the verified Qwen3.6-27B path.
-- **~2.24× over no-MTP AR at `temp=0.6`.** The hardware-independent number, which the CLI reports as `mean_speedup_vs_ar`. Verified contract on the public default `Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`: `63.056 / 62.886 tok/s` MTP-D3 vs `28.156 tok/s` no-MTP AR, on Apple Silicon M5 Max with `--max` fans, target sampler `temp=0.6 top_p=0.95 top_k=20`, draft sampler `temp=0.70`. Absolute tok/s scales with memory bandwidth; the 2.24× multiplier doesn't.
+- **~2.24× over no-MTP AR at `temp=0.6`.** This is a paired same-machine multiplier, which the CLI reports as `mean_speedup_vs_ar`. Verified contract on the public default `Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`: `63.056 / 62.886 tok/s` MTP-D3 vs `28.156 tok/s` no-MTP AR, on Apple Silicon M5 Max with `--max` fans, target sampler `temp=0.6 top_p=0.95 top_k=20`, draft sampler `temp=0.70`. Absolute tok/s scales with memory bandwidth.
 - **Real serving surface.** OpenAI-compatible `/v1/chat/completions` + `/v1/completions` + `/v1/models`, Anthropic-compatible `/v1/messages` (streaming SSE), `/health`, `/metrics`. Plug it into Pi, Open WebUI, OpenClaw, Claude Code, Cline, Continue, or anything that speaks OpenAI.
 - **Agent tool calls.** OpenAI-style `tools` / `tool_choice`, structured `message.tool_calls`, streaming `delta.tool_calls`, and tool-result history are supported so agent clients execute tools instead of printing Qwen tool markup.
 - **In-browser chat UI** with auto-detected model context (256k for Qwen3.6), live tokens-per-second, markdown rendering, code-block copy buttons, a stop button, an MTP on/off toggle, and a settings sidebar that persists per-machine.
@@ -68,7 +70,7 @@ when `thermalforge` and macOS `powermetrics` are available.
   - `Stable` — hidden compatibility flag (`--profile stable` / `--profile safe`) for the exact/staged long-reply path.
 - **Crash-safe fan control.** When Sustained Max or Burst is on, MTPLX spawns a detached watchdog that restores fans to auto if the parent dies for any reason — including `kill -9` and "I closed the terminal". Verified live on hardware.
 - **Idle-aware fan-backed modes.** Server tracks request activity; after 15 minutes of no chat, fans drop to auto, then ramp back up on the next message.
-- **Per-Mac Tune.** `mtplx tune`, `mtplx-tune`, and `mtplx bench tune` compare AR/D1/D2/D3 in isolated subprocesses and persist the winning depth per model, hardware, software, and settings. If no MTP depth beats AR, nothing worse is saved. `mtplx bench tune` also records MX Power Gadget-style power, frequency, temperature, utilization, fan, and thermal-pressure telemetry per candidate for chip-level diagnosis.
+- **Per-Mac Tune.** `mtplx tune`, `mtplx-tune`, and `mtplx bench tune` compare AR/D1/D2/D3 in isolated subprocesses and persist the winning depth per model, hardware, software, and settings. If no MTP depth beats AR, nothing worse is saved. `mtplx bench tune` also records MX Power Gadget-style power, frequency, temperature, utilization, fan, and thermal-pressure telemetry per candidate for chip-level diagnosis, with generation-window scope when available.
 - **Four-tier model compatibility contract.** `mtplx inspect <model>` reports: verified / arch-compatible-unverified / incompatible-architecture / no-MTP. No silent garbage runs.
 - **Lazy imports.** `mtplx --help`, `doctor`, `inspect`, `init`, `setup` work on a fresh venv *without MLX installed*. Generation and serving pull in MLX only when needed.
 - **v0.3.6 memory, Tune, and OpenCode fixes.** Large `max_tokens` one-off requests no longer reserve the full decode KV window up front, anonymous no-reuse sessions do not retain full-capacity live cache refs, OpenCode tool-result turns reuse the stable cached prefix instead of cold-prefilling the full history, and Tune is available from the packaged CLI.
@@ -150,7 +152,7 @@ The math-correctness wedge is real. At `temperature=0.6`, the difference between
 
 **Verified evidence (current public default `Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`):**
 - **~2.24× over matched no-MTP AR at `temp=0.6`** on Apple Silicon M5 Max: `63.056 / 62.886 tok/s` MTP-D3 paired runs vs `28.156 tok/s` no-MTP AR, same machine, same target sampler (`temp=0.6 top_p=0.95 top_k=20`), draft sampler `temp=0.70 top_p=0.95 top_k=20`, performance-cold profile, fans pinned by `--max`, thinking mode off. Recorded in `mtplx_runtime.json` under the model.
-- The multiplier is what the CLI reports as `mean_speedup_vs_ar`. Absolute tok/s above is M5-Max-with-614-GB/s-bandwidth-specific; if your Mac is slower you keep the **2.24×** ratio, the absolute number drops with bandwidth.
+- The multiplier is what the CLI reports as `mean_speedup_vs_ar` for a paired same-machine run. Absolute tok/s above is M5-Max-with-614-GB/s-bandwidth-specific; slower memory bandwidth lowers the absolute number, and users should run `mtplx tune` / `mtplx bench tune` to measure their own Mac.
 - Per-position acceptance on the recorded prompt: `[100%, 97.96%, 93.88%]` at D3 (corrections=3 over 49 verify calls).
 - Distribution exactness vs reference single-token AR: `max_diff = 0.0`. Greedy diagnostic on the same cleaned window: `60.108 tok/s`.
 

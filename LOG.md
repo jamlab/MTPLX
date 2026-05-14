@@ -420,3 +420,39 @@ uv run --extra dev python -m pytest tests/test_public_cli.py tests/test_mtp_dept
 uv run --extra dev python -m ruff check mtplx/benchmarks/runners/mtp_depth_sweep.py mtplx/commands/public.py tests/test_public_cli.py -> pass
 git diff --check -> pass
 ```
+
+## 2026-05-15 00:45 BST - Release Copy Honesty Pass
+
+Scope:
+
+```text
+worktree=/Users/youssof/Documents/MTPLX-release/mtplx-v0.3.6
+branch=codex/release-v0.3.6
+user_gate=user approved continuing to public release, with production gates still required before publish
+public_state=GitHub/PyPI/Homebrew latest all still v0.3.5 / 0.3.5
+target_version=0.3.6
+```
+
+Changes:
+
+```text
+README no longer calls the 2.24x multiplier hardware-independent; it now says paired same-machine multiplier and tells users to run Tune on their own Mac
+README now documents bench tune generation-window telemetry scope
+CHANGELOG v0.3.6 now includes bench tune model-source warning, --no-telemetry, and generation-window telemetry fixes
+```
+
+Verification:
+
+```text
+python3 -m compileall -q mtplx tests scripts -> pass
+uv run --extra dev python -m ruff check -> pass
+uv run --extra dev python -m pytest -q -> pass
+uv run --extra dev python -m twine check dist/* -> pass
+scripts/fresh_venv_smoke.sh -> pass
+git diff --check -> pass
+mtplx --version -> mtplx 0.3.6 (0.3.6)
+mtplx start opencode --dry-run --json --model models/example --yes -> pass
+mtplx start pi --dry-run --json --model models/example --yes -> pass
+mtplx-tune --model models/not-loaded-in-dry-run --dry-run --yes -> pass
+mtplx bench tune --model models/not-loaded-in-dry-run --dry-run --json --yes --no-telemetry -> pass
+```
