@@ -72,8 +72,10 @@ def test_run_onboarding_screens_with_stubbed_input(monkeypatch, capsys):
     """Walk all three screens with stubbed ``input`` answers."""
     answers = iter(["1", "1", "1"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+    expected_model = onboarding._verified_default_model()
+
     state = onboarding.run_onboarding_screens()
-    assert state["model"] == onboarding.DEFAULT_HF_MODEL
+    assert state["model"] == expected_model
     assert state["profile"] == "sustained"
     assert state["max"] is False
     assert state["target"] == "openwebui"
@@ -371,7 +373,7 @@ def test_run_quickstart_flow_legacy_stable_state_is_not_reused(tmp_path, monkeyp
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     state = onboarding.run_quickstart_flow(fresh=False)
     assert state is not None
-    assert state["model"] == onboarding.DEFAULT_HF_MODEL
+    assert state["model"] == onboarding._verified_default_model()
     assert state["profile"] == "sustained"
     assert state["max"] is False
     assert state["target"] == "openwebui"
@@ -423,7 +425,7 @@ def test_run_quickstart_flow_returning_user_says_no(tmp_path, monkeypatch):
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     state = onboarding.run_quickstart_flow(fresh=False)
     assert state is not None
-    assert state["model"] == onboarding.DEFAULT_HF_MODEL
+    assert state["model"] == onboarding._verified_default_model()
     assert state["profile"] == "sustained"
     assert state["target"] == "openwebui"
 
@@ -438,14 +440,16 @@ def test_screen_model_surfaces_configured_path_first(tmp_path, monkeypatch):
     assert chosen == configured
 
 
-def test_screen_model_picks_canonical_default_when_configured_offered(monkeypatch):
+def test_screen_model_picks_verified_default_when_configured_offered(monkeypatch):
     """With a configured path shown as option 1, option 2 still maps to the
-    canonical Hugging Face default."""
+    verified default, preferring an installed local artifact when present."""
     configured = "/Users/test/Documents/MTPLX/models/Qwen3.6-27B-MTPLX"
     answers = iter(["2"])  # explicit "verified default"
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+    expected_model = onboarding._verified_default_model()
+
     chosen = onboarding.screen_model(configured=configured)
-    assert chosen == onboarding.DEFAULT_HF_MODEL
+    assert chosen == expected_model
 
 
 def test_screen_model_picks_hardware_default_when_configured_offered(monkeypatch):
@@ -463,8 +467,10 @@ def test_screen_model_no_configured_uses_default_first(monkeypatch):
     """Without a configured path, option 1 maps to the hardware default."""
     answers = iter(["1"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+    expected_model = onboarding._verified_default_model()
+
     chosen = onboarding.screen_model(configured=None)
-    assert chosen == onboarding.DEFAULT_HF_MODEL
+    assert chosen == expected_model
 
 
 def test_screen_model_optimized_quality_prefers_local_model(tmp_path, monkeypatch, capsys):
@@ -685,6 +691,7 @@ def test_start_invokes_onboarding_when_no_explicit_flags(tmp_path, monkeypatch):
         "mtplx.commands.public._quickstart_run_terminal_chat",
         fake_run_terminal,
     )
+    monkeypatch.setattr("mtplx.ui.onboarding.screen_tuning_offer", lambda: False)
 
     from mtplx.commands.public import cmd_quickstart_public
 
@@ -946,7 +953,7 @@ def test_quickstart_applies_saved_tuned_depth(monkeypatch):
     public._quickstart_apply_tuned_depth(
         args,
         runtime_model="/tmp/model",
-        target="openwebui",
+        target="terminal",
         can_prompt=False,
     )
 
@@ -995,7 +1002,7 @@ def test_quickstart_tuning_prompt_can_save_and_apply(monkeypatch):
     public._quickstart_apply_tuned_depth(
         args,
         runtime_model="/tmp/model",
-        target="openwebui",
+        target="terminal",
         can_prompt=True,
     )
 

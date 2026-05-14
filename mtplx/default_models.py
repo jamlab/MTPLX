@@ -24,18 +24,30 @@ from mtplx.profiles import (
 
 
 DEFAULT_MODEL_VARIANT_ENV = "MTPLX_DEFAULT_MODEL_VARIANT"
+SPEED_MODEL_ENV = "MTPLX_OPTIMIZED_SPEED_MODEL"
 QUALITY_MODEL_ENV = "MTPLX_OPTIMIZED_QUALITY_MODEL"
-DEFAULT_MODEL_VARIANTS = frozenset({"auto", "bf16", "fp16"})
+DEFAULT_MODEL_VARIANTS = frozenset({"auto", "speed", "q4", "bf16", "fp16"})
 _LEGACY_APPLE_FP16_GENERATIONS = frozenset({"m1", "m2"})
-_NEWER_APPLE_BF16_GENERATIONS = frozenset({"m3", "m4", "m5"})
+_NEWER_APPLE_SPEED_GENERATIONS = frozenset({"m3", "m4", "m5"})
+OPTIMIZED_SPEED_LABEL = "Qwen3.6 27B MTPLX Optimized Speed"
+OPTIMIZED_SPEED_DESCRIPTION = "Q4 target with Q4 MTP sidecar"
 OPTIMIZED_QUALITY_LABEL = "Qwen3.6 27B MTPLX Optimized Quality"
 OPTIMIZED_QUALITY_DESCRIPTION = "Flat8 target with INT8 MTP sidecar"
+_OPTIMIZED_SPEED_LOCAL_CANDIDATES = (
+    "~/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized",
+    "~/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized-Speed",
+    "~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+    "~/Documents/MTPLX/hf-staging/Qwen3.6-27B-MTPLX-Optimized",
+    "~/Documents/MTPLX/hf-staging/Qwen3.6-27B-MTPLX-Optimized-Speed",
+)
 _OPTIMIZED_QUALITY_LOCAL_CANDIDATES = (
     "~/Documents/MTPLX/hf-staging/Qwen3.6-27B-MTPLX-Optimized-Quality",
     "~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Quality",
 )
 _VERIFIED_DEFAULT_LOCAL_NAMES = frozenset(
     {
+        "Qwen3.6-27B-MTPLX-Optimized",
+        "Youssofal--Qwen3.6-27B-MTPLX-Optimized",
         "Qwen3.6-27B-MTPLX-Optimized-Speed",
         "Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
         "Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
@@ -58,8 +70,9 @@ class DefaultModelSelection:
 
     @property
     def display_name(self) -> str:
-        suffix = "FP16" if self.variant == "fp16" else "BF16"
-        return f"Qwen3.6 27B Optimized Speed {suffix}"
+        if self.variant == "fp16":
+            return "Qwen3.6 27B Optimized Speed FP16"
+        return OPTIMIZED_SPEED_LABEL
 
     @property
     def label(self) -> str:
@@ -101,14 +114,46 @@ def _is_complete_local_model(path: Path) -> bool:
     return has_weights and has_mtp
 
 
-def optimized_quality_model_ref() -> str:
-    env_ref = str(os.environ.get(QUALITY_MODEL_ENV) or "").strip()
-    candidates = (env_ref, *_OPTIMIZED_QUALITY_LOCAL_CANDIDATES) if env_ref else _OPTIMIZED_QUALITY_LOCAL_CANDIDATES
+def _env_ref_disabled(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"0", "false", "no", "none", "off", "disabled"}
+
+
+def _complete_local_model_ref(candidates: tuple[str, ...]) -> str | None:
     for candidate in candidates:
+        if not candidate or _env_ref_disabled(candidate):
+            continue
         path = Path(candidate).expanduser()
         if _is_complete_local_model(path):
             return str(path)
-    return QUALITY_HF_MODEL_ID
+    return None
+
+
+def optimized_speed_model_ref() -> str:
+    env_ref = str(os.environ.get(SPEED_MODEL_ENV) or "").strip()
+    candidates: tuple[str, ...]
+    if env_ref:
+        if _env_ref_disabled(env_ref):
+            return DEFAULT_HF_MODEL_ID
+        else:
+            candidates = (env_ref, *_OPTIMIZED_SPEED_LOCAL_CANDIDATES)
+    else:
+        candidates = _OPTIMIZED_SPEED_LOCAL_CANDIDATES
+    repo_local = str((_repo_root() / DEFAULT_RUNTIME_MODEL_DIR).resolve())
+    local = _complete_local_model_ref((*candidates, repo_local))
+    return local or DEFAULT_HF_MODEL_ID
+
+
+def optimized_quality_model_ref() -> str:
+    env_ref = str(os.environ.get(QUALITY_MODEL_ENV) or "").strip()
+    if env_ref:
+        if _env_ref_disabled(env_ref):
+            candidates = ()
+        else:
+            candidates = (env_ref, *_OPTIMIZED_QUALITY_LOCAL_CANDIDATES)
+    else:
+        candidates = _OPTIMIZED_QUALITY_LOCAL_CANDIDATES
+    local = _complete_local_model_ref(candidates)
+    return local or QUALITY_HF_MODEL_ID
 
 
 def is_optimized_quality_model_ref(model: str | Path | None) -> bool:
@@ -233,9 +278,13 @@ def _normalize_variant(value: str | None) -> tuple[str, str | None]:
     if raw in {"", "auto"}:
         return "auto", None
     aliases = {
-        "bf16": "bf16",
-        "bfloat16": "bf16",
-        "bfloat": "bf16",
+        "speed": "speed",
+        "optimized-speed": "speed",
+        "q4": "speed",
+        "int4": "speed",
+        "bf16": "speed",
+        "bfloat16": "speed",
+        "bfloat": "speed",
         "fp16": "fp16",
         "float16": "fp16",
         "f16": "fp16",
@@ -265,7 +314,7 @@ def select_default_model(
     """Select the verified default model for this machine.
 
     Auto policy is intentionally simple and visible:
-    M1/M2 -> FP16, M3/M4/M5/unknown -> BF16.
+    M1/M2 -> FP16, M3/M4/M5/unknown -> quantized Optimized Speed.
     """
 
     env_value = variant_override if variant_override is not None else os.environ.get(DEFAULT_MODEL_VARIANT_ENV)
@@ -278,18 +327,21 @@ def select_default_model(
         variant = "fp16"
         reason = f"forced by {DEFAULT_MODEL_VARIANT_ENV}=fp16"
         auto_selected = False
-    elif requested_variant == "bf16":
-        variant = "bf16"
-        reason = f"forced by {DEFAULT_MODEL_VARIANT_ENV}=bf16"
+    elif requested_variant == "speed":
+        variant = "speed"
+        if str(env_value or "").strip().lower() in {"bf16", "bfloat16", "bfloat"}:
+            reason = f"forced by {DEFAULT_MODEL_VARIANT_ENV}={env_value} (legacy alias for optimized speed)"
+        else:
+            reason = f"forced by {DEFAULT_MODEL_VARIANT_ENV}=speed"
         auto_selected = False
     elif generation in _LEGACY_APPLE_FP16_GENERATIONS:
         variant = "fp16"
         reason = "selected for M1/M2 Apple Silicon"
         auto_selected = True
     else:
-        variant = "bf16"
+        variant = "speed"
         auto_selected = True
-        if generation in _NEWER_APPLE_BF16_GENERATIONS:
+        if generation in _NEWER_APPLE_SPEED_GENERATIONS:
             reason = "selected for newer Apple Silicon"
         elif generation == "intel":
             reason = "selected because this is not Apple Silicon"
@@ -299,10 +351,18 @@ def select_default_model(
     if invalid_override is not None and requested_variant == "auto":
         reason = f"{reason}; ignored invalid {DEFAULT_MODEL_VARIANT_ENV}={invalid_override}"
 
-    hf_model = DEFAULT_FP16_HF_MODEL_ID if variant == "fp16" else DEFAULT_HF_MODEL_ID
-    precision = "FP16" if variant == "fp16" else "BF16"
+    if variant == "fp16":
+        model = DEFAULT_FP16_HF_MODEL_ID
+        hf_model = DEFAULT_FP16_HF_MODEL_ID
+        precision = "FP16"
+    else:
+        model = optimized_speed_model_ref()
+        hf_model = DEFAULT_HF_MODEL_ID
+        precision = OPTIMIZED_SPEED_DESCRIPTION
+        if model != hf_model:
+            reason = f"{reason}; installed locally"
     return DefaultModelSelection(
-        model=hf_model,
+        model=model,
         hf_model=hf_model,
         variant=variant,
         precision=precision,
@@ -316,10 +376,12 @@ def select_default_model(
 
 def verified_default_refs() -> set[str]:
     root = _repo_root()
+    local_speed = optimized_speed_model_ref()
     refs = {
         DEFAULT_HF_MODEL_ID,
         DEFAULT_FP16_HF_MODEL_ID,
         DEFAULT_MODEL_ID,
+        local_speed,
         str(DEFAULT_RUNTIME_MODEL_DIR),
         str((root / DEFAULT_RUNTIME_MODEL_DIR).resolve()),
     }

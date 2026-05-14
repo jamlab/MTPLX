@@ -6406,7 +6406,7 @@ def _quickstart_apply_tuned_depth(
     target: str,
     can_prompt: bool,
 ) -> None:
-    if target != "openwebui":
+    if target not in {"openwebui", "terminal"}:
         return
     if bool(getattr(args, "_explicit_depth", False)):
         return

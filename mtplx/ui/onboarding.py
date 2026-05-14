@@ -1127,7 +1127,7 @@ def screen_interface() -> str:
 
 
 def screen_tuning_offer() -> bool:
-    """Return whether the first-run Web UI flow should tune depth now."""
+    """Return whether the first-run interactive flow should tune depth now."""
 
     _step_panel(
         step=4,
@@ -1142,7 +1142,7 @@ def screen_tuning_offer() -> bool:
             (
                 "2",
                 "Skip for now",
-                "Start the Web UI with the default depth. You can run mtplx tune later.",
+                "Start MTPLX with the default depth. You can run mtplx tune later.",
             ),
         ],
     )

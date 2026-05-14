@@ -10,8 +10,8 @@ All notable user-facing changes are recorded here.
   against D1/D2/D3 on a short coding prompt, keep AR as the `1.00x` baseline,
   and save only a depth that actually beats AR for the current model, Mac, MLX
   stack, and settings.
-- Added first-run Web UI tuning affordance so new installs can opt into the
-  measured best depth without hiding the default startup path.
+- Added first-run Web UI and CLI tuning affordance so new installs can opt into
+  the measured best depth without hiding the default startup path.
 
 ### Fixed
 
@@ -33,6 +33,10 @@ All notable user-facing changes are recorded here.
   buffers for no-reuse workloads, and tightened high-RAM default MLX Metal caps
   so 512 GB Apple Silicon systems do not drift into hundreds of GiB of wired
   allocator memory by default.
+- Fixed verified-default onboarding copy and resolution for Optimized Speed:
+  the current speed artifact is labeled as Q4 target + Q4 MTP, and an already
+  installed local verified artifact is preferred over prompting to download the
+  Hugging Face mirror again.
 
 ## v0.3.5
 

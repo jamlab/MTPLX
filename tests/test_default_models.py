@@ -6,9 +6,12 @@ import pytest
 
 from mtplx.default_models import (
     DEFAULT_MODEL_VARIANT_ENV,
+    OPTIMIZED_SPEED_DESCRIPTION,
     QUALITY_MODEL_ENV,
+    SPEED_MODEL_ENV,
     is_verified_default_model_ref,
     optimized_quality_model_ref,
+    optimized_speed_model_ref,
     public_model_id_for_ref,
     select_default_model,
 )
@@ -22,6 +25,14 @@ from mtplx.profiles import (
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
     QUALITY_PUBLIC_MODEL_ID,
 )
+
+
+def _make_complete_model(path):
+    path.mkdir()
+    (path / "config.json").write_text("{}", encoding="utf-8")
+    (path / "mtp.safetensors").write_bytes(b"mtp")
+    (path / "model-00001-of-00001.safetensors").write_bytes(b"model")
+    return path
 
 
 @pytest.mark.parametrize(
@@ -84,8 +95,9 @@ def test_auto_default_uses_fp16_for_m1_m2(monkeypatch, generation):
 
 
 @pytest.mark.parametrize("generation", ["m3", "m4", "m5", "unknown", "intel"])
-def test_auto_default_uses_bf16_for_newer_unknown_and_intel(monkeypatch, generation):
+def test_auto_default_uses_q4_speed_for_newer_unknown_and_intel(monkeypatch, generation):
     monkeypatch.delenv(DEFAULT_MODEL_VARIANT_ENV, raising=False)
+    monkeypatch.setenv(SPEED_MODEL_ENV, "off")
 
     selection = select_default_model(
         hardware={
@@ -94,9 +106,10 @@ def test_auto_default_uses_bf16_for_newer_unknown_and_intel(monkeypatch, generat
         }
     )
 
-    assert selection.variant == "bf16"
-    assert selection.precision == "BF16"
+    assert selection.variant == "speed"
+    assert selection.precision == OPTIMIZED_SPEED_DESCRIPTION
     assert selection.model == DEFAULT_HF_MODEL_ID
+    assert "BF16" not in selection.label
     assert selection.auto_selected is True
 
 
@@ -115,8 +128,9 @@ def test_default_model_variant_env_override_forces_fp16(monkeypatch):
     assert selection.auto_selected is False
 
 
-def test_default_model_variant_env_override_forces_bf16(monkeypatch):
+def test_default_model_variant_env_override_legacy_bf16_alias_forces_speed(monkeypatch):
     monkeypatch.setenv(DEFAULT_MODEL_VARIANT_ENV, "bf16")
+    monkeypatch.setenv(SPEED_MODEL_ENV, "off")
 
     selection = select_default_model(
         hardware={
@@ -125,8 +139,10 @@ def test_default_model_variant_env_override_forces_bf16(monkeypatch):
         }
     )
 
-    assert selection.variant == "bf16"
+    assert selection.variant == "speed"
+    assert selection.precision == OPTIMIZED_SPEED_DESCRIPTION
     assert selection.model == DEFAULT_HF_MODEL_ID
+    assert "legacy alias" in selection.reason
     assert selection.auto_selected is False
 
 
@@ -145,9 +161,12 @@ def test_invalid_default_model_variant_env_falls_back_to_auto(monkeypatch):
     assert "ignored invalid" in selection.reason
 
 
-def test_verified_default_refs_include_bf16_and_fp16():
+def test_verified_default_refs_include_speed_and_fp16():
     assert is_verified_default_model_ref(DEFAULT_HF_MODEL_ID)
     assert is_verified_default_model_ref(DEFAULT_FP16_HF_MODEL_ID)
+    assert is_verified_default_model_ref(
+        "/Users/example/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized"
+    )
     assert is_verified_default_model_ref(
         "/Users/example/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed"
     )
@@ -158,12 +177,28 @@ def test_verified_default_refs_include_bf16_and_fp16():
     assert not is_verified_default_model_ref("/Users/example/models/custom-model")
 
 
+def test_optimized_speed_prefers_complete_local_env_model(tmp_path, monkeypatch):
+    local_speed = _make_complete_model(tmp_path / "Qwen3.6-27B-MTPLX-Optimized")
+    monkeypatch.setenv(SPEED_MODEL_ENV, str(local_speed))
+
+    selection = select_default_model(
+        hardware={
+            "chip": "Apple M5 Max",
+            "apple_silicon_generation": "m5",
+        }
+    )
+
+    assert optimized_speed_model_ref() == str(local_speed)
+    assert selection.model == str(local_speed)
+    assert selection.hf_model == DEFAULT_HF_MODEL_ID
+    assert selection.variant == "speed"
+    assert selection.precision == OPTIMIZED_SPEED_DESCRIPTION
+    assert "installed locally" in selection.reason
+    assert "BF16" not in selection.label
+
+
 def test_optimized_quality_prefers_complete_local_env_model(tmp_path, monkeypatch):
-    local_quality = tmp_path / "Qwen3.6-27B-MTPLX-Optimized-Quality"
-    local_quality.mkdir()
-    (local_quality / "config.json").write_text("{}", encoding="utf-8")
-    (local_quality / "mtp.safetensors").write_bytes(b"mtp")
-    (local_quality / "model-00001-of-00001.safetensors").write_bytes(b"model")
+    local_quality = _make_complete_model(tmp_path / "Qwen3.6-27B-MTPLX-Optimized-Quality")
     monkeypatch.setenv(QUALITY_MODEL_ENV, str(local_quality))
 
     assert optimized_quality_model_ref() == str(local_quality)

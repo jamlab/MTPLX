@@ -1,5 +1,48 @@
 # MTPLX Release Log
 
+## 2026-05-14 23:31 BST - v0.3.6 Onboarding Regression Fix Before User Test
+
+Scope:
+
+```text
+worktree=/Users/youssof/Documents/MTPLX-release/mtplx-v0.3.6
+branch=codex/release-v0.3.6
+trigger=user-tested global mtplx start wizard and found the verified default labeled BF16, prompting a download despite the local Optimized Speed artifact, and missing the CLI Tune offer
+public_release_done=false
+```
+
+Root cause:
+
+```text
+default_model_metadata=stale v0.3.0 BF16 wording still labeled the current Optimized Speed default as BF16 on M3/M4/M5-class Macs
+default_model_resolution=select_default_model returned the Hugging Face repo id even when /Users/youssof/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized was already installed and complete
+cli_tune_prompt=_quickstart_apply_tuned_depth returned immediately for target=terminal, so first-run Tune was offered only for Web UI
+```
+
+Fix:
+
+```text
+speed_default_label=Q4 target with Q4 MTP sidecar
+local_speed_preference=prefer complete local Optimized Speed artifacts from ~/.mtplx/hf-upload, ~/.mtplx/models, and repo-local models before the HF mirror
+legacy_bf16_env_alias=MTPLX_DEFAULT_MODEL_VARIANT=bf16 remains accepted but maps to optimized speed and no longer prints BF16 to users
+cli_tune_prompt=first-run Tune offer now applies to CLI/terminal as well as Web UI
+tests_added_or_updated=default speed local preference, no BF16 label, legacy alias behavior, verified legacy local path, terminal Tune application
+```
+
+Validation:
+
+```text
+python3 -m py_compile mtplx/default_models.py mtplx/commands/public.py mtplx/ui/onboarding.py tests/test_default_models.py tests/test_onboarding.py -> pass
+uv run --extra dev python -m ruff check mtplx/default_models.py mtplx/commands/public.py mtplx/ui/onboarding.py tests/test_default_models.py tests/test_onboarding.py -> pass
+uv run --extra dev python -m pytest tests/test_default_models.py tests/test_onboarding.py -q -> pass
+uv run --extra dev python -m build -> pass; rebuilt dist/mtplx-0.3.6.tar.gz and dist/mtplx-0.3.6-py3-none-any.whl
+uv run --extra dev python -m twine check dist/* -> pass
+/opt/homebrew/opt/python@3.14/bin/python3.14 -m pip install --force-reinstall --no-deps dist/mtplx-0.3.6-py3-none-any.whl -> pass
+mtplx --version -> mtplx 0.3.6
+mtplx start cli --dry-run --json -> model=/Users/youssof/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized; download_if_missing=false; precision=Q4 target with Q4 MTP sidecar
+global pseudo-tty mtplx start --fresh -> Step 1 shows Q4 target + Q4 MTP, no BF16, no missing/download prompt, CLI selected, Step 4 Tune prompt appears before model chat starts
+```
+
 ## 2026-05-14 22:05 BST - v0.3.6 Release Candidate Assembly
 
 Scope:
