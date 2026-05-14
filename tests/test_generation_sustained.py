@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
@@ -275,6 +276,61 @@ def test_sustained_prefill_chunks_without_full_prompt_logits(monkeypatch):
     assert rt.diagnostic_counters["prefill_chunks"] == 2
     assert rt.diagnostic_counters.get("full_logits_tokens_emitted", 0) == 0
     assert rt.diagnostic_counters["final_logits_tokens_emitted"] == 1
+
+
+def test_warm_restored_suffix_prefill_is_chunked_and_typed_for_abort(monkeypatch):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2")
+    monkeypatch.setenv("MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS", "0")
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=True)
+    appended: list[list[int]] = []
+
+    class Bank:
+        last_miss_reason = None
+
+        def restore(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                entry=SimpleNamespace(prefix_len=3),
+                cache=[],
+                logits=mx.zeros((1, 4), dtype=mx.float32),
+                hidden=mx.zeros((1, 1, 2), dtype=mx.float32),
+                mtp_history_cache=[],
+                restore_mode="clone",
+            )
+
+    def append_history(
+        _rt,
+        _mtp_cache,
+        hidden_states,
+        token_ids,
+        *,
+        mtp_hidden_variant,
+        position_offset=None,
+        force_eval=False,
+    ):
+        assert hidden_states.shape[1] == len(token_ids)
+        assert force_eval is True
+        appended.append(list(token_ids))
+        return 0.0
+
+    monkeypatch.setattr("mtplx.generation._append_mtp_history", append_history)
+
+    prompt_state = restore_or_prefill_prompt_state(
+        rt,
+        [0, 1, 2, 3, 4, 5, 6],
+        mtp_history_policy="committed",
+        session_bank=Bank(),
+    )
+
+    assert prompt_state.cache_hit is True
+    assert prompt_state.cached_tokens == 3
+    assert prompt_state.suffix_tokens == 4
+    assert [call["tokens"] for call in model.calls] == [2, 1, 1]
+    assert [call["return_hidden"] for call in model.calls] == [True, True, True]
+    assert [call["emit_logits"] for call in model.calls] == [False, False, True]
+    assert appended == [[3], [4, 5], [6]]
+    assert rt.diagnostic_counters["restored_suffix_prefill_chunks"] == 2
 
 
 def test_sustained_prefill_chunk_cache_cleanup_is_explicit(monkeypatch):

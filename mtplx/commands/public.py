@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import platform
 import shlex
 import shutil
 import socket
@@ -64,7 +66,6 @@ from mtplx.profiles import (
     DEFAULT_MODEL_ID,
     DEFAULT_PROFILE_NAME,
     DEFAULT_PUBLIC_MODEL_ID,
-    QUALITY_PUBLIC_MODEL_ID,
     apply_profile_env,
     get_profile,
 )
@@ -116,6 +117,12 @@ EXTERNAL_RUNTIME_ENV_KEYS = (
 )
 LOCALHOST_BINDS = {"", "127.0.0.1", "::1", "localhost"}
 MAX_PUBLIC_SPECULATIVE_DEPTH = 3
+TUNE_DEFAULT_DEPTHS = "1,2,3"
+TUNE_DEFAULT_SUITE = "cold-long-code-192"
+TUNE_DEFAULT_MAX_TOKENS = 192
+TUNE_DEFAULT_LIMIT = 1
+TUNE_DEFAULT_SEED = 0
+TUNE_STATE_PATH = Path("~/.mtplx/tuning.json").expanduser()
 GENERATION_MODE_MTP = "mtp"
 GENERATION_MODE_AR = "ar"
 GENERATION_MODES = {GENERATION_MODE_MTP, GENERATION_MODE_AR}
@@ -137,6 +144,13 @@ def _benchmark_seed(args: Any, *, runtime_profile: str, harness: str) -> int:
         return 0
     return 42
 
+
+def _depths_for_bench_run(args: Any) -> str:
+    explicit_depths = getattr(args, "depths", None)
+    if explicit_depths:
+        return str(explicit_depths)
+    depth = int(getattr(args, "speculative_depth", 0) or 0)
+    return str(depth) if depth > 0 else "3"
 
 def _runtime_env_with_external_overrides(runtime_env: dict[str, str]) -> dict[str, str]:
     merged = dict(runtime_env)
@@ -859,12 +873,14 @@ def _depth_sweep_native60(
     *,
     model: str,
     prompt_suite: str,
+    depths: str = "3",
     max_tokens: int,
     limit: int | None,
     seed: int,
-    depth: int = 3,
     draft_lm_head: dict[str, Any] | None = None,
     draft_sampler: dict[str, Any] | None = None,
+    compare_ar: bool = False,
+    ar_only: bool = False,
 ) -> dict[str, Any]:
     from mtplx.benchmarks.runners.mtp_depth_sweep import run_mtp_depth_sweep
 
@@ -877,7 +893,7 @@ def _depth_sweep_native60(
     return run_mtp_depth_sweep(
         model,
         prompt_suite,
-        depths=str(depth),
+        depths=depths,
         temperature=0.6,
         top_p=0.95,
         top_k=20,
@@ -885,7 +901,8 @@ def _depth_sweep_native60(
         seed=seed,
         limit=limit,
         enable_thinking=False,
-        compare_ar=False,
+        compare_ar=compare_ar,
+        ar_only=ar_only,
         mtp_hidden_variant="post_norm",
         mtp_cache_policy="persistent",
         mtp_history_policy="committed",
@@ -901,7 +918,6 @@ def _depth_sweep_native60(
         draft_top_p=None if draft_sampler is None else float(draft_sampler["top_p"]),
         draft_top_k=None if draft_sampler is None else int(draft_sampler["top_k"]),
     )
-
 
 class _temporary_env:
     def __init__(self, updates: dict[str, str]) -> None:
@@ -1113,6 +1129,8 @@ def cmd_bench_public(args: Any) -> int:
         return 0
     if action in {"run", "context"}:
         return _cmd_bench_run(args)
+    if action == "tune":
+        return _cmd_bench_tune(args)
     if action == "nightly":
         return _cmd_bench_nightly(args)
     if action == "compare":
@@ -1125,6 +1143,694 @@ def cmd_bench_public(args: Any) -> int:
         return _cmd_bench_reference_vllm(args)
     raise SystemExit(f"unknown bench action: {action}")
 
+
+def cmd_tune_public(args: Any) -> int:
+    if getattr(args, "_tune_candidate", None):
+        return _cmd_tune_candidate(args)
+    return _cmd_tune(
+        args,
+        action="tune",
+        save_default=not bool(getattr(args, "no_save", False)),
+        verbose_default=bool(getattr(args, "verbose", False)),
+    )
+
+
+def _cmd_bench_tune(args: Any) -> int:
+    child = SimpleNamespace(**vars(args))
+    cli_flags = getattr(child, "_cli_flags", set()) or set()
+    if "max-tokens" not in cli_flags:
+        child.max_tokens = TUNE_DEFAULT_MAX_TOKENS
+    return _cmd_tune(
+        child,
+        action="bench tune",
+        save_default=False,
+        verbose_default=True,
+    )
+
+
+def _cmd_tune(
+    args: Any,
+    *,
+    action: str,
+    save_default: bool,
+    verbose_default: bool,
+) -> int:
+    try:
+        depths = _parse_tune_depths(getattr(args, "depths", None) or TUNE_DEFAULT_DEPTHS)
+    except ValueError as exc:
+        return _tune_error(str(exc), json_output=bool(getattr(args, "json", False)))
+
+    model = getattr(args, "model", None) or DEFAULT_CHAMPION
+    settings = _tune_settings(args, depths=depths)
+    run_id = getattr(args, "run_id", None) or f"tune-{time.strftime('%Y%m%d-%H%M%S')}"
+    output_root = Path(getattr(args, "output_dir", None) or "outputs/cli/tune") / run_id
+    output_path = Path(getattr(args, "output", None)) if getattr(args, "output", None) else output_root / "tune.json"
+    json_output = bool(getattr(args, "json", False))
+    verbose = bool(getattr(args, "verbose", verbose_default) or verbose_default)
+
+    if bool(getattr(args, "dry_run", False)):
+        payload = _tune_dry_run_payload(
+            args,
+            action=action,
+            model=model,
+            run_id=run_id,
+            output_root=output_root,
+            output_path=output_path,
+            settings=settings,
+            depths=depths,
+            save_default=save_default,
+        )
+        if json_output or action == "bench tune":
+            _print(payload)
+        else:
+            _print_tune_dry_run_human(payload)
+        return 0
+
+    runtime_model, resolve_error = _resolve_runtime_model_path(
+        model,
+        cache_dir=getattr(args, "cache_dir", None),
+    )
+    if resolve_error is not None:
+        return _tune_error(
+            resolve_error.get("error") or "model is not available locally",
+            detail=resolve_error.get("detail"),
+            json_output=json_output,
+        )
+
+    profile = get_profile("performance-cold")
+    hardware = _apple_hardware_context()
+    software = _software_context()
+    backend = _mlx_backend_context(profile)
+    state_key, key_material = _tune_state_key(
+        runtime_model,
+        settings=settings,
+        hardware=hardware,
+        software=software,
+        backend=backend,
+    )
+    cached = None if bool(getattr(args, "retune", False)) else _load_tune_record(state_key)
+    if save_default and cached is not None:
+        payload = dict(cached.get("payload") or {})
+        payload["from_cache"] = True
+        payload["state_path"] = str(_tune_state_path())
+        if json_output:
+            _print(payload)
+        else:
+            _print_tune_human(payload, verbose=verbose)
+        return 0
+
+    from mtplx.thermal import MaxSession
+
+    def _emit(line: str) -> None:
+        print(line, file=sys.stderr, flush=True)
+
+    max_session = MaxSession(log=_emit)
+    if not max_session.start():
+        verified = max_session.thermal.get("verified") or {}
+        return _tune_error(
+            "verified max-fan mode did not start; refusing to run a model tune",
+            detail=verified.get("message"),
+            actionable=verified.get("actionable"),
+            thermal=max_session.thermal,
+            json_output=json_output,
+        )
+
+    try:
+        candidate_rows = _run_tune_candidates(
+            args,
+            runtime_model=runtime_model,
+            run_id=run_id,
+            output_root=output_root,
+            depths=depths,
+            settings=settings,
+        )
+    finally:
+        max_session.stop()
+
+    payload = _tune_payload(
+        action=action,
+        run_id=run_id,
+        model=runtime_model,
+        settings=settings,
+        rows=candidate_rows,
+        output_root=output_root,
+        output_path=output_path,
+        hardware=hardware,
+        software=software,
+        backend=backend,
+        thermal=max_session.thermal,
+        state_key=state_key,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(output_path, payload)
+
+    if payload.get("best") and save_default and not bool(getattr(args, "no_save", False)):
+        payload["saved"] = True
+        payload["state_path"] = str(_tune_state_path())
+        _save_tune_record(state_key, key_material=key_material, payload=payload)
+        write_json(output_path, payload)
+    else:
+        payload["saved"] = False
+        payload["state_path"] = str(_tune_state_path())
+        if not payload.get("best"):
+            payload["save_skipped_reason"] = "no MTP depth beat AR"
+        elif bool(getattr(args, "no_save", False)) or not save_default:
+            payload["save_skipped_reason"] = "save disabled"
+        write_json(output_path, payload)
+
+    if json_output:
+        _print(payload)
+    else:
+        _print_tune_human(payload, verbose=verbose)
+    if not candidate_rows or not any(isinstance(row.get("tok_s"), (int, float)) for row in candidate_rows):
+        return 1
+    return 0
+
+
+def _cmd_tune_candidate(args: Any) -> int:
+    candidate = str(getattr(args, "_tune_candidate", "")).lower()
+    output = Path(getattr(args, "_tune_candidate_output", None) or "")
+    if candidate not in {"ar", "1", "2", "3"}:
+        return _tune_error("invalid tune candidate", json_output=True)
+    if not output:
+        return _tune_error("missing tune candidate output path", json_output=True)
+    model = getattr(args, "model", None) or DEFAULT_CHAMPION
+    runtime_model, resolve_error = _resolve_runtime_model_path(
+        model,
+        cache_dir=getattr(args, "cache_dir", None),
+    )
+    if resolve_error is not None:
+        _print(resolve_error)
+        return 1
+    inspection, gate_exit = _model_gate(
+        runtime_model,
+        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
+        yes=True,
+    )
+    if gate_exit is not None:
+        _print({"error": "model failed MTP primary gate", "model": inspection})
+        return gate_exit
+    profile = get_profile("performance-cold")
+    draft_lm_head = _model_draft_lm_head_spec(inspection, profile)
+    draft_sampler = _model_draft_sampler_spec(inspection, profile)
+    result = _depth_sweep_native60(
+        model=runtime_model,
+        prompt_suite=prompt_suite_path(TUNE_DEFAULT_SUITE),
+        depths="1" if candidate == "ar" else candidate,
+        max_tokens=int(getattr(args, "max_tokens", TUNE_DEFAULT_MAX_TOKENS) or TUNE_DEFAULT_MAX_TOKENS),
+        limit=int(getattr(args, "limit", TUNE_DEFAULT_LIMIT) or TUNE_DEFAULT_LIMIT),
+        seed=int(getattr(args, "seed", TUNE_DEFAULT_SEED) or TUNE_DEFAULT_SEED),
+        draft_lm_head=draft_lm_head,
+        draft_sampler=draft_sampler,
+        compare_ar=candidate == "ar",
+        ar_only=candidate == "ar",
+    )
+    from mtplx.benchmarks.runners.mtp_depth_sweep import write_depth_sweep
+
+    write_depth_sweep(output, result)
+    _print({"candidate": candidate, "output": str(output)})
+    return 0
+
+
+def _parse_tune_depths(raw: Any) -> list[int]:
+    if raw is None:
+        raw = TUNE_DEFAULT_DEPTHS
+    parts = [part.strip() for part in str(raw).split(",") if part.strip()]
+    if not parts:
+        raise ValueError("tune depths must include at least one of 1,2,3")
+    depths: list[int] = []
+    for part in parts:
+        try:
+            depth = int(part)
+        except ValueError as exc:
+            raise ValueError("tune depths must be integers from 1 to 3") from exc
+        if depth < 1 or depth > MAX_PUBLIC_SPECULATIVE_DEPTH:
+            raise ValueError("tune depths must be between 1 and 3")
+        if depth not in depths:
+            depths.append(depth)
+    return depths
+
+
+def _tune_settings(args: Any, *, depths: list[int]) -> dict[str, Any]:
+    return {
+        "profile": "performance-cold",
+        "suite": TUNE_DEFAULT_SUITE,
+        "depths": ",".join(str(depth) for depth in depths),
+        "max_tokens": int(getattr(args, "max_tokens", TUNE_DEFAULT_MAX_TOKENS) or TUNE_DEFAULT_MAX_TOKENS),
+        "limit": int(getattr(args, "limit", TUNE_DEFAULT_LIMIT) or TUNE_DEFAULT_LIMIT),
+        "seed": int(getattr(args, "seed", TUNE_DEFAULT_SEED) or TUNE_DEFAULT_SEED),
+        "thinking": "disabled",
+    }
+
+
+def _tune_state_path() -> Path:
+    env = os.environ.get("MTPLX_TUNE_STATE")
+    return Path(env).expanduser() if env else TUNE_STATE_PATH
+
+
+def _load_tune_state() -> dict[str, Any]:
+    path = _tune_state_path()
+    if not path.exists():
+        return {"schema_version": 1, "records": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"schema_version": 1, "records": {}}
+    if not isinstance(data, dict):
+        return {"schema_version": 1, "records": {}}
+    records = data.get("records")
+    if not isinstance(records, dict):
+        data["records"] = {}
+    return data
+
+
+def _load_tune_record(state_key: str) -> dict[str, Any] | None:
+    record = (_load_tune_state().get("records") or {}).get(state_key)
+    if not isinstance(record, dict):
+        return None
+    payload = record.get("payload")
+    best = payload.get("best") if isinstance(payload, dict) else None
+    if not isinstance(best, dict):
+        return None
+    if not isinstance(best.get("depth"), int):
+        return None
+    return record
+
+
+def _save_tune_record(state_key: str, *, key_material: dict[str, Any], payload: dict[str, Any]) -> None:
+    state = _load_tune_state()
+    records = state.setdefault("records", {})
+    records[state_key] = {
+        "schema_version": 1,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "key": state_key,
+        "key_material": key_material,
+        "payload": payload,
+    }
+    path = _tune_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, state)
+
+
+def _tune_state_key(
+    model: str,
+    *,
+    settings: dict[str, Any],
+    hardware: dict[str, Any],
+    software: dict[str, Any],
+    backend: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    model_identity = str(Path(model).expanduser().resolve()) if Path(model).expanduser().exists() else str(model)
+    key_material = {
+        "model": model_identity,
+        "hardware": {
+            "chip": hardware.get("chip"),
+            "chip_family": hardware.get("chip_family"),
+            "hw_model": hardware.get("hw_model"),
+            "machine": hardware.get("machine"),
+        },
+        "software": {
+            "mtplx_version": software.get("mtplx_version"),
+            "mlx_version": software.get("mlx_version"),
+            "mlx_lm_version": software.get("mlx_lm_version"),
+        },
+        "backend": {
+            "mlx_core_path": backend.get("mlx_core_path"),
+            "optional_fast_mlx_fork_active": backend.get("optional_fast_mlx_fork_active"),
+            "stock_mlx_likely": backend.get("stock_mlx_likely"),
+        },
+        "settings": settings,
+    }
+    encoded = json.dumps(key_material, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), key_material
+
+
+def _tune_dry_run_payload(
+    args: Any,
+    *,
+    action: str,
+    model: str,
+    run_id: str,
+    output_root: Path,
+    output_path: Path,
+    settings: dict[str, Any],
+    depths: list[int],
+    save_default: bool,
+) -> dict[str, Any]:
+    commands = []
+    for candidate in ["ar", *[str(depth) for depth in depths]]:
+        candidate_output = output_root / f"{_tune_candidate_label(candidate).lower()}.json"
+        commands.append(
+            {
+                "candidate": _tune_candidate_label(candidate),
+                "command": _tune_candidate_command(
+                    args,
+                    candidate=candidate,
+                    model=model,
+                    output=candidate_output,
+                    settings=settings,
+                ),
+                "output": str(candidate_output),
+            }
+        )
+    return {
+        "dry_run": True,
+        "action": action,
+        "run_id": run_id,
+        "model": model,
+        "settings": settings,
+        "candidates": commands,
+        "output": str(output_path),
+        "state_path": str(_tune_state_path()),
+        "save_default": save_default,
+        "fan_control": "verified max-fan required before model load",
+    }
+
+
+def _run_tune_candidates(
+    args: Any,
+    *,
+    runtime_model: str,
+    run_id: str,
+    output_root: Path,
+    depths: list[int],
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
+    output_root.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    for candidate in ["ar", *[str(depth) for depth in depths]]:
+        label = _tune_candidate_label(candidate)
+        candidate_output = output_root / f"{label.lower()}.json"
+        stdout_path = output_root / f"{label.lower()}.log"
+        command = _tune_candidate_command(
+            args,
+            candidate=candidate,
+            model=runtime_model,
+            output=candidate_output,
+            settings=settings,
+        )
+        proc = subprocess.run(
+            command,
+            cwd=repo_root(),
+            env={**os.environ, "MTPLX_TUNE_CHILD": "1"},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        stdout_path.write_text(proc.stdout, encoding="utf-8")
+        rows.append(
+            _tune_candidate_summary(
+                candidate,
+                candidate_output,
+                returncode=proc.returncode,
+                stdout_path=stdout_path,
+                command=command,
+            )
+        )
+    return rows
+
+
+def _tune_candidate_command(
+    args: Any,
+    *,
+    candidate: str,
+    model: str,
+    output: Path,
+    settings: dict[str, Any],
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "mtplx.cli",
+        "tune",
+        "--_candidate",
+        candidate,
+        "--_candidate-output",
+        str(output),
+        "--model",
+        str(model),
+        "--max-tokens",
+        str(int(settings["max_tokens"])),
+        "--limit",
+        str(int(settings["limit"])),
+        "--seed",
+        str(int(settings["seed"])),
+        "--depths",
+        str(settings["depths"]),
+        "--yes",
+    ]
+    cache_dir = getattr(args, "cache_dir", None)
+    if cache_dir:
+        command.extend(["--cache-dir", str(cache_dir)])
+    if bool(getattr(args, "unsafe_force_unverified", False)):
+        command.append("--unsafe-force-unverified")
+    return command
+
+
+def _tune_candidate_label(candidate: str) -> str:
+    return "AR" if candidate == "ar" else f"D{candidate}"
+
+
+def _tune_candidate_summary(
+    candidate: str,
+    path: Path,
+    *,
+    returncode: int,
+    stdout_path: Path,
+    command: list[str],
+) -> dict[str, Any]:
+    label = _tune_candidate_label(candidate)
+    base = {
+        "mode": label,
+        "depth": None if candidate == "ar" else int(candidate),
+        "candidate": candidate,
+        "returncode": returncode,
+        "artifact": str(path),
+        "stdout": str(stdout_path),
+        "command": command,
+    }
+    if not path.exists():
+        return {**base, "error": "candidate did not write an artifact"}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {**base, "error": f"candidate artifact is not valid JSON: {exc}"}
+    if candidate == "ar":
+        ar_rows = data.get("ar_rows") or []
+        tok_values = [
+            float(row["tok_s"])
+            for row in ar_rows
+            if isinstance(row.get("tok_s"), (int, float))
+        ]
+        return {
+            **base,
+            "tok_s": (sum(tok_values) / len(tok_values)) if tok_values else None,
+            "generated_tokens": sum(int(row.get("generated_tokens") or 0) for row in ar_rows),
+            "verify_ms_per_call": None,
+            "quality_passed": True if ar_rows else None,
+        }
+    depth_rows = data.get("depths") or data.get("depth_results") or []
+    row = depth_rows[0] if depth_rows else {}
+    summary = row.get("summary") or {}
+    verify_calls = int(summary.get("verify_calls") or 0)
+    validations = [
+        validation
+        for depth_row in depth_rows
+        for result_row in depth_row.get("rows", [])
+        for validation in result_row.get("validations", [])
+    ]
+    acceptance = summary.get("acceptance_by_depth")
+    if acceptance is None:
+        acceptance = _rate_lists(
+            summary.get("accepted_by_depth") or [],
+            summary.get("drafted_by_depth") or [],
+        )
+    return {
+        **base,
+        "tok_s": summary.get("mean_tok_s"),
+        "generated_tokens": summary.get("generated_tokens"),
+        "elapsed_s": summary.get("elapsed_s"),
+        "verify_time_s": summary.get("verify_time_s"),
+        "verify_calls": verify_calls,
+        "verify_ms_per_call": _ms_per_call(summary.get("verify_time_s"), verify_calls),
+        "verify_forward_ms_per_call": _ms_per_call(summary.get("verify_forward_time_s"), verify_calls),
+        "verify_eval_ms_per_call": _ms_per_call(summary.get("verify_eval_time_s"), verify_calls),
+        "verify_hidden_eval_ms_per_call": _ms_per_call(summary.get("verify_hidden_eval_time_s"), verify_calls),
+        "accepted_by_depth": summary.get("accepted_by_depth"),
+        "drafted_by_depth": summary.get("drafted_by_depth"),
+        "acceptance_by_depth": acceptance,
+        "acceptance_percent_by_depth": [
+            (None if value is None else 100.0 * float(value)) for value in acceptance
+        ],
+        "mean_accept_probability_by_depth": summary.get("mean_accept_probability_by_depth"),
+        "quality_passed": all(bool(v.get("passed")) for v in validations) if validations else None,
+        "validations_total": len(validations),
+        "validations_passed": sum(1 for v in validations if v.get("passed")),
+    }
+
+
+def _tune_payload(
+    *,
+    action: str,
+    run_id: str,
+    model: str,
+    settings: dict[str, Any],
+    rows: list[dict[str, Any]],
+    output_root: Path,
+    output_path: Path,
+    hardware: dict[str, Any],
+    software: dict[str, Any],
+    backend: dict[str, Any],
+    thermal: dict[str, Any],
+    state_key: str,
+) -> dict[str, Any]:
+    rows = _annotate_multipliers(rows)
+    best = _best_multiplier_summary(rows)
+    return {
+        "action": action,
+        "run_id": run_id,
+        "model": model,
+        "profile": "performance-cold",
+        "suite": settings["suite"],
+        "settings": settings,
+        "results": rows,
+        "best": best.get("winner"),
+        "best_multiplier": best,
+        "hardware": hardware,
+        "software": software,
+        "backend": backend,
+        "thermal": thermal,
+        "state_key": state_key,
+        "artifacts": {
+            "root": str(output_root),
+            "summary": str(output_path),
+        },
+    }
+
+
+def _annotate_multipliers(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ar_tok_s = None
+    for row in results:
+        if row.get("mode") == "AR":
+            ar_tok_s = row.get("tok_s")
+            break
+    annotated = []
+    for row in results:
+        item = dict(row)
+        if item.get("mode") == "AR":
+            item["multiplier_vs_ar"] = 1.0 if isinstance(item.get("tok_s"), (int, float)) else None
+        else:
+            item["multiplier_vs_ar"] = item.get("speedup_vs_ar") or _safe_ratio(item.get("tok_s"), ar_tok_s)
+        annotated.append(item)
+    return annotated
+
+
+def _best_multiplier_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    annotated = _annotate_multipliers(results)
+    ar = next((row for row in annotated if row.get("mode") == "AR"), None)
+    candidates = [
+        row
+        for row in annotated
+        if row.get("depth") is not None
+        and isinstance(row.get("multiplier_vs_ar"), (int, float))
+        and float(row["multiplier_vs_ar"]) > 1.0
+    ]
+    winner = max(candidates, key=lambda row: float(row["multiplier_vs_ar"]), default=None)
+    if winner is None:
+        return {
+            "available": bool(ar and isinstance(ar.get("tok_s"), (int, float))),
+            "ar_tok_s": ar.get("tok_s") if ar else None,
+            "winner": None,
+            "verdict": "no_mtp_depth_beat_ar",
+        }
+    return {
+        "available": True,
+        "ar_tok_s": ar.get("tok_s") if ar else None,
+        "winner": {
+            "mode": winner.get("mode"),
+            "depth": winner.get("depth"),
+            "tok_s": winner.get("tok_s"),
+            "multiplier_vs_ar": winner.get("multiplier_vs_ar"),
+        },
+        "verdict": "mtp_depth_wins",
+    }
+
+
+def _print_tune_dry_run_human(payload: dict[str, Any]) -> None:
+    print("MTPLX Tune")
+    print("dry-run: no model will be loaded")
+    print(f"model: {payload.get('model')}")
+    print(f"output: {payload.get('output')}")
+    print("candidate commands:")
+    for row in payload.get("candidates", []):
+        print(f"  {row.get('candidate')}: {shlex.join(row.get('command') or [])}")
+
+
+def _print_tune_human(payload: dict[str, Any], *, verbose: bool = False) -> None:
+    print("MTPLX Tune")
+    if payload.get("from_cache"):
+        print("Using saved tuning. Run `mtplx tune --retune` to measure again.")
+    else:
+        print("Close heavy apps for cleaner results. Fans may get loud during tuning.")
+    print()
+    best = payload.get("best") or {}
+    for row in payload.get("results", []):
+        mode = str(row.get("mode") or "?")
+        tok_s = _fmt_metric(row.get("tok_s"), digits=1)
+        multiplier = _fmt_metric(row.get("multiplier_vs_ar"), digits=2)
+        marker = "  BEST" if best.get("mode") == mode else ""
+        print(f"{mode:<4} {tok_s:>6} tok/s   {multiplier}x{marker}")
+    print()
+    if best:
+        print(
+            f"Best for this Mac: {best.get('mode')}, "
+            f"{_fmt_metric(best.get('multiplier_vs_ar'), digits=2)}x AR"
+        )
+    else:
+        print("No MTP depth beat AR on this run")
+    if payload.get("saved") and best:
+        print(f"Saved: Web UI starts will use depth {best.get('depth')} for this model.")
+    elif payload.get("save_skipped_reason"):
+        print(f"Not saved: {payload.get('save_skipped_reason')}.")
+    if verbose:
+        print()
+        for row in payload.get("results", []):
+            if row.get("depth") is None:
+                continue
+            print(
+                f"{row.get('mode')}: verify_ms={_fmt_metric(row.get('verify_ms_per_call'), digits=2)} "
+                f"acceptance={_format_depth_acceptance(row)}"
+            )
+        artifacts = payload.get("artifacts") or {}
+        if artifacts:
+            print(f"artifacts: {artifacts.get('root')}")
+
+
+def _tune_error(
+    message: str,
+    *,
+    detail: str | None = None,
+    actionable: str | None = None,
+    thermal: dict[str, Any] | None = None,
+    json_output: bool = False,
+) -> int:
+    payload: dict[str, Any] = {"error": message}
+    if detail:
+        payload["detail"] = detail
+    if actionable:
+        payload["actionable"] = actionable
+    if thermal is not None:
+        payload["thermal"] = thermal
+    if json_output:
+        _print(payload)
+    else:
+        print(f"error: {message}", file=sys.stderr)
+        if detail:
+            print(f"detail: {detail}", file=sys.stderr)
+        if actionable:
+            print(f"action: {actionable}", file=sys.stderr)
+    return 1
 
 def cmd_pull_public(args: Any) -> int:
     from mtplx.hf_loader import pull_model, repo_id_from_model_ref
@@ -1234,6 +1940,7 @@ def _cmd_bench_run(args: Any) -> int:
     if harness == "auto":
         harness = "depth-sweep" if selected_profile.name == "performance-cold" else "direct-http"
     benchmark_seed = _benchmark_seed(args, runtime_profile=runtime_profile, harness=harness)
+    depths = _depths_for_bench_run(args)
 
     if args.dry_run:
         direct_command = _direct_http_bench_command(
@@ -1257,6 +1964,10 @@ def _cmd_bench_run(args: Any) -> int:
                     "profile": _exactness_profile_kwargs(args),
                 },
                 "harness": harness,
+                "depths": depths if harness == "depth-sweep" else None,
+                "compare_ar": bool(getattr(args, "compare_ar", False))
+                if harness == "depth-sweep"
+                else None,
                 "seed": benchmark_seed,
                 "profile": selected_profile.to_dict(),
                 "runtime_profile": runtime_profile,
@@ -1332,19 +2043,13 @@ def _cmd_bench_run(args: Any) -> int:
         result = _depth_sweep_native60(
             model=runtime_model,
             prompt_suite=prompt_suite,
+            depths=depths,
             max_tokens=args.max_tokens,
             limit=args.limit,
             seed=benchmark_seed,
-            depth=(
-                int(getattr(args, "depth", 3))
-                if "depth" in (getattr(args, "_cli_flags", set()) or set())
-                else _model_contract_depth(
-                    inspection,
-                    fallback=int(getattr(args, "depth", 3)),
-                )
-            ),
             draft_lm_head=draft_lm_head,
             draft_sampler=draft_sampler,
+            compare_ar=bool(getattr(args, "compare_ar", False)),
         )
     output.parent.mkdir(parents=True, exist_ok=True)
     write_depth_sweep(output, result)
@@ -3246,6 +3951,144 @@ def _active_mlx_fork_status(*, expected_fragment: str, expected_commit: str | No
         "observed_commit": commit,
     }
 
+
+def _apple_hardware_context() -> dict[str, Any]:
+    mem_bytes = _sysctl_int("hw.memsize")
+    chip = _sysctl_text("machdep.cpu.brand_string")
+    return {
+        "system": platform.system(),
+        "machine": platform.machine(),
+        "platform": platform.platform(),
+        "macos_version": _command_text(["sw_vers", "-productVersion"]),
+        "macos_build": _command_text(["sw_vers", "-buildVersion"]),
+        "chip": chip,
+        "chip_family": _apple_chip_family(chip),
+        "hw_model": _sysctl_text("hw.model"),
+        "memory_gib": (mem_bytes / (1024**3)) if mem_bytes else None,
+        "logical_cpu": _sysctl_int("hw.logicalcpu"),
+        "physical_cpu": _sysctl_int("hw.physicalcpu"),
+        "perf_cores": _sysctl_int("hw.perflevel0.physicalcpu"),
+        "efficiency_cores": _sysctl_int("hw.perflevel1.physicalcpu"),
+        "arm64": _sysctl_int("hw.optional.arm64"),
+    }
+
+def _software_context() -> dict[str, Any]:
+    env = collect_environment(".").to_dict()
+    return {
+        "python_executable": env.get("python_executable"),
+        "python_version": env.get("python_version"),
+        "mtplx_version": _package_version("mtplx"),
+        "mlx_version": _package_version("mlx"),
+        "mlx_lm_version": _package_version("mlx-lm"),
+        "numpy_version": _package_version("numpy"),
+        "git_branch": env.get("git_branch"),
+        "git_status": env.get("git_status"),
+    }
+
+def _mlx_backend_context(profile: Any) -> dict[str, Any]:
+    path = None
+    try:
+        spec = importlib.util.find_spec("mlx.core")
+        path = str(Path(spec.origin).resolve()) if spec and spec.origin else None
+    except Exception as exc:  # pragma: no cover - host dependent
+        path = f"ERROR: {exc}"
+    fork_status = None
+    if getattr(profile, "required_mlx_fork_fragment", None):
+        fork_status = _active_mlx_fork_status(
+            expected_fragment=profile.required_mlx_fork_fragment,
+            expected_commit=profile.required_mlx_fork_commit,
+        )
+    custom_env = {
+        key: os.environ.get(key)
+        for key in (
+            "MTPLX_GDN_OUT_QMV8",
+            "MTPLX_SOURCE_QMM_MANY",
+            "MTPLX_SOURCE_QMM_MANY_STRICT",
+            "MTPLX_NATIVE_MLP",
+            "MTPLX_VERIFY_MLP_FUSED",
+        )
+        if os.environ.get(key)
+    }
+    fork_active = bool(fork_status and fork_status.get("ok"))
+    return {
+        "mlx_core_path": path,
+        "mlx_version": _package_version("mlx"),
+        "mlx_lm_version": _package_version("mlx-lm"),
+        "optional_fast_mlx_fork_active": fork_active,
+        "optional_fast_mlx_fork": fork_status,
+        "stock_mlx_likely": not fork_active,
+        "custom_qmv_or_qmm_env": custom_env,
+    }
+
+def _ms_per_call(seconds: Any, calls: int) -> float | None:
+    if not isinstance(seconds, (int, float)) or not calls:
+        return None
+    return 1000.0 * float(seconds) / calls
+
+def _safe_ratio(numerator: Any, denominator: Any) -> float | None:
+    if not isinstance(numerator, (int, float)) or not isinstance(denominator, (int, float)):
+        return None
+    if float(denominator) == 0.0:
+        return None
+    return float(numerator) / float(denominator)
+
+def _package_version(name: str) -> str | None:
+    try:
+        return importlib.metadata.version(name)
+    except Exception:
+        return None
+
+def _command_text(args: list[str]) -> str | None:
+    try:
+        return subprocess.check_output(
+            args,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        ).strip()
+    except Exception:
+        return None
+
+def _sysctl_text(name: str) -> str | None:
+    return _command_text(["sysctl", "-n", name])
+
+def _sysctl_int(name: str) -> int | None:
+    text = _sysctl_text(name)
+    try:
+        return int(text) if text is not None else None
+    except ValueError:
+        return None
+
+def _apple_chip_family(chip: str | None) -> str | None:
+    if not chip:
+        return None
+    words = str(chip).replace("(TM)", "").split()
+    if len(words) >= 2 and words[0] == "Apple" and words[1].startswith("M"):
+        return " ".join(words[:3]) if len(words) >= 3 else " ".join(words[:2])
+    return chip
+
+def _rate_lists(numerators: list[Any], denominators: list[Any]) -> list[float | None]:
+    rates: list[float | None] = []
+    for numerator, denominator in zip(numerators, denominators):
+        den = float(denominator or 0)
+        rates.append((float(numerator) / den) if den else None)
+    return rates
+
+def _format_depth_acceptance(row: dict[str, Any]) -> str:
+    accepted = row.get("accepted_by_depth") or []
+    drafted = row.get("drafted_by_depth") or []
+    percentages = row.get("acceptance_percent_by_depth") or []
+    parts = []
+    for index, (acc, draft) in enumerate(zip(accepted, drafted), start=1):
+        pct = percentages[index - 1] if index - 1 < len(percentages) else None
+        pct_text = _fmt_metric(pct, digits=2)
+        parts.append(f"MTP{index} {acc}/{draft} ({pct_text}%)")
+    return " | ".join(parts) if parts else "n/a"
+
+def _fmt_metric(value: Any, *, digits: int) -> str:
+    if isinstance(value, (int, float)):
+        return f"{float(value):.{digits}f}"
+    return "n/a"
 
 def _print_serve_start_line(text: str = "") -> None:
     print(text, flush=True)
@@ -5556,6 +6399,97 @@ def _quickstart_run_terminal_chat_body(args: Any, *, runtime_model: str, inspect
         turn_index += 1
 
 
+def _quickstart_apply_tuned_depth(
+    args: Any,
+    *,
+    runtime_model: str,
+    target: str,
+    can_prompt: bool,
+) -> None:
+    if target != "openwebui":
+        return
+    if bool(getattr(args, "_explicit_depth", False)):
+        return
+    settings = {
+        "profile": "performance-cold",
+        "suite": TUNE_DEFAULT_SUITE,
+        "depths": TUNE_DEFAULT_DEPTHS,
+        "max_tokens": TUNE_DEFAULT_MAX_TOKENS,
+        "limit": TUNE_DEFAULT_LIMIT,
+        "seed": TUNE_DEFAULT_SEED,
+        "thinking": "disabled",
+    }
+    profile = get_profile("performance-cold")
+    hardware = _apple_hardware_context()
+    software = _software_context()
+    backend = _mlx_backend_context(profile)
+    state_key, _key_material = _tune_state_key(
+        runtime_model,
+        settings=settings,
+        hardware=hardware,
+        software=software,
+        backend=backend,
+    )
+    record = _load_tune_record(state_key)
+    if record is not None:
+        payload = record.get("payload") or {}
+        best = payload.get("best") or {}
+        depth = best.get("depth")
+        if isinstance(depth, int):
+            args.depth = depth
+            _quickstart_line(
+                f"tuned depth: D{depth} "
+                f"({_fmt_metric(best.get('multiplier_vs_ar'), digits=2)}x AR)"
+            )
+            return
+    if not can_prompt:
+        return
+    try:
+        from mtplx.ui.onboarding import screen_tuning_offer
+
+        should_tune = screen_tuning_offer()
+    except (KeyboardInterrupt, EOFError):
+        _quickstart_line()
+        _quickstart_line("tuning skipped")
+        return
+    if not should_tune:
+        _quickstart_line("tuning skipped; using default depth")
+        return
+    tune_args = SimpleNamespace(
+        command="tune",
+        model=runtime_model,
+        cache_dir=getattr(args, "cache_dir", None),
+        depths=TUNE_DEFAULT_DEPTHS,
+        max_tokens=TUNE_DEFAULT_MAX_TOKENS,
+        limit=TUNE_DEFAULT_LIMIT,
+        seed=TUNE_DEFAULT_SEED,
+        run_id=None,
+        output_dir=None,
+        output=None,
+        json=False,
+        verbose=False,
+        dry_run=False,
+        no_save=False,
+        retune=False,
+        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
+        yes=True,
+    )
+    code = _cmd_tune(
+        tune_args,
+        action="tune",
+        save_default=True,
+        verbose_default=False,
+    )
+    if code != 0:
+        _quickstart_line("tuning did not finish; using default depth")
+        return
+    record = _load_tune_record(state_key)
+    payload = record.get("payload") if isinstance(record, dict) else None
+    best = payload.get("best") if isinstance(payload, dict) else None
+    depth = best.get("depth") if isinstance(best, dict) else None
+    if isinstance(depth, int):
+        args.depth = depth
+
 def cmd_quickstart_public(args: Any) -> int:
     raw_target = getattr(args, "target", None)
 
@@ -5585,6 +6519,8 @@ def cmd_quickstart_public(args: Any) -> int:
     has_explicit_model = "model" in cli_flags
     args._model_explicit = has_explicit_model
     has_explicit_profile_flag = "profile" in cli_flags
+    has_explicit_depth = "depth" in cli_flags
+    args._explicit_depth = has_explicit_depth
     has_explicit_max = "max" in cli_flags
     has_prompt = bool(getattr(args, "prompt", None))
     is_dry_run = bool(getattr(args, "dry_run", False))
@@ -5861,6 +6797,12 @@ def cmd_quickstart_public(args: Any) -> int:
                 )
                 return gate_exit
             _apply_model_contract_depth_default(args, inspection)
+            _quickstart_apply_tuned_depth(
+                args,
+                runtime_model=runtime_model,
+                target=target,
+                can_prompt=bool(getattr(args, "_onboarded", False) and is_tty and not is_yes),
+            )
             if target == "openwebui":
                 args.model = runtime_model
                 return _quickstart_run_openwebui(args, runtime_model=runtime_model, inspection=inspection)
@@ -5900,6 +6842,12 @@ def cmd_quickstart_public(args: Any) -> int:
         )
         return gate_exit
     _apply_model_contract_depth_default(args, inspection)
+    _quickstart_apply_tuned_depth(
+        args,
+        runtime_model=runtime_model,
+        target=target,
+        can_prompt=bool(getattr(args, "_onboarded", False) and is_tty and not is_yes),
+    )
     _quickstart_line(f"model ready: {runtime_model}")
     if resolution.get("downloaded"):
         _quickstart_line(f"downloaded: {resolution.get('download_ref')}")

@@ -14,7 +14,7 @@ from mtplx.profiles import DEFAULT_HF_MODEL_ID, DEFAULT_MODEL_ID, DEFAULT_PROFIL
 
 
 DEFAULT_CONFIG_PATH = Path("~/.mtplx/config.toml").expanduser()
-RUNTIME_MODEL_COMMANDS = {"ask", "run", "chat", "start", "serve", "quickstart", "quick-start"}
+RUNTIME_MODEL_COMMANDS = {"ask", "run", "chat", "start", "serve", "quickstart", "quick-start", "tune"}
 CACHE_COMMANDS = {"pull", "list", "models", "remove"}
 LEGACY_DEFAULT_MODEL_REFS = {
     "models/Qwen3.6-27B-MTPLX-GDN8-Speed4",
@@ -62,7 +62,13 @@ def load_user_config(path: str | Path | None = None) -> UserConfig:
     profile = data.get("profile")
     thermal_control = data.get("thermal_control")
     if profile is not None:
-        profile = resolve_profile_name(str(profile))
+        try:
+            profile = resolve_profile_name(str(profile))
+        except ValueError:
+            # Config files can outlive profile names. Keep the raw value for
+            # diagnostics, but do not let a stale saved profile break unrelated
+            # commands before they can parse or explicitly choose a profile.
+            profile = str(profile)
     return UserConfig(
         path=resolved,
         exists=True,
@@ -84,7 +90,7 @@ def apply_user_config(args: Any, *, config_path: str | Path | None = None) -> Us
         _apply_model_default(args, config)
         _apply_cache_default(args, config)
         _apply_profile_default(args, config)
-    elif command == "bench" and getattr(args, "bench_action", None) == "run":
+    elif command == "bench" and getattr(args, "bench_action", None) in {"run", "tune"}:
         _apply_model_default(args, config)
         _apply_cache_default(args, config)
         _apply_profile_default(args, config)
@@ -131,4 +137,7 @@ def _apply_profile_default(args: Any, config: UserConfig) -> None:
         return
     current = getattr(args, "profile", None)
     if config.profile and current == DEFAULT_PROFILE_NAME:
-        args.profile = config.profile
+        try:
+            args.profile = resolve_profile_name(config.profile)
+        except ValueError:
+            return

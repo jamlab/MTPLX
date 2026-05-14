@@ -12,7 +12,7 @@
 [![PyPI](https://img.shields.io/pypi/v/mtplx?label=PyPI)](https://pypi.org/project/mtplx/)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-black?logo=apple)](https://developer.apple.com/metal/)
-[![Status](https://img.shields.io/badge/status-v0.3.5-blue)](CHANGELOG.md)
+[![Status](https://img.shields.io/badge/status-v0.3.6-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 </div>
@@ -36,6 +36,15 @@ The Homebrew installer sets up the `mtplx` command in `/opt/homebrew/bin` and bo
 
 That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`), runtime mode (Sustained / Sustained Max / Burst), and surface (browser chat at `127.0.0.1:8000/`, terminal chat, Pi, OpenCode, or Swival) on first run. On every subsequent run it asks "same as last time?" so you're one keypress from chatting.
 
+For a measured depth choice on your own Mac, run:
+
+```bash
+mtplx tune --model /path/to/model --retune
+```
+
+Tune compares AR, D1, D2, and D3 with thinking disabled, keeps AR as the `1.00x`
+baseline, and only saves a recommendation when an MTP depth is actually faster.
+
 ---
 
 ## What you get
@@ -56,9 +65,10 @@ That's it. The wizard handles the default speed model (`Youssofal/Qwen3.6-27B-MT
   - `Stable` — hidden compatibility flag (`--profile stable` / `--profile safe`) for the exact/staged long-reply path.
 - **Crash-safe fan control.** When Sustained Max or Burst is on, MTPLX spawns a detached watchdog that restores fans to auto if the parent dies for any reason — including `kill -9` and "I closed the terminal". Verified live on hardware.
 - **Idle-aware fan-backed modes.** Server tracks request activity; after 15 minutes of no chat, fans drop to auto, then ramp back up on the next message.
+- **Per-Mac Tune.** `mtplx tune`, `mtplx-tune`, and `mtplx bench tune` compare AR/D1/D2/D3 in isolated subprocesses and persist the winning depth per model, hardware, software, and settings. If no MTP depth beats AR, nothing worse is saved.
 - **Four-tier model compatibility contract.** `mtplx inspect <model>` reports: verified / arch-compatible-unverified / incompatible-architecture / no-MTP. No silent garbage runs.
 - **Lazy imports.** `mtplx --help`, `doctor`, `inspect`, `init`, `setup` work on a fresh venv *without MLX installed*. Generation and serving pull in MLX only when needed.
-- **v0.3.5 OpenCode agent fixes.** Tool-result turns now reuse the stable cached prefix instead of cold-prefilling the full OpenCode history, unsafe stream postcommit anchoring is fixed, and consecutive XML tool-call regressions are locked down.
+- **v0.3.6 memory, Tune, and OpenCode fixes.** Large `max_tokens` one-off requests no longer reserve the full decode KV window up front, anonymous no-reuse sessions do not retain full-capacity live cache refs, OpenCode tool-result turns reuse the stable cached prefix instead of cold-prefilling the full history, and Tune is available from the packaged CLI.
 
 > **Release honesty.** Burst is the old fan-backed headline lane and is capped in the UI at short contexts only. Sustained is the explicit long-context memory-safety lane; it is not an AR downgrade. Long no-fan decode decay remains a future runtime track; see [Roadmap](#roadmap).
 
@@ -86,6 +96,7 @@ mtplx start cli                             # terminal chat directly
 mtplx start pi                              # configure Pi and start MTPLX for Pi
 mtplx start opencode                        # configure OpenCode Desktop
 mtplx start swival                          # print the Swival generic-provider handoff
+mtplx tune --model /path/to/model --retune  # compare AR/D1/D2/D3 and save a real winner
 mtplx start cli --no-mtp                    # target-only AR generation
 mtplx start --profile sustained             # long-context native-MTP mode
 mtplx start --max                           # Sustained Max browser chat with fan boost
@@ -203,6 +214,8 @@ mtplx init                  # write ~/.mtplx/config.toml
 mtplx setup                 # download verified model, prepare cache
 mtplx pull                  # download the default HF model safely
 mtplx models                # cached models, validation, size, delete command
+mtplx tune                  # compare AR/D1/D2/D3; saves only a depth that beats AR
+mtplx-tune                  # same Tune command as a dedicated console script
 mtplx run "..."             # one-shot ask
 mtplx chat                  # terminal chat
 mtplx start                 # OpenAI/Anthropic-compatible server
@@ -223,9 +236,9 @@ The architectural achievement is **a single-model native-MTP runtime that's math
 
 ### 0. MLX runtime layer (the kernel stack we own)
 
-MTPLX is not a thin wrapper over stock MLX — the speed lane sits on top of an **MLX source fork** plus a small set of **custom Metal kernels** registered as primitives. Stock `mlx-lm` cannot reproduce the multiplier above; the runtime layer is what makes the speculative cycle in §2 tractable on Apple Silicon.
+MTPLX is not a thin wrapper over stock MLX. The recorded speed lane was measured with the runtime environment described below plus custom Metal kernels registered as primitives. Public wheels do not silently bundle an extra MLX fork; `mtplx doctor --deep --json` reports whether an optional fast MLX fork is active on the user's machine. Treat the fork details here as measured-environment evidence, not an install-time promise that every package manager has replaced MLX under you.
 
-What we changed at the MLX source level (fork: `mlx-mtplx-0.31.2-qmm`, commit `2377a99f` "Tune small-M qmv for MTPLX 60TPS path"):
+Measured MLX source-level environment for the public record (optional fork: `mlx-mtplx-0.31.2-qmm`, commit `2377a99f` "Tune small-M qmv for MTPLX 60TPS path"):
 
 - **Small-M `qmv` retuning.** The verify forward is dominated by quantized-matrix-vector ops at `M ≈ 3..6` (one position per accepted draft). Stock MLX's `qmv_fast_impl` is tuned for large M and stalls dispatch at small M. Our fork: `BN16` group-size, **4-simdgroup** instead of 2-simdgroup, `unroll_count(4)` on the inner loop. Cuts the verify-MLP region by enough to be the difference between "MTP loses to AR" and "MTP at ~2.24×".
 - **Source-primitive registration.** Custom kernels (below) are registered through `mlx.core.fast.metal_kernel` and integrated into MLX's graph the same way stock primitives are, so `mx.compile` can fuse around them and `mx.eval` doesn't see them as opaque blocks.

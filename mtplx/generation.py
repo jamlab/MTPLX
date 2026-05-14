@@ -13,6 +13,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Literal
 
 import mlx.core as mx
@@ -24,6 +25,7 @@ from .cache_state import (
     detach_array_leaf,
     detach_cache_state,
     owned_recurrent_state_stats,
+    restore_cache,
     rollback_after_verify,
     snapshot_cache,
     snapshot_untrimmable_cache,
@@ -1325,6 +1327,312 @@ class GenerationFinalState:
     mtp_history_position_base: int = 0
 
 
+def _prefill_restored_prompt_suffix(
+    rt: MTPLXRuntime,
+    restored: Any,
+    suffix: list[int],
+    *,
+    mtp_hidden_variant: str,
+    mtp_history_policy: str,
+    abort_check: Callable[[], bool] | None = None,
+) -> tuple[Any, Any, float, float]:
+    """Extend a restored SessionBank prefix without one giant suffix forward.
+
+    The old warm-prefix path sent the entire suffix through `forward_ar` with
+    hidden capture and logits enabled. In OpenCode sessions that made a stale
+    postcommit suffix behave like a full long-context prefill and, worse, it
+    could not observe abort requests until the huge Metal graph completed. This
+    mirrors the oMLX-style prefill shape: cache-only or hidden-only chunks for
+    the body, then a single final-token logits/hidden pass for decode startup.
+    """
+
+    if not suffix:
+        raise ValueError("suffix must not be empty")
+    _check_postcommit_abort(abort_check)
+    target_forward_time = 0.0
+    mtp_history_time = 0.0
+    final_logits_only = _final_logits_prefill_enabled()
+    use_committed_mtp = (
+        _mtp_history_uses_committed_cache(mtp_history_policy)
+        and restored.mtp_history_cache is not None
+    )
+
+    def append_history(hidden_states: Any, token_ids: list[int]) -> None:
+        nonlocal mtp_history_time
+        if not use_committed_mtp or not token_ids:
+            return
+        mtp_history_time += _append_mtp_history(
+            rt,
+            restored.mtp_history_cache,
+            hidden_states,
+            token_ids,
+            mtp_hidden_variant=mtp_hidden_variant,
+            force_eval=True,
+        )
+        _check_postcommit_abort(abort_check)
+
+    if use_committed_mtp and restored.hidden is not None:
+        append_history(restored.hidden, [int(suffix[0])])
+
+    if len(suffix) > 1:
+        body = suffix[:-1]
+        body_array = mx.array([body])
+        for start, end in _iter_prefill_chunk_spans(len(body)):
+            _check_postcommit_abort(abort_check)
+            chunk_array = body_array[:, start:end]
+            started = time.perf_counter()
+            with attention_phase("prefill"):
+                if use_committed_mtp:
+                    logits_chunk, hidden_chunk = rt.forward_ar(
+                        chunk_array,
+                        cache=restored.cache,
+                        return_hidden=True,
+                        hidden_variant=mtp_hidden_variant,
+                        emit_logits=False,
+                    )
+                else:
+                    hidden_chunk = None
+                    logits_chunk = _prefill_cache_only_forward(
+                        rt,
+                        chunk_array,
+                        restored.cache,
+                    )
+            if hidden_chunk is None:
+                if logits_chunk is None:
+                    _eval_cache_roots(restored.cache)
+                else:
+                    _eval(logits_chunk)
+            elif logits_chunk is None:
+                _eval(hidden_chunk)
+            else:
+                _eval(logits_chunk, hidden_chunk)
+            target_forward_time += time.perf_counter() - started
+            _runtime_count(rt, "restored_suffix_prefill_chunks")
+            _runtime_count(rt, "prefill_chunks")
+            _check_postcommit_abort(abort_check)
+
+            if hidden_chunk is not None:
+                append_history(
+                    hidden_chunk,
+                    [int(token) for token in suffix[start + 1 : end + 1]],
+                )
+            del hidden_chunk
+            del logits_chunk
+            target_forward_time += _prefill_chunk_cache_cleanup(rt)
+            _check_postcommit_abort(abort_check)
+
+    started = time.perf_counter()
+    _check_postcommit_abort(abort_check)
+    with attention_phase("prefill"):
+        suffix_logits, suffix_hidden = rt.forward_ar(
+            mx.array([[suffix[-1]]]),
+            cache=restored.cache,
+            return_hidden=True,
+            hidden_variant=mtp_hidden_variant,
+            emit_logits=True,
+            logits_keep=1 if final_logits_only else None,
+        )
+    _eval(suffix_logits, suffix_hidden)
+    target_forward_time += time.perf_counter() - started
+    _check_postcommit_abort(abort_check)
+    return (
+        suffix_logits[:, -1, :],
+        suffix_hidden[:, -1:, :],
+        target_forward_time,
+        mtp_history_time,
+    )
+
+
+def _cache_offset(cache: Any) -> int:
+    if not cache:
+        return 0
+    try:
+        return int(getattr(cache[0], "offset", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _trim_cache_to_offset(cache: Any, offset: int) -> bool:
+    target = max(0, int(offset))
+    if not cache:
+        return target == 0
+    for entry in cache:
+        current = int(getattr(entry, "offset", target) or 0)
+        if current < target:
+            return False
+        delta = current - target
+        if delta <= 0:
+            continue
+        trim = getattr(entry, "trim", None)
+        if not callable(trim):
+            return False
+        trimmed = int(trim(delta))
+        if trimmed != delta:
+            return False
+    return True
+
+
+def _entry_matches_restore_lookup(
+    entry: Any,
+    rt: MTPLXRuntime,
+    *,
+    hidden_variant: str | None,
+    template_hash: str | None,
+    mtp_history_policy: str | None,
+    draft_head_identity: str | None,
+    policy_fingerprint: str | None,
+) -> bool:
+    if getattr(entry, "model_path", None) != str(rt.model_path):
+        return False
+    if hidden_variant is not None and getattr(entry, "hidden_variant", None) != hidden_variant:
+        return False
+    if template_hash is not None and getattr(entry, "template_hash", None) != template_hash:
+        return False
+    entry_policy = getattr(entry, "mtp_history_policy", None)
+    if mtp_history_policy is not None:
+        if entry_policy != mtp_history_policy:
+            committed = {"committed", "last_window"}
+            if entry_policy not in committed or mtp_history_policy not in committed:
+                return False
+    if draft_head_identity is not None and getattr(entry, "draft_head_identity", None) != draft_head_identity:
+        return False
+    if policy_fingerprint is not None and getattr(entry, "policy_fingerprint", None) != policy_fingerprint:
+        return False
+    if (
+        getattr(entry, "mtp_snapshot_epoch", None) is not None
+        and int(getattr(entry, "mtp_snapshot_epoch")) != int(getattr(entry, "snapshot_epoch", 0))
+    ):
+        return False
+    return True
+
+
+def _near_prefix_restore_enabled() -> bool:
+    return not _env_falsey("MTPLX_SESSION_NEAR_PREFIX_RESTORE")
+
+
+def _restore_near_prefix_prompt_state(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    mtp_hidden_variant: str,
+    mtp_history_policy: str,
+    session_bank: Any,
+    template_hash: str | None,
+    draft_head_identity: str | None,
+    policy_fingerprint: str | None,
+    abort_check: Callable[[], bool] | None = None,
+) -> PromptState | None:
+    if not _near_prefix_restore_enabled() or len(prompt_ids) < 2:
+        return None
+    candidates = getattr(session_bank, "near_prefix_candidates", None)
+    if not callable(candidates):
+        return None
+    max_gap = max(0, _env_int("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP", 8))
+    min_match = max(1, _env_int("MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS", 64))
+    for entry, matched in candidates(
+        prompt_ids,
+        max_token_gap=max_gap,
+        min_matched_tokens=min_match,
+    ):
+        _check_postcommit_abort(abort_check)
+        matched = int(matched)
+        if matched < 2 or matched >= int(getattr(entry, "prefix_len", 0) or 0):
+            continue
+        if not _entry_matches_restore_lookup(
+            entry,
+            rt,
+            hidden_variant=mtp_hidden_variant,
+            template_hash=template_hash,
+            mtp_history_policy=mtp_history_policy,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+        ):
+            continue
+        if entry.mtp_history_snapshot is None and _mtp_history_uses_committed_cache(
+            mtp_history_policy
+        ):
+            continue
+
+        cache = rt.make_cache()
+        restore_cache(cache, entry.cache_snapshot)
+        if not _trim_cache_to_offset(cache, matched - 1):
+            continue
+
+        mtp_history_cache = None
+        if entry.mtp_history_snapshot is not None:
+            mtp_history_cache = rt.make_mtp_cache()
+            restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
+            if not _trim_cache_to_offset(mtp_history_cache, matched - 1):
+                continue
+
+        started = time.perf_counter()
+        _check_postcommit_abort(abort_check)
+        with attention_phase("prefill"):
+            logits, hidden = rt.forward_ar(
+                mx.array([[int(prompt_ids[matched - 1])]]),
+                cache=cache,
+                return_hidden=True,
+                hidden_variant=mtp_hidden_variant,
+                emit_logits=True,
+                logits_keep=1 if _final_logits_prefill_enabled() else None,
+            )
+        _eval(logits, hidden)
+        repair_time = time.perf_counter() - started
+        _check_postcommit_abort(abort_check)
+        restored = SimpleNamespace(
+            entry=SimpleNamespace(prefix_len=matched),
+            cache=cache,
+            logits=logits[:, -1, :],
+            hidden=hidden[:, -1:, :],
+            mtp_history_cache=mtp_history_cache,
+            restore_mode="near_prefix_clone",
+        )
+        suffix = list(prompt_ids[matched:])
+        if not suffix:
+            entry.hits += 1
+            entry.last_access_s = time.time()
+            return PromptState(
+                trunk_cache=cache,
+                logits=logits[:, -1, :],
+                hidden=hidden[:, -1:, :],
+                committed_mtp_cache=mtp_history_cache,
+                token_prefix=tuple(int(token) for token in prompt_ids),
+                prompt_eval_time_s=repair_time,
+                mtp_history_policy=mtp_history_policy,
+                cached_tokens=matched,
+                suffix_tokens=0,
+                cache_hit=True,
+                restore_mode="near_prefix_clone",
+            )
+        suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
+            _prefill_restored_prompt_suffix(
+                rt,
+                restored,
+                suffix,
+                mtp_hidden_variant=mtp_hidden_variant,
+                mtp_history_policy=mtp_history_policy,
+                abort_check=abort_check,
+            )
+        )
+        entry.hits += 1
+        entry.last_access_s = time.time()
+        return PromptState(
+            trunk_cache=cache,
+            logits=suffix_logits,
+            hidden=suffix_hidden,
+            committed_mtp_cache=mtp_history_cache,
+            token_prefix=tuple(int(token) for token in prompt_ids),
+            prompt_eval_time_s=repair_time + suffix_time + mtp_history_time,
+            prompt_mtp_history_time_s=mtp_history_time,
+            mtp_history_policy=mtp_history_policy,
+            cached_tokens=matched,
+            suffix_tokens=len(suffix),
+            cache_hit=True,
+            restore_mode="near_prefix_clone",
+        )
+    return None
+
+
 def restore_or_prefill_prompt_state(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -1388,43 +1696,21 @@ def restore_or_prefill_prompt_state(
                     restore_mode=restored.restore_mode,
                 )
 
-            started = time.perf_counter()
             _check_postcommit_abort(abort_check)
-            suffix_logits, suffix_hidden = rt.forward_ar(
-                mx.array([suffix]),
-                cache=restored.cache,
-                return_hidden=True,
-                hidden_variant=mtp_hidden_variant,
-                emit_logits=True,
-                logits_keep=1 if _final_logits_prefill_enabled() else None,
+            suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
+                _prefill_restored_prompt_suffix(
+                    rt,
+                    restored,
+                    suffix,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    mtp_history_policy=mtp_history_policy,
+                    abort_check=abort_check,
+                )
             )
-            _eval(suffix_logits, suffix_hidden)
-            _check_postcommit_abort(abort_check)
-            suffix_time = time.perf_counter() - started
-            mtp_history_time = 0.0
-            if _mtp_history_uses_committed_cache(mtp_history_policy):
-                history_hidden_parts = []
-                if restored.hidden is not None:
-                    history_hidden_parts.append(restored.hidden)
-                if len(suffix) > 1:
-                    history_hidden_parts.append(suffix_hidden[:, :-1, :])
-                if history_hidden_parts:
-                    history_hidden = (
-                        history_hidden_parts[0]
-                        if len(history_hidden_parts) == 1
-                        else mx.concatenate(history_hidden_parts, axis=1)
-                    )
-                    mtp_history_time = _append_mtp_history(
-                        rt,
-                        restored.mtp_history_cache,
-                        history_hidden,
-                        suffix,
-                        mtp_hidden_variant=mtp_hidden_variant,
-                    )
             return PromptState(
                 trunk_cache=restored.cache,
-                logits=suffix_logits[:, -1, :],
-                hidden=suffix_hidden[:, -1:, :],
+                logits=suffix_logits,
+                hidden=suffix_hidden,
                 committed_mtp_cache=restored.mtp_history_cache,
                 token_prefix=tuple(int(token) for token in prompt_ids),
                 prompt_eval_time_s=suffix_time + mtp_history_time,
@@ -1436,6 +1722,20 @@ def restore_or_prefill_prompt_state(
                 cache_hit=True,
                 restore_mode=restored.restore_mode,
             )
+
+        near_prompt_state = _restore_near_prefix_prompt_state(
+            rt,
+            prompt_ids,
+            mtp_hidden_variant=mtp_hidden_variant,
+            mtp_history_policy=mtp_history_policy,
+            session_bank=session_bank,
+            template_hash=template_hash,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+            abort_check=abort_check,
+        )
+        if near_prompt_state is not None:
+            return near_prompt_state
 
     mtp_history_cache = None
     prompt_history_time = 0.0
@@ -2953,6 +3253,7 @@ def generate_mtpk(
     session_policy_fingerprint: str | None = None,
     capture_final_state: bool = False,
     commit_prompt_state_to_bank: bool = False,
+    commit_prompt_state_keep_live_ref: bool = False,
     trace_label: str | None = None,
     trace_metadata: dict[str, Any] | None = None,
 ) -> GenerationOutput:
@@ -3075,7 +3376,7 @@ def generate_mtpk(
                 logits=prompt_state.logits,
                 hidden=prompt_state.hidden,
                 hidden_variant=mtp_hidden_variant,
-                keep_live_ref=False,
+                keep_live_ref=bool(commit_prompt_state_keep_live_ref),
                 session_id=session_id,
                 template_hash=session_template_hash,
                 mtp_history_policy=prompt_state.mtp_history_policy,

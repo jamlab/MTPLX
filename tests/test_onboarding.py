@@ -911,3 +911,115 @@ def test_screen_model_local_folder_routes_through_picker(tmp_path, monkeypatch):
 
     assert chosen == str(target)
     assert invocations == [None]
+
+
+def test_screen_tuning_offer_uses_numbered_choices(monkeypatch):
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": "2")
+
+    assert onboarding.screen_tuning_offer() is False
+
+
+def test_quickstart_applies_saved_tuned_depth(monkeypatch):
+    import argparse
+
+    from mtplx.commands import public
+
+    args = argparse.Namespace(depth=3, _explicit_depth=False, cache_dir=None)
+    monkeypatch.setattr(public, "_apple_hardware_context", lambda: {"chip": "Apple M5"})
+    monkeypatch.setattr(public, "_software_context", lambda: {"mtplx_version": "test", "mlx_version": "test"})
+    monkeypatch.setattr(public, "_mlx_backend_context", lambda _profile: {"stock_mlx_likely": True})
+    monkeypatch.setattr(public, "_tune_state_key", lambda *_args, **_kwargs: ("key", {}))
+    monkeypatch.setattr(
+        public,
+        "_load_tune_record",
+        lambda _key: {
+            "payload": {
+                "best": {
+                    "mode": "D2",
+                    "depth": 2,
+                    "multiplier_vs_ar": 1.8,
+                }
+            }
+        },
+    )
+
+    public._quickstart_apply_tuned_depth(
+        args,
+        runtime_model="/tmp/model",
+        target="openwebui",
+        can_prompt=False,
+    )
+
+    assert args.depth == 2
+
+
+def test_quickstart_tuning_prompt_can_save_and_apply(monkeypatch):
+    import argparse
+
+    from mtplx.commands import public
+
+    args = argparse.Namespace(
+        depth=3,
+        _explicit_depth=False,
+        cache_dir=None,
+        unsafe_force_unverified=False,
+    )
+    monkeypatch.setattr(public, "_apple_hardware_context", lambda: {"chip": "Apple M5"})
+    monkeypatch.setattr(public, "_software_context", lambda: {"mtplx_version": "test", "mlx_version": "test"})
+    monkeypatch.setattr(public, "_mlx_backend_context", lambda _profile: {"stock_mlx_likely": True})
+    monkeypatch.setattr(public, "_tune_state_key", lambda *_args, **_kwargs: ("key", {}))
+    monkeypatch.setattr("mtplx.ui.onboarding.screen_tuning_offer", lambda: True)
+    calls = []
+    records = iter(
+        [
+            None,
+            {
+                "payload": {
+                    "best": {
+                        "mode": "D1",
+                        "depth": 1,
+                        "multiplier_vs_ar": 1.4,
+                    }
+                }
+            },
+        ]
+    )
+    monkeypatch.setattr(public, "_load_tune_record", lambda _key: next(records))
+
+    def fake_tune(*_args, **_kwargs):
+        calls.append(True)
+        return 0
+
+    monkeypatch.setattr(public, "_cmd_tune", fake_tune)
+
+    public._quickstart_apply_tuned_depth(
+        args,
+        runtime_model="/tmp/model",
+        target="openwebui",
+        can_prompt=True,
+    )
+
+    assert calls == [True]
+    assert args.depth == 1
+
+
+def test_quickstart_explicit_depth_never_uses_tuning(monkeypatch):
+    import argparse
+
+    from mtplx.commands import public
+
+    args = argparse.Namespace(depth=2, _explicit_depth=True, cache_dir=None)
+    monkeypatch.setattr(
+        public,
+        "_load_tune_record",
+        lambda _key: (_ for _ in ()).throw(AssertionError("should not load tuning")),
+    )
+
+    public._quickstart_apply_tuned_depth(
+        args,
+        runtime_model="/tmp/model",
+        target="openwebui",
+        can_prompt=True,
+    )
+
+    assert args.depth == 2

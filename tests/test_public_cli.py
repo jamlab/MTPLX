@@ -1394,6 +1394,91 @@ def test_public_bench_long_code_dash_alias_uses_sustained_direct_test(capsys):
     assert command[command.index("--tests") + 1] == "long_code"
 
 
+def test_tune_dry_run_prints_clean_candidate_commands(capsys):
+    code = main(
+        [
+            "tune",
+            "--model",
+            "models/not-loaded-in-dry-run",
+            "--dry-run",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "MTPLX Tune" in out
+    assert "dry-run: no model will be loaded" in out
+    assert "--_candidate ar" in out
+    assert "--_candidate 3" in out
+
+
+def test_bench_tune_dry_run_is_json_support_payload(capsys):
+    code = main(
+        [
+            "bench",
+            "tune",
+            "--model",
+            "models/not-loaded-in-dry-run",
+            "--dry-run",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["action"] == "bench tune"
+    assert payload["save_default"] is False
+    assert payload["settings"]["depths"] == "1,2,3"
+    assert payload["settings"]["max_tokens"] == 192
+    assert [row["candidate"] for row in payload["candidates"]] == ["AR", "D1", "D2", "D3"]
+
+
+def test_tune_best_multiplier_selects_depth_not_ar():
+    rows = public._annotate_multipliers(
+        [
+            {"mode": "AR", "depth": None, "tok_s": 30.0},
+            {"mode": "D1", "depth": 1, "tok_s": 48.0},
+            {"mode": "D2", "depth": 2, "tok_s": 54.0},
+            {"mode": "D3", "depth": 3, "tok_s": 57.0},
+        ]
+    )
+    best = public._best_multiplier_summary(rows)
+
+    assert rows[0]["multiplier_vs_ar"] == 1.0
+    assert best["winner"]["mode"] == "D3"
+    assert best["winner"]["depth"] == 3
+    assert best["winner"]["multiplier_vs_ar"] == 1.9
+
+
+def test_tune_no_mtp_win_has_no_saved_recommendation():
+    best = public._best_multiplier_summary(
+        public._annotate_multipliers(
+            [
+                {"mode": "AR", "depth": None, "tok_s": 50.0},
+                {"mode": "D1", "depth": 1, "tok_s": 49.0},
+                {"mode": "D2", "depth": 2, "tok_s": 48.0},
+                {"mode": "D3", "depth": 3, "tok_s": 47.0},
+            ]
+        )
+    )
+
+    assert best["winner"] is None
+    assert best["verdict"] == "no_mtp_depth_beat_ar"
+
+
+def test_tune_state_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_TUNE_STATE", str(tmp_path / "tuning.json"))
+    payload = {
+        "best": {"mode": "D2", "depth": 2, "tok_s": 54.0, "multiplier_vs_ar": 1.8},
+        "results": [],
+    }
+
+    public._save_tune_record("key", key_material={"model": "m"}, payload=payload)
+    record = public._load_tune_record("key")
+
+    assert record is not None
+    assert record["payload"]["best"]["depth"] == 2
+
+
 def test_public_bench_run_dry_run_records_external_kernel_env(monkeypatch, capsys):
     monkeypatch.setenv("MTPLX_VERIFY_OUTPUT_DEPENDS", "recurrent")
     monkeypatch.setenv("MTPLX_VERIFY_OUTPUT_DEPENDS_AFTER_TOKENS", "1024")
@@ -1762,6 +1847,7 @@ def test_product_helper_commands_parse():
     ask = parser.parse_args(["ask", "hello"])
     ask_stats = parser.parse_args(["ask", "hello", "--stats"])
     serve_start = parser.parse_args(["serve", "--port", "18012"])
+    tune = parser.parse_args(["tune", "--dry-run"])
     status = parser.parse_args(["status", "--deep"])
     doctor_opencode = parser.parse_args(["doctor", "opencode", "--json"])
     doctor_android = parser.parse_args(["doctor", "android-studio", "--port", "8008", "--json"])
@@ -1771,6 +1857,7 @@ def test_product_helper_commands_parse():
     models = parser.parse_args(["models", "--json"])
     report = parser.parse_args(["report", "--output-dir", "reports"])
     nightly = parser.parse_args(["bench", "nightly", "--out", "out.json"])
+    bench_tune = parser.parse_args(["bench", "tune", "--dry-run"])
     nightly_json = parser.parse_args(["bench", "nightly", "--json", "--dry-run"])
     debug = parser.parse_args(["debug", "bundle", "--run-id", "debug-test"])
     hotpath = parser.parse_args(["debug", "hotpath"])
@@ -1815,6 +1902,8 @@ def test_product_helper_commands_parse():
     assert serve_start.command == "serve"
     assert serve_start.port == 18012
     assert serve_start.stats_footer is True
+    assert tune.command == "tune"
+    assert tune.depths == "1,2,3"
     assert status.command == "status"
     assert status.deep is True
     assert doctor_opencode.command == "doctor"
@@ -1831,6 +1920,7 @@ def test_product_helper_commands_parse():
     assert report.bundle is True
     assert report.deep is True
     assert nightly.bench_action == "nightly"
+    assert bench_tune.bench_action == "tune"
     assert nightly.output == "out.json"
     assert nightly_json.json is True
     assert debug.debug_action == "bundle"

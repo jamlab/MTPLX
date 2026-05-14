@@ -638,8 +638,10 @@ def _apply_metal_memory_caps(
     fixed budget; ``clear_cache`` periodically drops idle pool memory.
 
     Operators can override via env:
-      MTPLX_MEMORY_LIMIT_BYTES   - hard cap, default 75% of total RAM
-      MTPLX_WIRED_LIMIT_BYTES    - wired (resident) cap, default 60% of total RAM
+      MTPLX_MEMORY_LIMIT_BYTES   - hard cap, default 75% of total RAM,
+                                   capped at 192 GiB on very large Macs
+      MTPLX_WIRED_LIMIT_BYTES    - wired (resident) cap, default 60% of total
+                                   RAM, capped at 160 GiB on very large Macs
 
     Both accept plain bytes or K/M/G/T suffix.
     """
@@ -669,8 +671,20 @@ def _apply_metal_memory_caps(
         default_mem = 1
         default_wired = 1
     else:
-        default_mem = min(total_ram, max(8 * 1024**3, int(total_ram * 0.75)))
-        default_wired = min(default_mem, max(4 * 1024**3, int(total_ram * 0.60)))
+        # Percentage-only caps scale badly on 512 GiB M3 Ultra systems: 75% /
+        # 60% permits hundreds of GiB of allocator high-water before MLX is
+        # forced to release pressure. Keep the old behavior on 64-128 GiB Macs,
+        # but bound the default resident budget on large unified-memory boxes.
+        default_mem = min(
+            total_ram,
+            max(8 * 1024**3, int(total_ram * 0.75)),
+            192 * 1024**3,
+        )
+        default_wired = min(
+            default_mem,
+            max(4 * 1024**3, int(total_ram * 0.60)),
+            160 * 1024**3,
+        )
     mem_limit = _parse_metal_memory_size_bytes(mem_raw, default_mem)
     wired_limit = _parse_metal_memory_size_bytes(wired_raw, default_wired)
 
@@ -1549,6 +1563,7 @@ def _mtplx_tool_contract_text(tools: list[dict[str, Any]]) -> str:
     return (
         f"{_MTPLX_TOOL_CONTRACT_SENTINEL} declared tools and schemas: {allowed}. "
         "Call only these exact tool names and exact argument keys/case. "
+        "Include every required key shown in the signature. "
         f'Emit one tool call as <tool_call>{{"name":"{example_name}","arguments":{example_args}}}</tool_call>. '
         "Never invent Agent/task/Explore or any undeclared tool. "
         "If no declared tool applies, answer normally."
@@ -1662,10 +1677,49 @@ def _json_object_string(value: Any, *, context: str) -> str:
     return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
 
 
-def _decode_tool_parameter_value(value: str) -> Any:
+def _schema_type_names(schema: Any) -> set[str]:
+    if not isinstance(schema, dict):
+        return set()
+    raw_type = schema.get("type")
+    if isinstance(raw_type, str):
+        return {raw_type}
+    if isinstance(raw_type, list):
+        return {str(item) for item in raw_type if isinstance(item, str)}
+    return set()
+
+
+def _tool_parameter_schema(
+    tools: list[dict[str, Any]],
+    *,
+    tool_name: str | None,
+    parameter_name: str,
+) -> dict[str, Any] | None:
+    if not tool_name:
+        return None
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(function, dict):
+            continue
+        if str(function.get("name") or "").strip() != str(tool_name).strip():
+            continue
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict):
+            return None
+        properties = parameters.get("properties")
+        if not isinstance(properties, dict):
+            return None
+        schema = properties.get(parameter_name)
+        return schema if isinstance(schema, dict) else None
+    return None
+
+
+def _decode_tool_parameter_value(value: str, schema: Any | None = None) -> Any:
     text = value.strip()
     if not text:
         return ""
+    schema_types = _schema_type_names(schema)
+    if schema_types and schema_types <= {"string", "null"}:
+        return text
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -1834,10 +1888,6 @@ def _stream_tool_call_deltas(
             }
 
 
-def _json_string_inner(text: str) -> str:
-    return json.dumps(text, ensure_ascii=False)[1:-1]
-
-
 def _find_casefold(haystack: str, needle: str, start: int = 0) -> int:
     return haystack.lower().find(needle.lower(), start)
 
@@ -1920,8 +1970,7 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
         self._name: str | None = None
         self._current_key: str | None = None
         self._current_value_parts: list[str] = []
-        self._params: dict[str, str] = {}
-        self._arg_open = False
+        self._params: dict[str, Any] = {}
         self._done = False
         self._tool_calls: list[dict[str, Any]] | None = None
         self._fallback_reason: str | None = None
@@ -1960,8 +2009,11 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                 )
             )
             self._name_delta_emitted = True
-        suffix = "}" if self._arg_open else "{}"
-        deltas.append(_tool_delta(self._call_index, arguments=suffix))
+        arguments = _json_object_string(
+            self._params,
+            context=f"tool_call[{self._call_index}]",
+        )
+        deltas.append(_tool_delta(self._call_index, arguments=arguments))
         self._done = True
         self._tool_calls = [
             {
@@ -1969,10 +2021,7 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                 "type": "function",
                 "function": {
                     "name": str(self._name or ""),
-                    "arguments": _json_object_string(
-                        self._params,
-                        context=f"tool_call[{self._call_index}]",
-                    ),
+                    "arguments": arguments,
                 },
             }
         ]
@@ -2042,15 +2091,6 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                         )
                     )
                     self._name_delta_emitted = True
-                prefix = "," if self._arg_open else "{"
-                self._arg_open = True
-                deltas.append(
-                    _tool_delta(
-                        self._call_index,
-                        arguments=f"{prefix}{json.dumps(key, ensure_ascii=False)}:",
-                    )
-                )
-                deltas.append(_tool_delta(self._call_index, arguments='"'))
                 self._buf = self._buf[param_end + 1 :]
                 self._stage = "in_parameter"
                 continue
@@ -2067,12 +2107,6 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                         value_piece = value_piece[1:]
                     if value_piece:
                         self._current_value_parts.append(value_piece)
-                        deltas.append(
-                            _tool_delta(
-                                self._call_index,
-                                arguments=_json_string_inner(value_piece),
-                            )
-                        )
                     return deltas
                 value_piece = self._buf[:close_start]
                 # Qwen usually formats XML parameters as newline-delimited
@@ -2085,15 +2119,15 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                     value_piece = value_piece[1:]
                 if value_piece:
                     self._current_value_parts.append(value_piece)
-                    deltas.append(
-                        _tool_delta(
-                            self._call_index,
-                            arguments=_json_string_inner(value_piece),
-                        )
-                    )
                 key = str(self._current_key or "")
-                self._params[key] = "".join(self._current_value_parts).strip()
-                deltas.append(_tool_delta(self._call_index, arguments='"'))
+                self._params[key] = _decode_tool_parameter_value(
+                    "".join(self._current_value_parts),
+                    schema=_tool_parameter_schema(
+                        self._tools,
+                        tool_name=self._name,
+                        parameter_name=key,
+                    ),
+                )
                 self._buf = self._buf[close_start + len(self._PARAM_CLOSE) :]
                 self._stage = "find_parameter"
                 continue
@@ -2880,16 +2914,33 @@ def _postcommit_next_turn_prefix_ids(
     )
     if not rendered:
         return None
+    sentinel_at = rendered.find(_POSTCOMMIT_SENTINEL_CONTENT)
     turn_start = _sentinel_next_turn_start(
         rendered,
         sentinel_role=sentinel_role,
     )
+    if turn_start is None and sentinel_role == "tool":
+        # Qwen-style templates render OpenAI tool-result messages as a user
+        # turn containing <tool_response>. The sentinel is still a tool
+        # message semantically, but the rendered boundary to cut at is user.
+        user_turn_start = _sentinel_next_turn_start(rendered, sentinel_role="user")
+        if (
+            user_turn_start is not None
+            and sentinel_at >= 0
+            and (sentinel_at - user_turn_start) <= 2048
+        ):
+            turn_start = user_turn_start
     if turn_start is None:
         return None
     prefix_text = rendered[:turn_start]
     if not prefix_text:
         return None
-    return _encode_rendered_chat_text(tokenizer, prefix_text)
+    boundaries = (
+        _tool_history_generation_boundaries(prefix_text)
+        if assistant_tool_calls
+        else []
+    )
+    return _encode_rendered_chat_text_segmented(tokenizer, prefix_text, boundaries)
 
 
 def _encode_prompt(
@@ -3330,14 +3381,195 @@ def _temporary_env(updates: dict[str, str | None]):
                 os.environ[key] = value
 
 
+def _dynamic_paged_kv_initial_new_token_budget(max_new_tokens: int) -> tuple[int, int | None]:
+    raw = (
+        os.environ.get("MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS")
+        or "16384"
+    ).strip().lower()
+    requested = max(0, int(max_new_tokens))
+    if raw in {"0", "off", "false", "no", "none", "unlimited"}:
+        return requested, None
+    try:
+        cap = max(1, int(raw))
+    except (TypeError, ValueError):
+        cap = 16384
+    return min(requested, cap), cap
+
+
+def _dynamic_paged_kv_reservation(
+    *,
+    prompt_tokens: int,
+    max_new_tokens: int,
+    mtp_depth: int,
+) -> dict[str, Any]:
+    requested_new = max(0, int(max_new_tokens))
+    reserved_new, cap = _dynamic_paged_kv_initial_new_token_budget(requested_new)
+    reserved_tokens = (
+        max(0, int(prompt_tokens))
+        + max(0, int(reserved_new))
+        + max(0, int(mtp_depth))
+    )
+    return {
+        "env": {"MTPLX_DYNAMIC_PAGED_KV_TOKENS": str(reserved_tokens)},
+        "requested_new_tokens": int(requested_new),
+        "reserved_new_tokens": int(reserved_new),
+        "initial_new_token_cap": cap,
+        "reservation_capped": bool(reserved_new < requested_new),
+        "reserved_total_tokens": int(reserved_tokens),
+    }
+
+
 def _dynamic_paged_kv_env(
     *,
     prompt_tokens: int,
     max_new_tokens: int,
     mtp_depth: int,
 ) -> dict[str, str]:
-    needed = max(0, int(prompt_tokens)) + max(0, int(max_new_tokens)) + max(0, int(mtp_depth))
-    return {"MTPLX_DYNAMIC_PAGED_KV_TOKENS": str(needed)}
+    return _dynamic_paged_kv_reservation(
+        prompt_tokens=prompt_tokens,
+        max_new_tokens=max_new_tokens,
+        mtp_depth=mtp_depth,
+    )["env"]
+
+
+def _session_keep_live_refs_for_request(
+    *,
+    session_source: str | None,
+    session_id: str | None,
+    tool_names: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    if (
+        os.environ.get("MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS", "")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        return True
+    source = str(session_source or "")
+    if source.startswith("header.") or source.startswith("metadata."):
+        return True
+    if source in {"user", "chat_id", "conversation_id"}:
+        return True
+    if _anonymous_coding_agent_tool_request(tool_names):
+        return True
+    # Anonymous auto sessions are useful as cloneable prefix snapshots, but
+    # retaining their live paged-KV containers preserves the full request
+    # capacity. A benchmark with 65k max_tokens and many one-off prompts can
+    # otherwise pin huge unused buffers for no reuse benefit.
+    return bool(
+        session_id
+        and not session_id.startswith("anon-")
+        and source == "longest_prefix"
+    )
+
+
+def _anonymous_coding_agent_tool_request(
+    tool_names: list[str] | tuple[str, ...] | None,
+) -> bool:
+    names = {str(name).strip().lower() for name in (tool_names or []) if str(name).strip()}
+    if not names:
+        return False
+    coding_agent_tools = {
+        "bash",
+        "edit",
+        "glob",
+        "grep",
+        "ls",
+        "multi_edit",
+        "patch",
+        "read",
+        "str_replace_editor",
+        "task",
+        "todowrite",
+        "webfetch",
+        "write",
+    }
+    return bool(names & coding_agent_tools)
+
+
+def _clear_mlx_cache_after_request(
+    state: Any,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    raw = (
+        os.environ.get("MTPLX_CLEAR_CACHE_AFTER_REQUEST") or "auto"
+    ).strip().lower()
+    if raw in {"0", "false", "no", "off", "never"}:
+        return {"cleared": False, "reason": "disabled"}
+    lock = getattr(state, "lock", None)
+    acquired = False
+    if lock is not None and hasattr(lock, "acquire"):
+        acquired = bool(lock.acquire(blocking=False))
+        if not acquired:
+            return {"cleared": False, "reason": "model_lock_busy", "trigger": reason}
+    try:
+        try:
+            import mlx.core as mx
+        except Exception as exc:
+            return {
+                "cleared": False,
+                "reason": "mlx_unavailable",
+                "trigger": reason,
+                "error": repr(exc),
+            }
+        synchronize = getattr(mx, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+        clear_cache = getattr(mx, "clear_cache", None)
+        if not callable(clear_cache):
+            return {
+                "cleared": False,
+                "reason": "clear_cache_unavailable",
+                "trigger": reason,
+            }
+        clear_cache()
+        return {"cleared": True, "reason": reason}
+    except Exception as exc:
+        return {
+            "cleared": False,
+            "reason": "clear_cache_error",
+            "trigger": reason,
+            "error": repr(exc),
+        }
+    finally:
+        if acquired:
+            lock.release()
+
+
+def _attach_skipped_postcommit_cleanup(
+    state: Any,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    if (
+        snapshot.get("mode") == "async_skipped"
+        and snapshot.get("reason") == "stop_token_boundary_mismatch"
+    ):
+        snapshot["mlx_cache_cleanup"] = _clear_mlx_cache_after_request(
+            state,
+            reason="stop_token_boundary_mismatch_postcommit_skipped",
+        )
+    return snapshot
+
+
+def _mlx_allocator_public_stats() -> dict[str, int]:
+    try:
+        import mlx.core as mx
+    except Exception:
+        return {}
+    stats: dict[str, int] = {}
+    for name, attr in (
+        ("active_memory_bytes", "get_active_memory"),
+        ("peak_memory_bytes", "get_peak_memory"),
+        ("cache_memory_bytes", "get_cache_memory"),
+    ):
+        fn = getattr(mx, attr, None)
+        if callable(fn):
+            try:
+                stats[name] = int(fn())
+            except Exception:
+                pass
+    return stats
 
 
 def _generation_truth_stats(state: "ServerState", effective_mode: str) -> dict[str, Any]:
@@ -3469,7 +3701,9 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "requested_mtp_depth",
     "requested_speculative_depth",
     "long_context_mtp_depth_policy",
+    "active_memory_bytes",
     "peak_memory_bytes",
+    "cache_memory_bytes",
     "reasoning_reentries",
     "reasoning_tokens",
     "answer_tokens",
@@ -3479,7 +3713,9 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "tool_parse_fallback_kind",
     "tool_parser_dialect",
     "request_session_source",
+    "request_session_keep_live_ref",
     "request_session_prefix_diagnostic",
+    "dynamic_paged_kv",
     "session_prompt_prefix_commit",
 )
 PUBLIC_POSTCOMMIT_KEYS = (
@@ -3494,6 +3730,7 @@ PUBLIC_POSTCOMMIT_KEYS = (
     "cached_tokens",
     "suffix_tokens",
     "cache_miss_reason",
+    "mlx_cache_cleanup",
     "error",
 )
 
@@ -3730,6 +3967,7 @@ def _store_retokenized_history_snapshot(
     abort_check: Callable[[], bool] | None = None,
     abort_reason: Callable[[], str] | None = None,
     pending_record: Any | None = None,
+    keep_live_ref: bool = True,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "reason": "no_session_id"}
@@ -3846,7 +4084,7 @@ def _store_retokenized_history_snapshot(
                 logits=prompt_state.logits,
                 hidden=prompt_state.hidden,
                 hidden_variant="post_norm",
-                keep_live_ref=True,
+                keep_live_ref=bool(keep_live_ref),
                 session_id=session_id,
                 template_hash=state.template_hash,
                 mtp_history_policy="committed",
@@ -4070,6 +4308,7 @@ def _store_generation_final_history_snapshot(
     thinking_enabled: bool,
     policy_fingerprint: str,
     tool_specs: list[dict[str, Any]] | None = None,
+    keep_live_ref: bool = True,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "mode": "unsafe", "reason": "no_session_id"}
@@ -4114,7 +4353,7 @@ def _store_generation_final_history_snapshot(
             logits=final_state.final_logits,
             hidden=final_state.final_hidden,
             hidden_variant="post_norm",
-            keep_live_ref=True,
+            keep_live_ref=bool(keep_live_ref),
             session_id=session_id,
             template_hash=state.template_hash,
             mtp_history_policy="committed",
@@ -4162,6 +4401,7 @@ def _schedule_idle_postcommit_snapshot(
     tool_specs: list[dict[str, Any]] | None = None,
     session: Any | None = None,
     expected_session_revision: int | None = None,
+    keep_live_ref: bool = True,
 ) -> dict[str, Any]:
     """Schedule a background SessionBank commit for a response the
     generation-final compatibility check rejected as unsafe (most commonly
@@ -4301,6 +4541,7 @@ def _schedule_idle_postcommit_snapshot(
                     abort_check=_postcommit_abort_check,
                     abort_reason=_postcommit_abort_reason,
                     pending_record=record,
+                    keep_live_ref=bool(keep_live_ref),
                 )
                 if postcommit.get("stored"):
                     _log(postcommit)
@@ -4351,6 +4592,42 @@ def _schedule_idle_postcommit_snapshot(
             # Telemetry plumbing must never break the request path.
             pass
     return pending
+
+
+def _skipped_idle_postcommit_snapshot(
+    *,
+    unsafe_reason: str,
+    assistant_tool_calls: list[dict[str, Any]] | None = None,
+    prompt_prefix_len: int | None = None,
+) -> dict[str, Any] | None:
+    """Return a cheap postcommit result for unsafe cases that should not prefill.
+
+    OpenCode often finishes a tool-result turn with a tiny assistant message
+    whose canonical chat-template history differs from the generated boundary
+    only because of stop-token framing. The foreground path has already
+    committed the prompt prefix, so scheduling a full retokenized postcommit
+    here burns GPU for seconds without improving the next request materially.
+
+    Tool-call turns are different: the next request sends structured
+    assistant tool-call history, so they must still use the retokenized async
+    path.
+    """
+    reason = str(unsafe_reason or "")
+    if assistant_tool_calls:
+        return None
+    if reason != "stop_token_boundary_mismatch":
+        return None
+    result: dict[str, Any] = {
+        "stored": False,
+        "mode": "async_skipped",
+        "reason": reason,
+    }
+    if prompt_prefix_len is not None:
+        try:
+            result["prefix_len"] = int(prompt_prefix_len)
+        except (TypeError, ValueError):
+            pass
+    return result
 
 
 def _generation_params(
@@ -4446,6 +4723,7 @@ def _run_generation(
     background_request: bool = False,
     commit_final_state_to_bank: bool = True,
     commit_prompt_prefix_to_bank: bool = False,
+    session_keep_live_ref: bool = True,
     request_observability: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     response_max, sampler, generation_limits = _generation_params(
@@ -4519,12 +4797,12 @@ def _run_generation(
             state.lock.acquire()
         lock_wait_time_s += time.perf_counter() - lock_started
         try:
-            dynamic_kv_env = _dynamic_paged_kv_env(
+            dynamic_kv_reservation = _dynamic_paged_kv_reservation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,
                 mtp_depth=effective_depth,
             )
-            with _temporary_env(dynamic_kv_env):
+            with _temporary_env(dynamic_kv_reservation["env"]):
                 if effective_mode == "ar":
                     out = generate_ar(
                         state.runtime,
@@ -4568,6 +4846,7 @@ def _run_generation(
                             and session_bank is not None
                             and session_id is not None
                         ),
+                        commit_prompt_state_keep_live_ref=session_keep_live_ref,
                         trace_label=trace_label,
                         trace_metadata=trace_metadata,
                         adaptive_policy=adaptive_policy,
@@ -4642,7 +4921,7 @@ def _run_generation(
                 logits=final_state.final_logits,
                 hidden=final_state.final_hidden,
                 hidden_variant="post_norm",
-                keep_live_ref=True,
+                keep_live_ref=bool(session_keep_live_ref),
                 session_id=session_id,
                 template_hash=session_template_hash,
                 mtp_history_policy="committed",
@@ -4685,6 +4964,12 @@ def _run_generation(
             mtp_depth=actual_mtp_depth if effective_mode == "mtp" else 0,
             generation_limits=generation_limits,
         )
+        envelope["dynamic_paged_kv"] = {
+            key: value
+            for key, value in dynamic_kv_reservation.items()
+            if key != "env"
+        }
+        envelope.update(_mlx_allocator_public_stats())
         envelope["generation_mode"] = effective_mode
         envelope["requested_mtp_depth"] = (
             requested_mtp_depth if effective_mode == "mtp" else 0
@@ -6934,7 +7219,20 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.post("/admin/cache/clear")
     def admin_clear_cache() -> dict[str, Any]:
-        return state.sessions.clear_all()
+        cleared = state.sessions.clear_all()
+        if isinstance(cleared, dict):
+            cleared["mlx_cache_cleanup"] = _clear_mlx_cache_after_request(
+                state,
+                reason="admin_cache_clear",
+            )
+            return cleared
+        return {
+            "cleared": cleared,
+            "mlx_cache_cleanup": _clear_mlx_cache_after_request(
+                state,
+                reason="admin_cache_clear",
+            ),
+        }
 
     @app.get("/v1/models")
     def list_models() -> dict[str, Any]:
@@ -7084,6 +7382,15 @@ def create_app(state: ServerState) -> FastAPI:
         prefix_diagnostic = getattr(state.sessions, "last_prefix_diagnostic", None)
         if isinstance(prefix_diagnostic, dict):
             request_observability["request_session_prefix_diagnostic"] = prefix_diagnostic
+        session_keep_live_ref = _session_keep_live_refs_for_request(
+            session_source=session_source,
+            session_id=session_id,
+            tool_names=_tool_names(tool_specs) if tools_active else None,
+        )
+        request_observability["request_session_keep_live_ref"] = bool(
+            session_keep_live_ref
+        )
+
         def run_generation_for_response() -> dict[str, Any]:
             if session is None:
                 return _run_generation(
@@ -7107,6 +7414,7 @@ def create_app(state: ServerState) -> FastAPI:
                     session_policy_fingerprint=policy_fingerprint,
                     background_request=background,
                     commit_prompt_prefix_to_bank=tools_active,
+                    session_keep_live_ref=session_keep_live_ref,
                     request_observability=request_observability,
                 )
             with session.in_flight_generation():
@@ -7128,6 +7436,7 @@ def create_app(state: ServerState) -> FastAPI:
                     session_draft_head_identity=state.draft_head_identity,
                     session_policy_fingerprint=policy_fingerprint,
                     commit_prompt_prefix_to_bank=tools_active,
+                    session_keep_live_ref=session_keep_live_ref,
                     request_observability=request_observability,
                 )
                 session.commit(
@@ -7173,6 +7482,16 @@ def create_app(state: ServerState) -> FastAPI:
             generated_mode = str(
                 generated.get("stats", {}).get("generation_mode") or ""
             )
+            skipped = _skipped_idle_postcommit_snapshot(
+                unsafe_reason=unsafe_reason,
+                assistant_tool_calls=assistant_tool_calls,
+                prompt_prefix_len=len(prompt_ids),
+            )
+            if skipped is not None:
+                generated["stats"]["session_postcommit_snapshot"] = (
+                    _attach_skipped_postcommit_cleanup(state, skipped)
+                )
+                return
             if (
                 stream_response
                 and state.args.session_postcommit_mode == "async"
@@ -7191,6 +7510,7 @@ def create_app(state: ServerState) -> FastAPI:
                         tool_specs=tool_specs if tools_active else None,
                         session=session,
                         expected_session_revision=getattr(session, "revision", None),
+                        keep_live_ref=session_keep_live_ref,
                     )
                 )
                 return
@@ -7206,6 +7526,7 @@ def create_app(state: ServerState) -> FastAPI:
                         thinking_enabled=thinking_enabled,
                         policy_fingerprint=policy_fingerprint,
                         tool_specs=tool_specs if tools_active else None,
+                        keep_live_ref=session_keep_live_ref,
                     ),
                     batch_key=f"postcommit.inline:{session_id or 'stateless'}",
                 ),
@@ -7333,6 +7654,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 session_policy_fingerprint=policy_fingerprint,
                                 background_request=background,
                                 commit_prompt_prefix_to_bank=tools_active,
+                                session_keep_live_ref=session_keep_live_ref,
                                 request_observability=request_observability,
                             )
                         else:
@@ -7357,6 +7679,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     session_policy_fingerprint=policy_fingerprint,
                                     commit_final_state_to_bank=False,
                                     commit_prompt_prefix_to_bank=tools_active,
+                                    session_keep_live_ref=session_keep_live_ref,
                                     request_observability=request_observability,
                                 )
                                 queue.put(("done", generated))
@@ -7386,6 +7709,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             thinking_enabled=thinking_enabled,
                                             policy_fingerprint=policy_fingerprint,
                                             tool_specs=tool_specs if tools_active else None,
+                                            keep_live_ref=session_keep_live_ref,
                                         )
                                     else:
                                         postcommit = _store_generation_final_history_snapshot(
@@ -7399,6 +7723,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             thinking_enabled=thinking_enabled,
                                             policy_fingerprint=policy_fingerprint,
                                             tool_specs=tool_specs if tools_active else None,
+                                            keep_live_ref=session_keep_live_ref,
                                         )
                                         if not postcommit.get("stored"):
                                             generated["stats"][
@@ -7645,6 +7970,7 @@ def create_app(state: ServerState) -> FastAPI:
                     )
                     return content
 
+                stream_cancelled_by_client = False
                 for field, text in splitter.start():
                     if text:
                         for chunk in stream_content_delta_chunks(field, text):
@@ -7659,9 +7985,16 @@ def create_app(state: ServerState) -> FastAPI:
                                 cancel_event.is_set()
                                 or await raw_request.is_disconnected()
                             ):
+                                stream_cancelled_by_client = True
                                 _cancel_stream_generation(
                                     cancel_event, generation_future
                                 )
+                                if session is not None and hasattr(
+                                    session, "abort_pending_postcommit"
+                                ):
+                                    session.abort_pending_postcommit(
+                                        "stream_client_disconnected"
+                                    )
                                 return
                             now_s = time.perf_counter()
                             if (
@@ -7832,28 +8165,47 @@ def create_app(state: ServerState) -> FastAPI:
                                         ),
                                         "boundary_kind": prompt_prefix_boundary_kind,
                                     }
-                                    generated["stats"][
-                                        "session_postcommit_snapshot"
-                                    ] = _schedule_idle_postcommit_snapshot(
-                                        state,
-                                        session_id=session_id,
-                                        messages=request.messages,
-                                        assistant_content=assistant_history_content,
+                                    unsafe_reason = str(
+                                        postcommit.get("reason") or "unsafe_history"
+                                    )
+                                    postcommit_snapshot = _skipped_idle_postcommit_snapshot(
+                                        unsafe_reason=unsafe_reason,
                                         assistant_tool_calls=assistant_tool_calls,
-                                        thinking_enabled=thinking_enabled,
-                                        policy_fingerprint=policy_fingerprint,
-                                        unsafe_reason=str(
-                                            postcommit.get("reason")
-                                            or "unsafe_history"
-                                        ),
-                                        tool_specs=(
-                                            tool_specs if tools_active else None
-                                        ),
-                                        session=session,
-                                        expected_session_revision=getattr(
-                                            session, "revision", None
+                                        prompt_prefix_len=(
+                                            prompt_prefix_commit.prefix_len
                                         ),
                                     )
+                                    if postcommit_snapshot is not None:
+                                        postcommit_snapshot = (
+                                            _attach_skipped_postcommit_cleanup(
+                                                state,
+                                                postcommit_snapshot,
+                                            )
+                                        )
+                                    else:
+                                        postcommit_snapshot = _schedule_idle_postcommit_snapshot(
+                                            state,
+                                            session_id=session_id,
+                                            messages=request.messages,
+                                            assistant_content=(
+                                                assistant_history_content
+                                            ),
+                                            assistant_tool_calls=assistant_tool_calls,
+                                            thinking_enabled=thinking_enabled,
+                                            policy_fingerprint=policy_fingerprint,
+                                            unsafe_reason=unsafe_reason,
+                                            tool_specs=(
+                                                tool_specs if tools_active else None
+                                            ),
+                                            session=session,
+                                            expected_session_revision=getattr(
+                                                session, "revision", None
+                                            ),
+                                            keep_live_ref=session_keep_live_ref,
+                                        )
+                                    generated["stats"][
+                                        "session_postcommit_snapshot"
+                                    ] = postcommit_snapshot
                                 else:
                                     yield mark_sse_sent(
                                         error_chunk(
@@ -7903,6 +8255,7 @@ def create_app(state: ServerState) -> FastAPI:
                             yield mark_sse_sent("data: [DONE]\n\n")
                             return
                 except asyncio.CancelledError:
+                    stream_cancelled_by_client = True
                     _cancel_stream_generation(cancel_event, generation_future)
                     raise
                 except BaseException as exc:
@@ -7911,6 +8264,12 @@ def create_app(state: ServerState) -> FastAPI:
                     return
                 finally:
                     _cancel_stream_generation(cancel_event, generation_future)
+                    if (
+                        stream_cancelled_by_client
+                        and session is not None
+                        and hasattr(session, "abort_pending_postcommit")
+                    ):
+                        session.abort_pending_postcommit("stream_cancelled")
                     if session is not None and not commit_event.is_set():
                         commit_state["commit"] = False
                         commit_event.set()

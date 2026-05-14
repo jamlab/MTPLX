@@ -583,7 +583,7 @@ def test_restore_thermal_profile_verified_fails_when_still_manual(monkeypatch):
     thermal.detect_thermal_control.cache_clear()
 
 
-def test_restore_thermal_profile_verified_rejects_auto_with_max_target(monkeypatch):
+def test_restore_thermal_profile_verified_accepts_auto_with_transient_max_target(monkeypatch):
     thermal.detect_thermal_control.cache_clear()
     monkeypatch.setattr(thermal, "_find_thermalforge", lambda: "/usr/local/bin/thermalforge")
     suspicious_status = (
@@ -601,7 +601,8 @@ def test_restore_thermal_profile_verified_rejects_auto_with_max_target(monkeypat
 
     result = thermal.restore_thermal_profile_verified(settle_timeout_s=0)
 
-    assert result["ok"] is False
+    assert result["ok"] is True
+    assert result["message"] == "fan profile restored"
     thermal.detect_thermal_control.cache_clear()
 
 

@@ -50,6 +50,108 @@ def test_startup_urls_distinguish_wildcard_bind_from_local_url():
     assert openai._startup_openai_base_url(args) == "http://127.0.0.1:8000/v1"
 
 
+def test_dynamic_paged_kv_reservation_caps_oversized_response_budget(monkeypatch):
+    monkeypatch.delenv("MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS", raising=False)
+
+    reservation = openai._dynamic_paged_kv_reservation(
+        prompt_tokens=181,
+        max_new_tokens=65536,
+        mtp_depth=3,
+    )
+
+    assert reservation["env"]["MTPLX_DYNAMIC_PAGED_KV_TOKENS"] == str(181 + 16384 + 3)
+    assert reservation["requested_new_tokens"] == 65536
+    assert reservation["reserved_new_tokens"] == 16384
+    assert reservation["initial_new_token_cap"] == 16384
+    assert reservation["reservation_capped"] is True
+
+
+def test_dynamic_paged_kv_reservation_can_disable_initial_cap(monkeypatch):
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS", "off")
+
+    reservation = openai._dynamic_paged_kv_reservation(
+        prompt_tokens=10,
+        max_new_tokens=65536,
+        mtp_depth=3,
+    )
+
+    assert reservation["env"]["MTPLX_DYNAMIC_PAGED_KV_TOKENS"] == str(10 + 65536 + 3)
+    assert reservation["reserved_new_tokens"] == 65536
+    assert reservation["initial_new_token_cap"] is None
+    assert reservation["reservation_capped"] is False
+
+
+def test_implicit_anonymous_sessions_do_not_keep_live_refs(monkeypatch):
+    monkeypatch.delenv(
+        "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS",
+        raising=False,
+    )
+
+    assert (
+        openai._session_keep_live_refs_for_request(
+            session_source="implicit_hash", session_id="anon-bench"
+        )
+        is False
+    )
+
+
+def test_anonymous_coding_agent_tool_sessions_keep_live_refs(monkeypatch):
+    monkeypatch.delenv(
+        "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS",
+        raising=False,
+    )
+
+    assert (
+        openai._session_keep_live_refs_for_request(
+            session_source="new",
+            session_id="anon-opencode",
+            tool_names=["bash", "read", "write"],
+        )
+        is True
+    )
+
+
+def test_anonymous_non_tool_benchmark_sessions_stay_cold(monkeypatch):
+    monkeypatch.delenv(
+        "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS",
+        raising=False,
+    )
+
+    assert (
+        openai._session_keep_live_refs_for_request(
+            session_source="new",
+            session_id="anon-aime",
+            tool_names=[],
+        )
+        is False
+    )
+
+
+def test_explicit_sessions_keep_live_refs(monkeypatch):
+    monkeypatch.delenv(
+        "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS",
+        raising=False,
+    )
+
+    assert (
+        openai._session_keep_live_refs_for_request(
+            session_source="metadata.chat_id", session_id="chat-123"
+        )
+        is True
+    )
+
+
+def test_implicit_session_live_refs_have_diagnostic_override(monkeypatch):
+    monkeypatch.setenv("MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS", "1")
+
+    assert (
+        openai._session_keep_live_refs_for_request(
+            session_source="implicit_hash", session_id="anon-bench"
+        )
+        is True
+    )
+
+
 class FakeExecutor:
     def submit(self, fn, *args, **kwargs):
         future: Future = Future()
@@ -628,6 +730,72 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
     assert "already in flight" not in second.text
 
 
+def test_streaming_stop_boundary_mismatch_skips_idle_retokenized_postcommit(
+    monkeypatch,
+):
+    state = _fake_streaming_session_state()
+    cleanup_calls: list[str] = []
+
+    def fake_store_generation_final(*_args, **_kwargs):
+        return {
+            "stored": False,
+            "mode": "unsafe",
+            "reason": "stop_token_boundary_mismatch",
+        }
+
+    def fail_schedule(*_args, **_kwargs):
+        raise AssertionError("stop-token mismatches should not schedule GPU postcommit")
+
+    def fake_cleanup(_state, *, reason):
+        cleanup_calls.append(reason)
+        return {"cleared": True, "reason": reason}
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        token_callback = kwargs.get("token_callback")
+        tokens = [ord("O"), ord("K")]
+        if token_callback is not None:
+            token_callback(tokens)
+        return {
+            "text": "OK",
+            "tokens": tokens,
+            "stats": {
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": 2,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 2,
+            "finish_reason": "stop",
+            "_final_state": _fake_final_state(tokens),
+        }
+
+    monkeypatch.setattr(
+        openai, "_store_generation_final_history_snapshot", fake_store_generation_final
+    )
+    monkeypatch.setattr(openai, "_schedule_idle_postcommit_snapshot", fail_schedule)
+    monkeypatch.setattr(openai, "_clear_mlx_cache_after_request", fake_cleanup)
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-session-id": "stop-boundary-session"},
+            json={
+                "messages": [{"role": "user", "content": "Say OK"}],
+                "enable_thinking": False,
+                "stream": True,
+                "max_tokens": 4,
+            },
+        )
+
+    assert response.status_code == 200
+    assert '"mode": "async_skipped"' in response.text
+    assert '"reason": "stop_token_boundary_mismatch"' in response.text
+    assert '"mlx_cache_cleanup"' in response.text
+    assert '"postcommit_prompt_prefix"' in response.text
+    assert cleanup_calls == ["stop_token_boundary_mismatch_postcommit_skipped"]
+
+
 def test_streaming_ar_schedules_async_postcommit_in_default_mode(monkeypatch):
     state = _fake_streaming_session_state()
     scheduled: list[dict] = []
@@ -960,6 +1128,44 @@ def _write_tool_schema():
     }
 
 
+def _bash_tool_schema():
+    return {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "description": {"type": "string"},
+                    "timeout": {"type": "number"},
+                },
+                "required": ["command", "description"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _question_tool_schema():
+    return {
+        "type": "function",
+        "function": {
+            "name": "question",
+            "description": "Ask the user one or more questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "questions": {"type": "array"},
+                },
+                "required": ["questions"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 def _fake_generation(text: str):
     return {
         "text": text,
@@ -1065,6 +1271,7 @@ def test_tool_contract_includes_exact_schema_keys_for_opencode_write(monkeypatch
     assert '"filePath":"<string>"' in contract
     assert '"content":"<string>"' in contract
     assert "exact argument keys/case" in contract
+    assert "Include every required key" in contract
 
 
 def test_opencode_title_request_fast_path_does_not_enter_model(monkeypatch):
@@ -1150,6 +1357,52 @@ def test_tool_requests_enable_prompt_prefix_bank_commit(monkeypatch):
     )
 
     assert captured["commit_prompt_state_to_bank"] is True
+    assert captured["commit_prompt_state_keep_live_ref"] is True
+
+
+def test_run_generation_can_store_final_state_without_live_cache_ref(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+
+    def fake_generate_mtpk(*_args, **_kwargs):
+        tokens = [ord("O"), ord("K")]
+        return SimpleNamespace(
+            tokens=tokens,
+            text="OK",
+            stats=SimpleNamespace(
+                to_dict=lambda: {
+                    "prompt_eval_time_s": 0.0,
+                    "generated_tokens": 2,
+                    "elapsed_s": 0.1,
+                    "tok_s": 20.0,
+                }
+            ),
+            final_state=_fake_final_state(tokens),
+        )
+
+    monkeypatch.setattr(openai, "generate_mtpk", fake_generate_mtpk)
+
+    openai._run_generation(
+        state,
+        [1, 2, 3],
+        max_tokens=65536,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        seed=42,
+        generation_mode="mtp",
+        depth=3,
+        session_id="anon-bench",
+        session_bank=state.sessions.bank,
+        session_template_hash=state.template_hash,
+        session_draft_head_identity=state.draft_head_identity,
+        session_policy_fingerprint="policy",
+        session_keep_live_ref=False,
+    )
+
+    assert state.sessions.bank.puts
+    assert state.sessions.bank.puts[-1]["keep_live_ref"] is False
 
 
 def test_tool_template_schema_failure_retries_with_compact_contract(monkeypatch):
@@ -1330,6 +1583,54 @@ def test_tool_result_history_encoding_keeps_generation_prompt_prefix():
     assert "<tool_response>" in rendered
 
 
+def test_postcommit_tool_history_encoding_matches_next_tool_turn_prefix():
+    tokenizer = QwenToolHistoryBoundaryTokenizer()
+    tools = [_tool_schema()]
+    initial_messages = [
+        openai.ChatMessage(role="system", content="You are opencode."),
+        openai.ChatMessage(role="user", content="write hello.py"),
+    ]
+    tool_call = {
+        "id": "call_write",
+        "type": "function",
+        "function": {
+            "name": "session_status",
+            "arguments": "{}",
+        },
+    }
+    history_messages = [
+        *initial_messages,
+        openai.ChatMessage(role="assistant", content="", tool_calls=[tool_call]),
+    ]
+    resumed_messages = [
+        *history_messages,
+        openai.ChatMessage(
+            role="tool",
+            tool_call_id="call_write",
+            content='{"status":"ok"}',
+        ),
+    ]
+
+    postcommit_prefix = openai._postcommit_next_turn_prefix_ids(
+        tokenizer,
+        history_messages,
+        enable_thinking=True,
+        strip_assistant_reasoning_history=False,
+        tools=tools,
+        assistant_tool_calls=[tool_call],
+    )
+    resumed_prompt = openai._encode_messages(
+        tokenizer,
+        resumed_messages,
+        enable_thinking=True,
+        tools=tools,
+    )
+
+    assert postcommit_prefix is not None
+    assert resumed_prompt[: len(postcommit_prefix)] == postcommit_prefix
+    assert tokenizer.merged not in postcommit_prefix
+
+
 def test_chat_tool_xml_returns_openai_tool_calls_nonstream(monkeypatch):
     client = TestClient(create_app(_fake_state()))
     monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
@@ -1469,6 +1770,89 @@ def test_chat_stream_consecutive_qwen_xml_tool_calls_emit_ordered_deltas(monkeyp
         payload["choices"][0].get("finish_reason") == "tool_calls"
         for payload in payloads
     )
+
+
+def test_chat_stream_qwen_xml_shell_arguments_are_typed(monkeypatch):
+    client = TestClient(create_app(_fake_state()))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    generated = (
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\nnpm run build\n</parameter>\n"
+        "<parameter=description>\nBuild the project\n</parameter>\n"
+        "<parameter=timeout>\n60000\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(generated))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Build."}],
+            "tools": [_bash_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 256,
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(response.text)
+    args_text = "".join(
+        item.get("function", {}).get("arguments", "")
+        for payload in payloads
+        for item in payload["choices"][0]["delta"].get("tool_calls", [])
+    )
+    args = json.loads(args_text)
+    assert args == {
+        "command": "npm run build",
+        "description": "Build the project",
+        "timeout": 60000,
+    }
+    assert isinstance(args["timeout"], int)
+    assert '"timeout":"60000"' not in args_text
+    assert any(
+        payload["choices"][0].get("finish_reason") == "tool_calls"
+        for payload in payloads
+    )
+
+
+def test_chat_stream_qwen_xml_questions_arguments_are_arrays(monkeypatch):
+    client = TestClient(create_app(_fake_state()))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    questions = (
+        '[{"header":"Scope","id":"scope","question":"Pick one",'
+        '"options":[{"label":"A","description":"first"},'
+        '{"label":"B","description":"second"}]}]'
+    )
+    generated = (
+        "<tool_call>\n<function=question>\n"
+        f"<parameter=questions>\n{questions}\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(generated))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Ask."}],
+            "tools": [_question_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 256,
+        },
+    )
+
+    assert response.status_code == 200
+    args_text = "".join(
+        item.get("function", {}).get("arguments", "")
+        for payload in _stream_payloads(response.text)
+        for item in payload["choices"][0]["delta"].get("tool_calls", [])
+    )
+    args = json.loads(args_text)
+    assert isinstance(args["questions"], list)
+    assert args["questions"][0]["options"][1]["description"] == "second"
 
 
 def test_chat_stream_tool_call_preamble_is_stored_for_postcommit(monkeypatch):

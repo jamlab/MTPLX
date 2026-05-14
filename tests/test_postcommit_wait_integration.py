@@ -151,6 +151,30 @@ def test_pending_near_prefix_resolves_tool_result_waiter() -> None:
     session.wait_for_pending_postcommit(timeout_s=1.0)
 
 
+def test_pending_near_prefix_tolerates_small_tool_boundary_gap() -> None:
+    manager = EngineSessionManager()
+    session = manager.get_or_create("sess-tool")
+    prompt = list(range(200))
+    session.commit_prompt_prefix(
+        prompt_ids=prompt,
+        finish_reason="tool_calls",
+        boundary_kind="tool_call_prompt_prefix",
+    )
+    future: Future = Future()
+    session.set_pending_postcommit(future)
+    tool_result_prompt = prompt[:-3] + [10_001, 10_002, 10_003, 10_004]
+
+    session_id, source = manager.resolve_session_id(prompt_ids=tool_result_prompt)
+
+    assert session_id == "sess-tool"
+    assert source == "pending_postcommit_near_prefix"
+    assert manager.last_prefix_diagnostic is not None
+    assert manager.last_prefix_diagnostic["near_prefix_gap"] == 3
+
+    future.set_result(None)
+    session.wait_for_pending_postcommit(timeout_s=1.0)
+
+
 def test_retokenized_prefix_replaces_prompt_anchor_boundary() -> None:
     session = EngineSession("sess-tool")
     session.commit_prompt_prefix(prompt_ids=[1, 2, 3, 4], finish_reason="tool_calls")
@@ -166,6 +190,24 @@ def test_retokenized_prefix_replaces_prompt_anchor_boundary() -> None:
     assert session.committed_token_ids == (1, 2, 3, 99, 100)
     assert session.prefix_len == 5
     assert session.bytes_estimate == 123
+    assert session.revision == 2
+
+
+def test_retokenized_prefix_tolerates_small_tool_boundary_gap() -> None:
+    session = EngineSession("sess-tool")
+    prompt = list(range(200))
+    session.commit_prompt_prefix(prompt_ids=prompt, finish_reason="tool_calls")
+
+    retokenized = prompt[:-3] + [10_001, 10_002, 10_003, 10_004]
+    commit = session.commit_retokenized_prefix(
+        token_ids=retokenized,
+        expected_revision=1,
+        nbytes=123,
+    )
+
+    assert commit.committed is True
+    assert commit.reason == "committed_retokenized_prefix"
+    assert session.committed_token_ids == tuple(retokenized)
     assert session.revision == 2
 
 

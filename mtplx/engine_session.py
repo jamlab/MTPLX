@@ -198,6 +198,8 @@ def is_background_request(
 
 
 _DEFAULT_POSTCOMMIT_WAIT_TIMEOUT_S = 2.0
+_DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP = 8
+_DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS = 64
 
 
 def _postcommit_wait_timeout_s() -> float:
@@ -216,6 +218,33 @@ def _postcommit_wait_timeout_s() -> float:
     if value < 0:
         return 0.0
     return value
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(int(minimum), value)
+
+
+def _near_prefix_max_token_gap() -> int:
+    return _env_int(
+        "MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP",
+        _DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP,
+        minimum=0,
+    )
+
+
+def _near_prefix_min_match_tokens() -> int:
+    return _env_int(
+        "MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS",
+        _DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS,
+        minimum=1,
+    )
 
 
 @dataclass
@@ -666,7 +695,10 @@ class EngineSession:
                     self.prefix_len,
                 )
             matched = common_prefix_len(current, tokens)
-            if matched < len(current) and (len(current) - matched) > 2:
+            if (
+                matched < len(current)
+                and (len(current) - matched) > _near_prefix_max_token_gap()
+            ):
                 return EngineSessionCommit(
                     False,
                     "retokenized_prefix_not_extending_session",
@@ -881,10 +913,21 @@ class EngineSessionManager:
         self,
         token_ids: list[int] | tuple[int, ...],
         *,
-        max_token_gap: int = 2,
+        max_token_gap: int | None = None,
+        min_matched_tokens: int | None = None,
     ) -> tuple[EngineSession | None, int]:
         """Return a pending-postcommit session with a near-exact prompt prefix."""
         tokens = tuple(int(token) for token in token_ids)
+        gap_limit = (
+            _near_prefix_max_token_gap()
+            if max_token_gap is None
+            else max(0, int(max_token_gap))
+        )
+        min_match = (
+            _near_prefix_min_match_tokens()
+            if min_matched_tokens is None
+            else max(1, int(min_matched_tokens))
+        )
         best: EngineSession | None = None
         best_matched = 0
         for session in self._sessions.values():
@@ -893,11 +936,12 @@ class EngineSessionManager:
             prefix = session.committed_token_ids
             if not prefix:
                 continue
-            if len(prefix) > len(tokens) + int(max_token_gap):
+            if len(prefix) > len(tokens) + gap_limit:
                 continue
             matched = common_prefix_len(tokens, prefix)
             gap = len(prefix) - matched
-            if gap < 0 or gap > int(max_token_gap):
+            required_match = min(min_match, max(1, len(prefix) - gap_limit))
+            if gap < 0 or gap > gap_limit or matched < required_match:
                 continue
             if best is None or matched > best_matched or (
                 matched == best_matched and len(prefix) > len(best.committed_token_ids)

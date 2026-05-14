@@ -62,6 +62,7 @@ NATIVE_MTP_60_MODEL = DEFAULT_MODEL_ID
 
 PUBLIC_COMMANDS = (
     ("start", "Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival)"),
+    ("tune", "Find the fastest AR/D1/D2/D3 depth for this Mac"),
     ("help", "Detailed help; `help commands` / `help flags` / `help <name>`"),
     ("setup", "Prepare config and the model cache"),
     ("quickstart", "Run the local OpenAI/Anthropic server"),
@@ -536,6 +537,12 @@ def _add_mtp_toggle_args(parser: argparse.ArgumentParser) -> None:
 
 def cmd_bench_public(args: argparse.Namespace) -> int:
     from .commands.public import cmd_bench_public as handler
+
+    return handler(args)
+
+
+def cmd_tune_public(args: argparse.Namespace) -> int:
+    from .commands.public import cmd_tune_public as handler
 
     return handler(args)
 
@@ -1879,6 +1886,28 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_p.add_argument("--include-paths", action="store_true", help="Keep local paths in --bundle output")
     doctor_p.set_defaults(func=cmd_doctor)
 
+    tune_p = sub.add_parser("tune", help="Find the fastest AR/D1/D2/D3 depth for this Mac")
+    tune_p.add_argument("--model", default=default_model)
+    tune_p.add_argument("--cache-dir")
+    tune_p.add_argument("--depths", default="1,2,3", help="Comma-separated MTP depths to compare against AR")
+    tune_p.add_argument("--max-tokens", type=int, default=192)
+    tune_p.add_argument("--limit", type=int, default=1)
+    tune_p.add_argument("--seed", type=int, default=0)
+    tune_p.add_argument("--run-id")
+    tune_p.add_argument("--output-dir")
+    tune_p.add_argument("--output")
+    tune_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    tune_p.add_argument("--verbose", action="store_true", help="Show verify and acceptance details")
+    tune_p.add_argument("--dry-run", action="store_true", help="Show candidate commands without loading MLX")
+    tune_p.add_argument("--no-save", action="store_true", help="Do not save the winning depth")
+    tune_p.add_argument("--retune", action="store_true", help="Ignore saved tuning and measure again")
+    tune_p.add_argument("--unsafe-force-unverified", action="store_true")
+    tune_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
+    tune_p.add_argument("--profile", choices=PROFILE_CHOICES, default="performance-cold", help=argparse.SUPPRESS)
+    tune_p.add_argument("--_candidate", choices=["ar", "1", "2", "3"], dest="_tune_candidate", help=argparse.SUPPRESS)
+    tune_p.add_argument("--_candidate-output", dest="_tune_candidate_output", help=argparse.SUPPRESS)
+    tune_p.set_defaults(func=cmd_tune_public)
+
     report_p = sub.add_parser("report", help="Create a redacted MTPLX support bundle")
     report_p.add_argument("--project-root", default=".")
     report_p.add_argument("--smc-path", default=os.environ.get("MTPLX_SMC_PATH") or shutil.which("smc") or "")
@@ -2117,6 +2146,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             "run",
             "context",
+            "tune",
             "prefill-ladder",
             "nightly",
             "compare",
@@ -2213,6 +2243,9 @@ def build_parser() -> argparse.ArgumentParser:
     bench_p.add_argument("--output")
     bench_p.add_argument("--out", dest="output", help="Alias for --output")
     bench_p.add_argument("--json", action="store_true", help="Accepted for friendly scripts; benchmark commands already print JSON")
+    bench_p.add_argument("--verbose", action="store_true", help="Show detailed tuner diagnostics where supported")
+    bench_p.add_argument("--no-save", action="store_true", help="Do not save tuner recommendations")
+    bench_p.add_argument("--retune", action="store_true", help="Ignore saved tuner results where supported")
     bench_p.add_argument("--before", help="Baseline envelope or nightly summary for bench compare")
     bench_p.add_argument("--after", help="Candidate envelope or nightly summary for bench compare")
     bench_p.add_argument("--strict-exactness", action="store_true", help="Require exactness gate pass in envelope compare mode")
@@ -2231,6 +2264,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sampler seed. Defaults are harness-aware: 42 for long direct-HTTP runs, 0 for cold depth-sweep runs.",
     )
     bench_p.add_argument("--max-tokens", type=int, default=128)
+    bench_p.add_argument(
+        "--depths",
+        help="Comma-separated MTP depths for bench tune/depth diagnostics; defaults to 1,2,3 for tune.",
+    )
     bench_p.add_argument(
         "--contexts",
         help="Comma-separated prompt token contexts for bench prefill-ladder, e.g. 512,1k,32k",
@@ -2390,7 +2427,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable Qwen thinking in bench prefill-ladder chat formatting.",
     )
-    bench_p.add_argument("--speculative-depth", type=int, default=0)
+    bench_p.add_argument(
+        "--speculative-depth",
+        "--depth",
+        dest="speculative_depth",
+        type=int,
+        default=0,
+        help="Speculative MTP depth for depth-sweep benchmark runs; 0 uses the model contract default.",
+    )
     bench_p.add_argument(
         "--vary-seed-by-context",
         action="store_true",
@@ -3175,6 +3219,11 @@ def main(argv: list[str] | None = None) -> int:
 
     apply_user_config(args)
     return int(args.func(args))
+
+
+def main_tune(argv: list[str] | None = None) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    return main(["tune", *raw_args])
 
 
 def _explicit_cli_flags(raw_args: list[str]) -> set[str]:

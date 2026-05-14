@@ -2,7 +2,37 @@
 
 All notable user-facing changes are recorded here.
 
-## Unreleased
+## v0.3.6
+
+### Added
+
+- Added `mtplx tune`, `mtplx-tune`, and `mtplx bench tune` to compare AR
+  against D1/D2/D3 on a short coding prompt, keep AR as the `1.00x` baseline,
+  and save only a depth that actually beats AR for the current model, Mac, MLX
+  stack, and settings.
+- Added first-run Web UI tuning affordance so new installs can opt into the
+  measured best depth without hiding the default startup path.
+
+### Fixed
+
+- Fixed Qwen XML streaming tool calls so arguments are emitted as one complete,
+  schema-typed JSON object instead of string-fragment XML parameters. This fixes
+  OpenCode `bash.timeout` arriving as `"60000"` and `question.questions`
+  arriving as a stringified array.
+- Fixed restored-prefix suffix extension so warm SessionBank hits advance the
+  suffix in prefill chunks, with abort checks between chunks, instead of one
+  long hidden/logits AR call that could leave GPU work running after stop.
+- Fixed OpenCode stop-boundary postcommit churn: after the foreground prompt
+  prefix is committed, tiny final assistant turns no longer schedule a full
+  retokenized-history GPU prefill just to resolve a stop-token mismatch.
+- Fixed cold benchmark / one-off request memory growth when clients request
+  very large response budgets such as `max_tokens=65536`: dynamic paged KV now
+  reserves a bounded initial decode window and grows only if the model actually
+  reaches it.
+- Fixed anonymous SessionBank entries retaining full-capacity live paged-KV
+  buffers for no-reuse workloads, and tightened high-RAM default MLX Metal caps
+  so 512 GB Apple Silicon systems do not drift into hundreds of GiB of wired
+  allocator memory by default.
 
 ## v0.3.5
 

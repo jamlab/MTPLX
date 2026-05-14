@@ -1126,6 +1126,30 @@ def screen_interface() -> str:
     return "swival"
 
 
+def screen_tuning_offer() -> bool:
+    """Return whether the first-run Web UI flow should tune depth now."""
+
+    _step_panel(
+        step=4,
+        total=4,
+        title="Tune MTPLX for this Mac?",
+        options=[
+            (
+                "1",
+                "Run tuning [recommended]",
+                "Tests AR, D1, D2, and D3 on a short coding prompt, then saves the fastest depth for this model and Mac. This takes a few minutes; close heavy background apps for cleaner results. Fans may get loud and will be restored after tuning.",
+            ),
+            (
+                "2",
+                "Skip for now",
+                "Start the Web UI with the default depth. You can run mtplx tune later.",
+            ),
+        ],
+    )
+    choice = _prompt_choice("Select", ["1", "2"], default="1")
+    return choice == "1"
+
+
 def screen_server_surface(
     *,
     host: str = "127.0.0.1",

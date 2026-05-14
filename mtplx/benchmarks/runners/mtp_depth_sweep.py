@@ -51,6 +51,7 @@ def run_mtp_depth_sweep(
     limit: int | None = None,
     enable_thinking: bool | None = None,
     compare_ar: bool = False,
+    ar_only: bool = False,
     mtp_hidden_variant: str = "post_norm",
     mtp_cache_policy: str = "persistent",
     mtp_history_policy: str = "cycle",
@@ -101,7 +102,7 @@ def run_mtp_depth_sweep(
     )
     draft_lm_head_report: dict[str, Any] | None = None
     if draft_lm_head_bits is not None:
-        from scripts.probe_draft_lm_head_requant import _install_draft_lm_head
+        from mtplx.draft_lm_head import _install_draft_lm_head
 
         draft_lm_head_report = _install_draft_lm_head(
             rt,
@@ -122,7 +123,9 @@ def run_mtp_depth_sweep(
         mtp_corrector_path,
         blend=mtp_corrector_blend,
     )
-    depth_values = _parse_depths(depths)
+    if ar_only and not compare_ar:
+        raise ValueError("ar_only requires compare_ar=True")
+    depth_values = [] if ar_only else _parse_depths(depths)
     mtp_topk_reranker = (
         TopKProposalReranker.from_calibration(
             mtp_topk_reranker_calib,
@@ -257,6 +260,11 @@ def run_mtp_depth_sweep(
                         else None
                     ),
                     "verify_time_s": out.stats.verify_time_s,
+                    "verify_forward_time_s": out.stats.verify_forward_time_s,
+                    "verify_eval_time_s": out.stats.verify_eval_time_s,
+                    "verify_hidden_eval_time_s": out.stats.verify_hidden_eval_time_s,
+                    "verify_joint_eval_time_s": out.stats.verify_joint_eval_time_s,
+                    "verify_target_distribution_time_s": out.stats.verify_target_distribution_time_s,
                     "draft_time_s": out.stats.draft_time_s,
                     "target_forward_time_s": out.stats.target_forward_time_s,
                     "snapshot_time_s": out.stats.snapshot_time_s,
@@ -325,6 +333,13 @@ def run_mtp_depth_sweep(
                         else None
                     ),
                     "verify_time_s": sum(row["verify_time_s"] for row in rows),
+                    "verify_forward_time_s": sum(row["verify_forward_time_s"] for row in rows),
+                    "verify_eval_time_s": sum(row["verify_eval_time_s"] for row in rows),
+                    "verify_hidden_eval_time_s": sum(row["verify_hidden_eval_time_s"] for row in rows),
+                    "verify_joint_eval_time_s": sum(row["verify_joint_eval_time_s"] for row in rows),
+                    "verify_target_distribution_time_s": sum(
+                        row["verify_target_distribution_time_s"] for row in rows
+                    ),
                     "draft_time_s": sum(row["draft_time_s"] for row in rows),
                     "target_forward_time_s": sum(row["target_forward_time_s"] for row in rows),
                     "snapshot_time_s": sum(row["snapshot_time_s"] for row in rows),
@@ -388,6 +403,7 @@ def run_mtp_depth_sweep(
         "seed": seed,
         "enable_thinking": enable_thinking,
         "compare_ar": compare_ar,
+        "ar_only": ar_only,
         "mtp_hidden_variant": mtp_hidden_variant,
         "mtp_cache_policy": mtp_cache_policy,
         "mtp_history_policy": mtp_history_policy,

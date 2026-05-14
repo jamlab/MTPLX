@@ -33,7 +33,7 @@ from mtplx.generation import generate_mtpk
 from mtplx.mtp_patch import MTPContract
 from mtplx.runtime import load
 from mtplx.sampling import SamplerConfig
-from scripts.probe_draft_lm_head_requant import _install_draft_lm_head
+from mtplx.draft_lm_head import _install_draft_lm_head
 
 
 FAST_PATH_ENV = {

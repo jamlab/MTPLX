@@ -94,3 +94,50 @@ def test_apply_user_config_preserves_explicit_default_like_model(tmp_path):
     apply_user_config(args, config_path=config)
 
     assert args.model == explicit_model
+
+
+def test_apply_user_config_fills_tune_model_defaults(tmp_path):
+    config = tmp_path / "config.toml"
+    model_dir = tmp_path / "models"
+    config.write_text(
+        'model = "mtplx/example"\n'
+        f'model_dir = "{model_dir}"\n'
+        'profile = "exact"\n',
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        command="tune",
+        model=str(DEFAULT_RUNTIME_MODEL_DIR),
+        cache_dir=None,
+        profile="performance-cold",
+        _cli_flags=set(),
+    )
+
+    apply_user_config(args, config_path=config)
+
+    assert args.model == "mtplx/example"
+    assert args.cache_dir == str(model_dir)
+    assert args.profile == "performance-cold"
+
+
+def test_apply_user_config_fills_bench_tune_model_defaults(tmp_path):
+    config = tmp_path / "config.toml"
+    model_dir = tmp_path / "models"
+    config.write_text(
+        'model = "mtplx/example"\n'
+        f'model_dir = "{model_dir}"\n',
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        command="bench",
+        bench_action="tune",
+        model=str(DEFAULT_RUNTIME_MODEL_DIR),
+        cache_dir=None,
+        profile=None,
+        _cli_flags=set(),
+    )
+
+    apply_user_config(args, config_path=config)
+
+    assert args.model == "mtplx/example"
+    assert args.cache_dir == str(model_dir)

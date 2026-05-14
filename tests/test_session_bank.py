@@ -50,3 +50,37 @@ def test_session_bank_skips_dense_materializing_snapshot():
     assert len(bank) == 0
     assert bank.last_put_skipped_oversized_snapshot is True
     assert bank.eviction_log[-1]["reason"] == "skipped_dense_materializing_snapshot"
+
+
+def test_session_bank_near_prefix_candidates_only_accept_boundary_drift():
+    bank = SessionBank(max_entries=4, max_bytes=1024, per_session_max_bytes=512)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    entry = bank.put(
+        runtime=runtime,
+        token_ids=list(range(200)),
+        cache=[],
+        logits=None,
+        hidden=None,
+        session_id="session-1",
+        nbytes_override=128,
+    )
+    assert entry is not None
+
+    near = list(range(197)) + [10_001, 10_002, 10_003, 10_004]
+    far = list(range(120)) + [20_001, 20_002]
+
+    candidates = bank.near_prefix_candidates(
+        near,
+        max_token_gap=8,
+        min_matched_tokens=64,
+    )
+
+    assert candidates == [(entry, 197)]
+    assert (
+        bank.near_prefix_candidates(
+            far,
+            max_token_gap=8,
+            min_matched_tokens=64,
+        )
+        == []
+    )

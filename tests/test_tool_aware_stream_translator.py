@@ -58,6 +58,38 @@ OPENCODE_WRITE_TOOL_SPECS = [
         },
     }
 ]
+OPENCODE_SHELL_TOOL_SPECS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "description": {"type": "string"},
+                    "timeout": {"type": "number"},
+                },
+                "required": ["command", "description"],
+            },
+        },
+    }
+]
+OPENCODE_QUESTIONS_TOOL_SPECS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "question",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "questions": {"type": "array"},
+                },
+                "required": ["questions"],
+            },
+        },
+    }
+]
 
 
 def _make(*, tools=TOOL_SPECS):
@@ -455,6 +487,47 @@ def test_opencode_style_long_write_arguments_stream_without_raw_xml():
     streamed_args = _argument_text(out)
     assert "\\ud83c" not in streamed_args
     assert json.loads(streamed_args) == args
+
+
+def test_opencode_shell_xml_stream_emits_complete_typed_arguments():
+    t = _make(tools=OPENCODE_SHELL_TOOL_SPECS)
+    text = (
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\nnpm run build\n</parameter>\n"
+        "<parameter=description>\nBuild the project\n</parameter>\n"
+        "<parameter=timeout>\n60000\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    out = _feed_in_chunks(t, text, [11, 2, 19, 5, 7, 3, 23, 1])
+
+    args_text = _argument_text(out)
+    args = json.loads(args_text)
+    assert args == {
+        "command": "npm run build",
+        "description": "Build the project",
+        "timeout": 60000,
+    }
+    assert isinstance(args["timeout"], int)
+    assert '"timeout":"60000"' not in args_text
+
+
+def test_opencode_questions_xml_stream_emits_array_not_string():
+    t = _make(tools=OPENCODE_QUESTIONS_TOOL_SPECS)
+    questions = (
+        '[{"header":"Scope","id":"scope","question":"Pick one",'
+        '"options":[{"label":"A","description":"first"},'
+        '{"label":"B","description":"second"}]}]'
+    )
+    text = (
+        "<tool_call>\n<function=question>\n"
+        f"<parameter=questions>\n{questions}\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    out = _feed_in_chunks(t, text, [4, 4, 9, 2, 17, 1, 31, 8])
+
+    args = json.loads(_argument_text(out))
+    assert isinstance(args["questions"], list)
+    assert args["questions"][0]["options"][1]["label"] == "B"
 
 
 def test_existing_json_tool_call_final_parse_still_works():

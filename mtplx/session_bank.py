@@ -47,6 +47,14 @@ def token_prefix_hash(token_ids: list[int] | tuple[int, ...]) -> str:
     return h.hexdigest()
 
 
+def common_prefix_len(left: list[int] | tuple[int, ...], right: list[int] | tuple[int, ...]) -> int:
+    limit = min(len(left), len(right))
+    for index in range(limit):
+        if int(left[index]) != int(right[index]):
+            return index
+    return limit
+
+
 # Policies that share the committed-mtp-cache representation. An entry stored
 # under any of these policies can be safely reused for a lookup that requests
 # any other policy in this set, because the cache snapshot shape is identical
@@ -292,6 +300,37 @@ class SessionBank:
             if best is None or len(prefix) > len(best.token_ids):
                 best = entry
         return best
+
+    def near_prefix_candidates(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        *,
+        max_token_gap: int = 8,
+        min_matched_tokens: int = 64,
+    ) -> list[tuple[SessionBankEntry, int]]:
+        """Return entries whose divergence is only at the prompt boundary.
+
+        This is for tokenizer-boundary drift in tool-call transcripts. It does
+        not accept arbitrary shared system prompts: the common prefix must reach
+        within ``max_token_gap`` tokens of the stored entry's end.
+        """
+        tokens = tuple(int(token) for token in token_ids)
+        gap_limit = max(0, int(max_token_gap))
+        min_match = max(1, int(min_matched_tokens))
+        matches: list[tuple[SessionBankEntry, int]] = []
+        self._purge_expired()
+        for entry in self._entries.values():
+            prefix = entry.token_ids
+            if not prefix:
+                continue
+            matched = common_prefix_len(tokens, prefix)
+            gap = len(prefix) - matched
+            required_match = min(min_match, max(1, len(prefix) - gap_limit))
+            if gap < 0 or gap > gap_limit or matched < required_match:
+                continue
+            matches.append((entry, matched))
+        matches.sort(key=lambda item: (item[1], item[0].prefix_len), reverse=True)
+        return matches
 
     def restore(
         self,

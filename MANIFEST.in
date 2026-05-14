@@ -1,1 +1,4 @@
 include CITATION.cff
+include CHANGELOG.md
+include LOG.md
+recursive-include scripts *.py *.sh

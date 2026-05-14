@@ -386,14 +386,12 @@ def _summary_indicates_auto(summary: dict[str, Any]) -> bool:
     for fan in fans:
         mode = str(fan.get("mode") or "").lower()
         target_int = _int_or_none(fan.get("target_rpm"))
-        # ThermalForge may report target_rpm as 0 or as the fan's low automatic
-        # setpoint (~min_rpm) while mode is auto. The mode is the authoritative
+        # ThermalForge may briefly keep reporting the previous max target while
+        # mode has already flipped to auto. The mode is the authoritative
         # restore signal; target only helps when a tool omits mode.
         if mode in {"auto", "automatic", "default"}:
-            if _fan_target_is_ramped(fan):
-                return False
             continue
-        if target_int is not None and target_int <= 0:
+        if target_int is not None and target_int < FAN_RAMP_FALLBACK_THRESHOLD_RPM:
             continue
         return False
     return True

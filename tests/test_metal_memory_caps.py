@@ -77,6 +77,38 @@ def test_apply_metal_memory_caps_uses_top_level_mlx_apis(monkeypatch):
     assert calls == [("memory", 64 * GiB), ("wired", 48 * GiB)]
 
 
+def test_apply_metal_memory_caps_caps_large_unified_memory_defaults(monkeypatch):
+    mx, calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=512 * GiB,
+    )
+
+    assert result["applied"] is True
+    assert result["memory_limit_bytes"] == 192 * GiB
+    assert result["wired_limit_bytes"] == 160 * GiB
+    assert calls == [("memory", 192 * GiB), ("wired", 160 * GiB)]
+
+
+def test_apply_metal_memory_caps_preserves_128g_defaults(monkeypatch):
+    mx, calls = _fake_mx(top_level=True)
+    monkeypatch.delenv("MTPLX_MEMORY_LIMIT_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_WIRED_LIMIT_BYTES", raising=False)
+
+    result = openai._apply_metal_memory_caps(
+        mx_module=mx,
+        total_ram_bytes=128 * GiB,
+    )
+
+    assert result["applied"] is True
+    assert result["memory_limit_bytes"] == 96 * GiB
+    assert result["wired_limit_bytes"] == int(128 * GiB * 0.60)
+    assert calls == [("memory", 96 * GiB), ("wired", int(128 * GiB * 0.60))]
+
+
 def test_apply_metal_memory_caps_falls_back_to_deprecated_metal_apis(monkeypatch):
     mx, calls = _fake_mx(top_level=False)
     monkeypatch.setenv("MTPLX_MEMORY_LIMIT_BYTES", "32G")
