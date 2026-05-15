@@ -18,6 +18,7 @@ RUNTIME_MODEL_COMMANDS = {"ask", "run", "chat", "start", "serve", "quickstart", 
 CACHE_COMMANDS = {"pull", "list", "models", "remove"}
 LEGACY_DEFAULT_MODEL_REFS = {
     "models/Qwen3.6-27B-MTPLX-GDN8-Speed4",
+    "models/Qwen3.6-27B-MTPLX-Optimized-Speed",
     "Youssofal/Qwen3.6-27B-MTPLX-Optimized",
 }
 

@@ -4,7 +4,7 @@ import argparse
 
 from mtplx.config import apply_user_config, load_user_config
 from mtplx.constants import DEFAULT_RUNTIME_MODEL_DIR
-from mtplx.profiles import DEFAULT_PROFILE_NAME
+from mtplx.profiles import DEFAULT_HF_MODEL_ID, DEFAULT_PROFILE_NAME
 
 
 def test_load_user_config_reads_runtime_defaults(tmp_path):
@@ -50,6 +50,25 @@ def test_apply_user_config_fills_runtime_defaults(tmp_path):
     assert args.cache_dir == str(model_dir)
     assert args.profile == "exact"
     assert args.mtplx_config["path"] == str(config)
+
+
+def test_apply_user_config_ignores_legacy_optimized_speed_default(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'model = "models/Qwen3.6-27B-MTPLX-Optimized-Speed"\n',
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        command="quickstart",
+        model=DEFAULT_HF_MODEL_ID,
+        cache_dir=None,
+        profile=DEFAULT_PROFILE_NAME,
+        _cli_flags=set(),
+    )
+
+    apply_user_config(args, config_path=config)
+
+    assert args.model == DEFAULT_HF_MODEL_ID
 
 
 def test_apply_user_config_preserves_explicit_runtime_values(tmp_path):

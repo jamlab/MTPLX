@@ -1612,7 +1612,7 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"mtplx {DISPLAY_VERSION} ({__version__})",
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    default_model = str(DEFAULT_RUNTIME_MODEL_DIR)
+    default_model = DEFAULT_HF_MODEL_ID
 
     help_p = sub.add_parser("help", help=argparse.SUPPRESS)
     help_p.add_argument("topic", nargs="?")

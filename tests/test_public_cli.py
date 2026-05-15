@@ -775,6 +775,40 @@ def test_quickstart_public_quality_alias_missing_cache_is_not_no_mtp(tmp_path, c
     assert "tier: no-MTP" not in captured
 
 
+def test_quickstart_default_missing_cache_is_not_legacy_models_path(tmp_path, capsys):
+    code = main(
+        [
+            "quickstart",
+            "--profile",
+            "sustained",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--yes",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    captured = capsys.readouterr().out
+    assert code == 1
+    assert "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed" in captured
+    assert "models/Qwen3.6-27B-MTPLX-Optimized-Speed" not in captured
+    assert "error: model cannot run with MTPLX" not in captured
+    assert "tier: no-MTP" not in captured
+
+
+def test_tune_default_dry_run_is_not_legacy_models_path(tmp_path, capsys):
+    code = main(["tune", "--dry-run", "--json", "--cache-dir", str(tmp_path / "cache")])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["model"] == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
+    first_command = payload["candidates"][0]["command"]
+    assert "--model" in first_command
+    assert first_command[first_command.index("--model") + 1] == payload["model"]
+    assert "models/Qwen3.6-27B-MTPLX-Optimized-Speed" not in " ".join(first_command)
+
+
 def test_quickstart_short_reply_reports_decode_tps():
     line = public._quickstart_stats_line(
         {
@@ -1481,8 +1515,9 @@ def test_bench_tune_dry_run_can_disable_telemetry(capsys):
 
 def test_bench_tune_dry_run_warns_when_config_model_differs_from_default(tmp_path, monkeypatch, capsys):
     config = tmp_path / "config.toml"
+    configured_model = "/Users/youssof/Documents/CustomModels/Qwen3.6-27B-MTPLX-Optimized-Speed"
     config.write_text(
-        'model = "/Users/youssof/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed"\n',
+        f'model = "{configured_model}"\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("MTPLX_CONFIG", str(config))
@@ -1496,7 +1531,7 @@ def test_bench_tune_dry_run_warns_when_config_model_differs_from_default(tmp_pat
 
     payload = json.loads(capsys.readouterr().out)
     assert code == 0
-    assert payload["model"] == "/Users/youssof/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed"
+    assert payload["model"] == configured_model
     notes = payload["diagnostics"]["model_source_notes"]
     assert any("using configured model" in note for note in notes)
     assert any("verified default for this Mac" in note for note in notes)
@@ -2361,9 +2396,11 @@ def test_product_helper_commands_parse():
     assert start_openwebui.strict_fast_path is False
     assert start_openwebui_strict.strict_fast_path is True
     assert quickstart.command == "quickstart"
+    assert quickstart.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
     assert quickstart.port == 18012
     assert quickstart.profile == "sustained"
     assert quickstart_alias.command == "quick-start"
+    assert quickstart_alias.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
     assert quickstart_alias.port == 18013
     assert quickstart_alias.profile == "sustained"
     assert setup.command == "setup"
@@ -2378,6 +2415,7 @@ def test_product_helper_commands_parse():
     assert serve_start.port == 18012
     assert serve_start.stats_footer is True
     assert tune.command == "tune"
+    assert tune.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
     assert tune.depths == "1,2,3"
     assert status.command == "status"
     assert status.deep is True
