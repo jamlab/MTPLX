@@ -749,6 +749,32 @@ def test_start_missing_model_suggests_download(monkeypatch, capsys):
     assert "try: mtplx start --model /path/to/model" in captured
 
 
+def test_quickstart_public_quality_alias_missing_cache_is_not_no_mtp(tmp_path, capsys):
+    cache_dir = tmp_path / "cache"
+
+    code = main(
+        [
+            "quickstart",
+            "--max",
+            "--model",
+            "Qwen3.6-27B-MTPLX-Optimized-Quality",
+            "--cache-dir",
+            str(cache_dir),
+            "--yes",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    captured = capsys.readouterr().out
+    assert code == 1
+    assert "error: model is not available locally" in captured
+    assert "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality" in captured
+    assert "try: mtplx quickstart --download" in captured
+    assert "error: model cannot run with MTPLX" not in captured
+    assert "tier: no-MTP" not in captured
+
+
 def test_quickstart_short_reply_reports_decode_tps():
     line = public._quickstart_stats_line(
         {

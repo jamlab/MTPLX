@@ -16,6 +16,7 @@ from mtplx.hf_loader import (
     safe_model_name,
     validate_mtplx_model_files,
 )
+from mtplx.profiles import DEFAULT_HF_MODEL_ID, QUALITY_HF_MODEL_ID
 
 
 def test_repo_id_from_model_ref_accepts_hf_url_and_repo_id():
@@ -25,6 +26,19 @@ def test_repo_id_from_model_ref_accepts_hf_url_and_repo_id():
         == "mtplx/example"
     )
     assert repo_id_from_model_ref("models/local-model") is None
+
+
+def test_repo_id_from_model_ref_maps_known_public_aliases():
+    assert repo_id_from_model_ref("Qwen3.6-27B-MTPLX-Optimized-Quality") == QUALITY_HF_MODEL_ID
+    assert repo_id_from_model_ref("Qwen3.6-27B-MTPLX-Optimized-Speed") == DEFAULT_HF_MODEL_ID
+
+
+def test_known_public_alias_wins_over_bare_cwd_folder(tmp_path: Path, monkeypatch):
+    (tmp_path / "Qwen3.6-27B-MTPLX-Optimized-Quality").mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    assert repo_id_from_model_ref("Qwen3.6-27B-MTPLX-Optimized-Quality") == QUALITY_HF_MODEL_ID
+    assert repo_id_from_model_ref("./Qwen3.6-27B-MTPLX-Optimized-Quality") is None
 
 
 def test_safe_model_name_and_cache_path(tmp_path: Path):
@@ -130,6 +144,17 @@ def test_resolve_model_path_reports_missing_cache(tmp_path: Path):
         assert "mtplx pull mtplx/example" in str(exc)
     else:
         raise AssertionError("expected missing cache error")
+
+
+def test_resolve_model_path_rejects_missing_local_path(tmp_path: Path):
+    missing = tmp_path / "Qwen3.6-27B-MTPLX-Optimized-Quality"
+    try:
+        resolve_model_path(str(missing), cache_dir=tmp_path)
+    except FileNotFoundError as exc:
+        assert "not available locally" in str(exc)
+        assert str(missing) in str(exc)
+    else:
+        raise AssertionError("expected missing local path error")
 
 
 def test_list_and_remove_cached_models(tmp_path: Path):

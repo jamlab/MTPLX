@@ -19,8 +19,15 @@ from .constants import (
     EXPECTED_MTP_TENSOR_COUNT,
     MULTIMODAL_SIDECARS,
 )
+from .profiles import DEFAULT_FP16_HF_MODEL_ID, DEFAULT_HF_MODEL_ID, QUALITY_HF_MODEL_ID
 
 MTP_KEY_PREFIXES = ("mtp.", "language_model.mtp.")
+_KNOWN_PUBLIC_MODEL_ALIASES = {
+    "qwen3.6-27b-mtplx-optimized-speed": DEFAULT_HF_MODEL_ID,
+    "qwen3.6-27b-mtplx-optimized": DEFAULT_HF_MODEL_ID,
+    "qwen3.6-27b-mtplx-optimized-speed-fp16": DEFAULT_FP16_HF_MODEL_ID,
+    "qwen3.6-27b-mtplx-optimized-quality": QUALITY_HF_MODEL_ID,
+}
 
 
 def normalize_mtp_key(key: str) -> str:
@@ -281,7 +288,12 @@ def _is_local_like_model_ref(value: str) -> bool:
 
 def _hf_repo_id_from_ref(value: Path | str) -> str | None:
     text = str(value).strip()
-    if not text or _is_local_like_model_ref(text):
+    if not text:
+        return None
+    known_alias = _KNOWN_PUBLIC_MODEL_ALIASES.get(text.lower())
+    if known_alias:
+        return known_alias
+    if _is_local_like_model_ref(text):
         return None
     parsed = urllib.parse.urlparse(text)
     if parsed.scheme in {"http", "https"}:

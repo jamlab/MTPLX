@@ -164,7 +164,7 @@ def resolve_model_path(model_ref: str, *, cache_dir: str | Path | None = None) -
         return local
     repo_id = repo_id_from_model_ref(model_ref)
     if repo_id is None:
-        return local
+        raise FileNotFoundError(f"Model path is not available locally: {local}")
     cached = cached_model_path(repo_id, cache_dir=cache_dir)
     if cached_model_is_complete(cached):
         return cached
