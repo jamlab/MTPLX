@@ -368,6 +368,24 @@ def test_start_auto_default_can_route_to_fp16(monkeypatch, tmp_path, capsys):
     assert payload["default_model_selection"]["precision"] == "FP16"
 
 
+def test_start_default_openwebui_dry_run_uses_resolved_model(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+
+    code = main(["start", "--dry-run", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert "Qwen3.6-27B-MTPLX-Optimized-Speed" in payload["model"]
+    assert payload["openwebui"]["model_id"].startswith(
+        "mtplx-qwen36-27b-optimized-speed"
+    )
+    assert payload["openwebui"]["model_id"] != "none"
+    assert f"--model {payload['model']}" in payload["openwebui"]["server_command"]
+    assert "--model None" not in payload["openwebui"]["server_command"]
+
+
 def test_start_explicit_model_bypasses_auto_default(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
     monkeypatch.setenv("MTPLX_DEFAULT_MODEL_VARIANT", "fp16")

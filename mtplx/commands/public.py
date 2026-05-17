@@ -8065,6 +8065,11 @@ def cmd_quickstart_public(args: Any) -> int:
     default_selection = getattr(args, "_mtplx_default_model_selection", None)
     if isinstance(default_selection, dict) and model != default_selection.get("model"):
         default_selection = None
+    # Downstream integration payloads build copy-pasteable server commands from
+    # args.model. When the user accepts the verified default, argparse leaves
+    # args.model unset, so keep the resolved model on the namespace as soon as
+    # the selection is known.
+    args.model = model
     cache_dir = getattr(args, "cache_dir", None)
     if getattr(args, "dry_run", False):
         openwebui = (

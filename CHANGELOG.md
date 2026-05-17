@@ -4,8 +4,27 @@ All notable user-facing changes are recorded here.
 
 ## Unreleased
 
+### Added
+
+- Added full Claude Code client-tool support on the Anthropic Messages surface:
+  `/v1/messages`, streaming `tool_use` / `tool_result` turns,
+  `/v1/messages/count_tokens`, and `mtplx connect claude-code` now support the
+  real Claude Code agent loop with Bash/Read/Write/Edit-style client tools.
+
+### Changed
+
+- Tune and benchmark output now treat headline `tok/s` as decode throughput,
+  with prefill and end-to-end throughput kept as separate metrics so MTPLX and
+  MLX-LM comparisons are not polluted by prefill-inclusive numbers.
+
 ### Fixed
 
+- Fixed `mtplx start --dry-run --json` when accepting the verified default so
+  OpenWebUI handoff commands use the resolved Optimized Speed model instead of
+  emitting `--model None` / `model_id: none`.
+- Fixed Tune child-failure reporting so invalid non-MTP model paths surface the
+  child gate reason directly instead of collapsing into a missing-artifact or
+  false no-winner result.
 - Fixed direct `mtplx quickstart`, `mtplx serve`, `mtplx tune`, and
   `mtplx-tune` default model references so they use the public verified
   Optimized Speed repo instead of the old repo-relative

@@ -1,5 +1,40 @@
 # MTPLX Release Log
 
+## 2026-05-17 05:21 BST - Release Readiness Evidence For Issues #67/#68/#70/#71
+
+Scope:
+
+```text
+worktree=/Users/youssof/Documents/MTPLX-release/mtplx
+branch=main
+base_head=fc0efb2 Eliminate stale relative model defaults
+release_issues=#67 default installed model; #68 honest speed metrics; #70 Claude Code tools; #71 tune stale paths/failure reporting
+local_fix=mtplx start dry-run now stores the resolved verified default on args.model before building OpenWebUI handoff payloads
+```
+
+Validation:
+
+```text
+source_neutral_dry_runs=from /tmp with fresh HOME/MTPLX_CONFIG/cache, `start --dry-run --json`, `tune --dry-run --json`, and `bench tune --dry-run --json --no-telemetry` resolve to Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed or the verified local absolute artifact, never stale models/Qwen3.6-27B-MTPLX-Optimized-Speed
+start_handoff_fix=`mtplx start --dry-run --json` now emits openwebui.model_id=mtplx-qwen36-27b-optimized-speed and server_command contains the resolved model, not `--model None`
+fresh_package=rebuilt /tmp/mtplx-release-readiness-final-pkg/dist/mtplx-0.3.6.{tar.gz,py3-none-any.whl}, installed wheel into /tmp/mtplx-release-readiness-final-pkg/venv, and passed `mtplx --version`, `mtplx help`, `mtplx start --dry-run --json`, `mtplx tune --dry-run --json`, `mtplx bench tune --dry-run --json --no-telemetry`, `python -m mtplx.server.openai --help`, and `mtplx connect claude-code --json`
+real_server_67=source quickstart from /tmp on port 18901 with /Users/youssof/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed reached Runtime contract verified, /health generation_mode=mtp mtp_enabled=true runtime_mode=Sustained MTP, and an OpenAI chat completion returned separate tok_s/decode_tok_s and end_to_end_tok_s fields
+real_tune_71_68=max-fan `bench tune --model /Users/youssof/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed --depths 1,2,3 --max-tokens 192 --limit 1 --seed 0 --no-save --retune --no-telemetry` wrote AR/D1/D2/D3 artifacts under /tmp/mtplx-release-readiness-tune-max/tune-20260517-050926; AR=22.58 decode tok/s, D1=35.07, D2=38.31, D3=39.73 best 1.76x; output explicitly said speed shown is decode tok/s and prefill is tracked separately
+bad_model_71=final bad-model rerun under /tmp/mtplx-release-readiness-bad-tune-final/tune-20260517-051932 reports AR and D1 failed with `model failed MTP primary gate: Model has no MTP head. MTPLX requires an MTP-equipped model.`, not a missing-artifact placeholder
+mlx_lm_comparison_68=same local Optimized Speed family, 181-token prompt and 192-token generation in mlx_lm reported prefill 281.57 tokens/s and generation 31.11 tokens/s; MTPLX AR in the max Tune run was lower at 22.58 decode tok/s while MTPLX D3 was higher at 39.73 decode tok/s, so the discrepancy is a real runtime/mode comparison issue rather than a prefill-inclusive headline
+claude_code_70=count_tokens with a Bash tool returned input_tokens=351; headless Claude Code v2.1.143 against MTPLX on port 18902 created a Snake game over 6 turns with 5 tool_use and 5 tool_result blocks, ran Bash, produced 36/36 passing tests, and transcript parsing found no assistant-text leaks for Bash(, Skill(, <tool_call>, or <function=
+claude_code_interactive_70=interactive PTY Claude Code against the same MTPLX server visibly executed Bash(./test.sh), displayed the test output, and summarized all 36 tests passing
+focused_tests=/Users/youssof/Documents/MTPLX-release/mtplx/.venv/bin/python -m pytest tests/test_public_cli.py tests/test_server_openai.py tests/test_openai_bridge.py tests/test_generation_sustained.py tests/test_hf_loader.py tests/test_default_models.py tests/test_config.py -q -> pass, one existing skip, deprecation warnings only
+```
+
+Release status:
+
+```text
+ready_for_commit_after_docs=true
+not_yet_pushed_at_entry_time=true
+required_after_push=wait for GitHub Actions on pushed main SHA before closing issues
+```
+
 ## 2026-05-15 21:01 BST - Post-v0.3.6 Model Reference Hotfixes, No Public Release
 
 Scope:
