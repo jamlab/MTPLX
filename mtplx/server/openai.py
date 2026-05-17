@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import html
 import json
+import logging
 import os
 import re
 import secrets
@@ -59,6 +60,8 @@ from mtplx.profiles import (
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
 from mtplx.server_urls import bind_label, is_wildcard_bind, local_url_for_bind
+
+LOGGER = logging.getLogger("mtplx.server.openai")
 
 try:
     from mtplx.generation import (
@@ -347,6 +350,7 @@ class ChatCompletionRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any = None
     parallel_tool_calls: bool | None = None
+    stop: Any = None
     stream_options: dict[str, Any] | None = None
     response_format: Any = None
     metadata: dict[str, Any] | None = None
@@ -391,6 +395,12 @@ class AnthropicMessagesRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    stop_sequences: list[str] | str | None = None
+    metadata: dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
+    thinking: Any | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
     depth: int | None = None
     generation_mode: str | None = None
     stream: bool = False
@@ -465,7 +475,9 @@ def _open_pi_later(command: str, *, model_id: str, delay_s: float = 1.0) -> None
             if result.get("ok"):
                 _startup_line("Pi opened in Terminal.")
             else:
-                _startup_line(f"warning: could not open Pi automatically: {result.get('error')}")
+                _startup_line(
+                    f"warning: could not open Pi automatically: {result.get('error')}"
+                )
                 _startup_line(f"run manually: {command}")
         except Exception as exc:
             _startup_line(f"warning: could not open Pi automatically: {exc}")
@@ -900,7 +912,9 @@ def _submit_idle_postcommit_model_work(
 ) -> Any:
     scheduler = getattr(state, "model_scheduler", None)
     if scheduler is not None and hasattr(scheduler, "submit_idle_postcommit"):
-        return scheduler.submit_idle_postcommit(fn, *args, batch_key=batch_key, **kwargs)
+        return scheduler.submit_idle_postcommit(
+            fn, *args, batch_key=batch_key, **kwargs
+        )
     executor = getattr(state, "postcommit_executor", None)
     if executor is None:
         executor = getattr(state, "generation_executor", None)
@@ -1056,6 +1070,10 @@ def _anthropic_content_to_text(content: Any) -> str:
                 block_type = str(item.get("type") or "")
                 if block_type == "text" or "text" in item:
                     parts.append(str(item.get("text", "")))
+                elif block_type == "thinking":
+                    parts.append(str(item.get("thinking", "")))
+                elif block_type == "tool_use":
+                    continue
                 elif block_type == "tool_result":
                     parts.append(_anthropic_content_to_text(item.get("content")))
                 else:
@@ -1070,21 +1088,244 @@ def _anthropic_content_to_text(content: Any) -> str:
     return str(content)
 
 
+_ANTHROPIC_SERVER_SIDE_TOOL_TYPE_PREFIXES = (
+    "web_search_",
+    "code_execution_",
+    "bash_",
+    "text_editor_",
+    "computer_",
+)
+
+
+def _anthropic_content_blocks(content: Any) -> list[Any]:
+    if content is None:
+        return []
+    if isinstance(content, list):
+        return content
+    return [{"type": "text", "text": content}]
+
+
+def _anthropic_filter_system_text(text: str) -> str:
+    lines = []
+    for line in str(text).splitlines():
+        if line.strip().lower().startswith("x-anthropic-billing-header:"):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _anthropic_system_to_text(system: Any) -> str:
+    if system is None:
+        return ""
+    if isinstance(system, list):
+        parts: list[str] = []
+        for block in system:
+            if isinstance(block, dict):
+                text = _anthropic_filter_system_text(
+                    _anthropic_content_to_text([block])
+                )
+            else:
+                text = _anthropic_filter_system_text(str(block))
+            if text:
+                parts.append(text)
+        return "\n\n".join(parts).strip()
+    return _anthropic_filter_system_text(_anthropic_content_to_text(system))
+
+
+def _anthropic_tool_use_to_openai(block: dict[str, Any]) -> dict[str, Any]:
+    name = str(block.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="tool_use block is missing a name")
+    call_id = str(block.get("id") or f"call_{uuid.uuid4().hex[:24]}")
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": _json_object_string(
+                block.get("input", {}),
+                context=f"tool_use '{name}'",
+            ),
+        },
+    }
+
+
+def _anthropic_tool_result_id(block: dict[str, Any]) -> str:
+    return str(block.get("tool_use_id") or block.get("id") or "").strip()
+
+
+def _anthropic_message_to_chat_messages(
+    message: AnthropicMessage,
+) -> list[ChatMessage]:
+    role = str(message.role or "").strip().lower()
+    if role == "assistant":
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        for block in _anthropic_content_blocks(message.content):
+            if isinstance(block, dict):
+                block_type = str(block.get("type") or "")
+                if block_type == "tool_use":
+                    tool_calls.append(_anthropic_tool_use_to_openai(block))
+                elif block_type == "thinking":
+                    thinking_parts.append(str(block.get("thinking") or ""))
+                else:
+                    text_parts.append(_anthropic_content_to_text([block]))
+            else:
+                text_parts.append(str(block))
+        kwargs: dict[str, Any] = {}
+        if thinking := "".join(thinking_parts).strip():
+            kwargs["reasoning_content"] = thinking
+        return [
+            ChatMessage(
+                role="assistant",
+                content="".join(text_parts),
+                tool_calls=tool_calls or None,
+                **kwargs,
+            )
+        ]
+    if role == "user":
+        messages: list[ChatMessage] = []
+        text_parts: list[str] = []
+        for block in _anthropic_content_blocks(message.content):
+            if (
+                isinstance(block, dict)
+                and str(block.get("type") or "") == "tool_result"
+            ):
+                if text_parts:
+                    messages.append(
+                        ChatMessage(role="user", content="".join(text_parts))
+                    )
+                    text_parts = []
+                tool_call_id = _anthropic_tool_result_id(block)
+                if not tool_call_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="tool_result block is missing tool_use_id",
+                    )
+                messages.append(
+                    ChatMessage(
+                        role="tool",
+                        tool_call_id=tool_call_id,
+                        content=_anthropic_content_to_text(block.get("content")),
+                    )
+                )
+            elif isinstance(block, dict):
+                text_parts.append(_anthropic_content_to_text([block]))
+            else:
+                text_parts.append(str(block))
+        if text_parts or not messages:
+            messages.append(ChatMessage(role="user", content="".join(text_parts)))
+        return messages
+    return [
+        ChatMessage(
+            role=role or "user", content=_anthropic_content_to_text(message.content)
+        )
+    ]
+
+
+def _anthropic_is_server_side_tool(tool: dict[str, Any]) -> bool:
+    tool_type = str(tool.get("type") or "").strip()
+    return bool(tool_type) and any(
+        tool_type.startswith(prefix)
+        for prefix in _ANTHROPIC_SERVER_SIDE_TOOL_TYPE_PREFIXES
+    )
+
+
+def _anthropic_tools_to_openai(
+    tools: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    if not tools:
+        return None
+    converted: list[dict[str, Any]] = []
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise HTTPException(
+                status_code=400, detail=f"tools[{index}] must be an object"
+            )
+        if _anthropic_is_server_side_tool(tool):
+            LOGGER.info(
+                "dropping unsupported Anthropic server-side tool type=%s name=%s",
+                tool.get("type"),
+                tool.get("name"),
+            )
+            continue
+        name = str(tool.get("name") or "").strip()
+        if not name:
+            raise HTTPException(
+                status_code=400, detail=f"tools[{index}] is missing a name"
+            )
+        input_schema = tool.get("input_schema")
+        if input_schema is None:
+            input_schema = tool.get("parameters")
+        parameters = (
+            input_schema if isinstance(input_schema, dict) else {"type": "object"}
+        )
+        converted.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": str(tool.get("description") or ""),
+                    "parameters": parameters,
+                },
+            }
+        )
+    return converted or None
+
+
+def _anthropic_tool_choice_to_openai(tool_choice: Any) -> Any:
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        value = tool_choice.strip().lower()
+        if value in {"auto", "none"}:
+            return value
+        if value in {"any", "required"}:
+            return "required"
+        return tool_choice
+    if isinstance(tool_choice, dict):
+        value = (
+            str(tool_choice.get("type") or tool_choice.get("mode") or "")
+            .strip()
+            .lower()
+        )
+        if value in {"auto", "none"}:
+            return value
+        if value in {"any", "required"}:
+            return "required"
+        if value == "tool":
+            name = str(tool_choice.get("name") or "").strip()
+            if not name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="tool_choice tool must include a name",
+                )
+            return {"type": "function", "function": {"name": name}}
+    return tool_choice
+
+
+def _anthropic_thinking_to_enable_thinking(thinking: Any) -> bool | None:
+    if not isinstance(thinking, dict):
+        return None
+    mode = str(thinking.get("type") or "").strip().lower()
+    if mode == "enabled":
+        return True
+    if mode == "disabled":
+        return False
+    return None
+
+
 def _anthropic_to_chat_request(
     request: AnthropicMessagesRequest,
 ) -> ChatCompletionRequest:
     messages: list[ChatMessage] = []
-    system_text = _anthropic_content_to_text(request.system).strip()
+    system_text = _anthropic_system_to_text(request.system)
     if system_text:
         messages.append(ChatMessage(role="system", content=system_text))
     for message in request.messages:
-        role = "assistant" if message.role == "assistant" else "user"
-        messages.append(
-            ChatMessage(
-                role=role,
-                content=_anthropic_content_to_text(message.content),
-            )
-        )
+        messages.extend(_anthropic_message_to_chat_messages(message))
+    enable_thinking = _anthropic_thinking_to_enable_thinking(request.thinking)
     return ChatCompletionRequest(
         model=request.model,
         messages=messages,
@@ -1092,10 +1333,61 @@ def _anthropic_to_chat_request(
         temperature=request.temperature,
         top_p=request.top_p,
         top_k=request.top_k,
+        tools=_anthropic_tools_to_openai(request.tools),
+        tool_choice=_anthropic_tool_choice_to_openai(request.tool_choice),
+        stop=request.stop_sequences,
+        metadata=request.metadata,
+        enable_thinking=enable_thinking,
         depth=request.depth,
         generation_mode=request.generation_mode,
         stream=False,
     )
+
+
+def _anthropic_tool_input_from_arguments(arguments: Any) -> dict[str, Any]:
+    if arguments is None:
+        return {}
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        text = arguments.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _anthropic_tool_use_block(tool_call: dict[str, Any]) -> dict[str, Any] | None:
+    function = tool_call.get("function") if isinstance(tool_call, dict) else None
+    if not isinstance(function, dict):
+        return None
+    name = str(function.get("name") or "").strip()
+    if not name:
+        return None
+    return {
+        "type": "tool_use",
+        "id": str(tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"),
+        "name": name,
+        "input": _anthropic_tool_input_from_arguments(function.get("arguments")),
+    }
+
+
+def _anthropic_stop_reason(
+    finish_reason: Any,
+    *,
+    has_tool_calls: bool,
+) -> str:
+    if has_tool_calls or finish_reason == "tool_calls":
+        return "tool_use"
+    if finish_reason == "length":
+        return "max_tokens"
+    if finish_reason == "stop":
+        return "end_turn"
+    return "end_turn"
 
 
 def _anthropic_payload_from_openai(openai_payload: dict[str, Any]) -> dict[str, Any]:
@@ -1103,15 +1395,38 @@ def _anthropic_payload_from_openai(openai_payload: dict[str, Any]) -> dict[str, 
     choice = choices[0] if choices else {}
     message = choice.get("message") or {}
     text = str(message.get("content") or choice.get("text") or "")
+    tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+    content: list[dict[str, Any]] = []
+    reasoning = message.get("reasoning_content") if isinstance(message, dict) else None
+    if isinstance(reasoning, str) and reasoning.strip():
+        content.append(
+            {
+                "type": "thinking",
+                "thinking": reasoning,
+                "signature": "mtplx-reasoning",
+            }
+        )
+    if text:
+        content.append({"type": "text", "text": text})
+    if isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            block = _anthropic_tool_use_block(tool_call)
+            if block is not None:
+                content.append(block)
+    if not content:
+        content = [{"type": "text", "text": ""}]
     usage = openai_payload.get("usage") or {}
     finish_reason = choice.get("finish_reason") or "stop"
-    stop_reason = "max_tokens" if finish_reason == "length" else "end_turn"
+    stop_reason = _anthropic_stop_reason(
+        finish_reason,
+        has_tool_calls=any(block.get("type") == "tool_use" for block in content),
+    )
     return {
         "id": "msg_" + uuid.uuid4().hex,
         "type": "message",
         "role": "assistant",
         "model": openai_payload.get("model"),
-        "content": [{"type": "text", "text": text}],
+        "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
@@ -1156,10 +1471,15 @@ async def _iter_sse_data(body_iterator: Any):
 
 async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
     message_id = "msg_" + uuid.uuid4().hex
-    content_started = False
+    next_block_index = 0
+    active_text_index: int | None = None
+    active_thinking_index: int | None = None
+    opened_any_block = False
+    opened_tool_block = False
     stop_reason = "end_turn"
     usage = {"input_tokens": 0, "output_tokens": 0}
     mtplx_stats: dict[str, Any] | None = None
+    tool_blocks: dict[int, dict[str, Any]] = {}
 
     yield _anthropic_sse(
         "message_start",
@@ -1178,14 +1498,19 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
         },
     )
 
-    def start_content_block() -> str:
+    def start_content_block(index: int, block: dict[str, Any]) -> str:
         return _anthropic_sse(
             "content_block_start",
             {
                 "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
+                "index": index,
+                "content_block": block,
             },
+        )
+
+    def stop_content_block(index: int) -> str:
+        return _anthropic_sse(
+            "content_block_stop", {"type": "content_block_stop", "index": index}
         )
 
     try:
@@ -1229,27 +1554,136 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
                 mtplx_stats = payload.get("mtplx_stats")
             for choice in payload.get("choices") or []:
                 delta = choice.get("delta") or {}
-                text = ""
-                if delta.get("reasoning_content"):
-                    text += str(delta.get("reasoning_content") or "")
-                if delta.get("content"):
-                    text += str(delta.get("content") or "")
-                if text:
-                    if not content_started:
-                        content_started = True
-                        yield start_content_block()
+                reasoning_text = str(delta.get("reasoning_content") or "")
+                if reasoning_text:
+                    if active_text_index is not None:
+                        yield stop_content_block(active_text_index)
+                        active_text_index = None
+                    if active_thinking_index is None:
+                        active_thinking_index = next_block_index
+                        next_block_index += 1
+                        opened_any_block = True
+                        yield start_content_block(
+                            active_thinking_index,
+                            {
+                                "type": "thinking",
+                                "thinking": "",
+                                "signature": "mtplx-reasoning",
+                            },
+                        )
                     yield _anthropic_sse(
                         "content_block_delta",
                         {
                             "type": "content_block_delta",
-                            "index": 0,
+                            "index": active_thinking_index,
+                            "delta": {
+                                "type": "thinking_delta",
+                                "thinking": reasoning_text,
+                            },
+                        },
+                    )
+                text = str(delta.get("content") or "")
+                if text:
+                    if active_thinking_index is not None:
+                        yield stop_content_block(active_thinking_index)
+                        active_thinking_index = None
+                    if active_text_index is None:
+                        active_text_index = next_block_index
+                        next_block_index += 1
+                        opened_any_block = True
+                        yield start_content_block(
+                            active_text_index,
+                            {"type": "text", "text": ""},
+                        )
+                    yield _anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": active_text_index,
                             "delta": {"type": "text_delta", "text": text},
                         },
                     )
+                tool_call_deltas = delta.get("tool_calls")
+                if isinstance(tool_call_deltas, list) and tool_call_deltas:
+                    if active_text_index is not None:
+                        yield stop_content_block(active_text_index)
+                        active_text_index = None
+                    if active_thinking_index is not None:
+                        yield stop_content_block(active_thinking_index)
+                        active_thinking_index = None
+                    for raw_tool_delta in tool_call_deltas:
+                        if not isinstance(raw_tool_delta, dict):
+                            continue
+                        upstream_index = int(raw_tool_delta.get("index") or 0)
+                        state = tool_blocks.setdefault(
+                            upstream_index,
+                            {
+                                "id": None,
+                                "name": None,
+                                "block_index": None,
+                                "pending_arguments": "",
+                            },
+                        )
+                        if raw_tool_delta.get("id"):
+                            state["id"] = str(raw_tool_delta.get("id"))
+                        function_delta = raw_tool_delta.get("function")
+                        arguments_delta = ""
+                        if isinstance(function_delta, dict):
+                            if function_delta.get("name"):
+                                state["name"] = str(function_delta.get("name"))
+                            if function_delta.get("arguments") is not None:
+                                arguments_delta = str(
+                                    function_delta.get("arguments") or ""
+                                )
+                        if state["block_index"] is None:
+                            if not state.get("name"):
+                                state["pending_arguments"] += arguments_delta
+                                continue
+                            state["block_index"] = next_block_index
+                            next_block_index += 1
+                            opened_any_block = True
+                            opened_tool_block = True
+                            yield start_content_block(
+                                int(state["block_index"]),
+                                {
+                                    "type": "tool_use",
+                                    "id": state.get("id")
+                                    or f"call_{uuid.uuid4().hex[:24]}",
+                                    "name": state["name"],
+                                    "input": {},
+                                },
+                            )
+                            pending = str(state.get("pending_arguments") or "")
+                            if pending:
+                                yield _anthropic_sse(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": state["block_index"],
+                                        "delta": {
+                                            "type": "input_json_delta",
+                                            "partial_json": pending,
+                                        },
+                                    },
+                                )
+                                state["pending_arguments"] = ""
+                        if arguments_delta:
+                            yield _anthropic_sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": state["block_index"],
+                                    "delta": {
+                                        "type": "input_json_delta",
+                                        "partial_json": arguments_delta,
+                                    },
+                                },
+                            )
                 finish_reason = choice.get("finish_reason")
                 if finish_reason:
-                    stop_reason = (
-                        "max_tokens" if finish_reason == "length" else "end_turn"
+                    stop_reason = _anthropic_stop_reason(
+                        finish_reason,
+                        has_tool_calls=opened_tool_block,
                     )
     finally:
         if hasattr(body_iterator, "aclose"):
@@ -1258,11 +1692,18 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
             except Exception:
                 pass
 
-    if not content_started:
-        yield start_content_block()
-    yield _anthropic_sse(
-        "content_block_stop", {"type": "content_block_stop", "index": 0}
-    )
+    if active_text_index is not None:
+        yield stop_content_block(active_text_index)
+    if active_thinking_index is not None:
+        yield stop_content_block(active_thinking_index)
+    for state in tool_blocks.values():
+        block_index = state.get("block_index")
+        if block_index is not None:
+            yield stop_content_block(int(block_index))
+    if not opened_any_block:
+        empty_index = next_block_index
+        yield start_content_block(empty_index, {"type": "text", "text": ""})
+        yield stop_content_block(empty_index)
     delta_payload: dict[str, Any] = {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
@@ -1325,13 +1766,38 @@ _TOOL_CALL_BLOCK_RE = re.compile(
     r"<tool_call>\s*(.*?)\s*</tool_call>",
     re.IGNORECASE | re.DOTALL,
 )
+_NAMESPACED_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<([A-Za-z_][\w.-]*):tool_call>\s*(.*?)\s*</\1:tool_call>",
+    re.IGNORECASE | re.DOTALL,
+)
 _TOOL_FUNCTION_BLOCK_RE = re.compile(
     r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_TOOL_FUNCTION_START_RE = re.compile(
+    r"^\s*<function=([^>\s]+)>\s*(.*?)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
 _TOOL_PARAMETER_BLOCK_RE = re.compile(
     r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
     re.IGNORECASE | re.DOTALL,
+)
+_INVOKE_TOOL_BLOCK_RE = re.compile(
+    r'^\s*<invoke\s+name="([^"]+)">\s*(.*?)\s*</invoke>\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
+_INVOKE_PARAMETER_BLOCK_RE = re.compile(
+    r'<parameter\s+name="([^"]+)">\s*(.*?)\s*</parameter>',
+    re.IGNORECASE | re.DOTALL,
+)
+_BRACKET_TOOL_CALL_RE = re.compile(
+    r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)(?:\(({.*?})\))?\]",
+    re.IGNORECASE | re.DOTALL,
+)
+_BRACKET_TOOL_PREFIXES = ("[Calling tool:", "[Tool call:")
+_NAMESPACED_TOOL_CALL_START_RE = re.compile(
+    r"<[A-Za-z_][\w.-]*:tool_call",
+    re.IGNORECASE,
 )
 _MTPLX_TOOL_CONTRACT_SENTINEL = "MTPLX tool contract:"
 _TOOL_PARSE_COUNTER_KEYS = (
@@ -1484,6 +1950,100 @@ def _tool_json_schema(tool: dict[str, Any]) -> dict[str, Any]:
     return parameters if isinstance(parameters, dict) else {}
 
 
+def _tool_schema_for_name(
+    tools: list[dict[str, Any]],
+    *,
+    tool_name: str,
+) -> dict[str, Any]:
+    for tool in tools:
+        if _tool_spec_name(tool) == tool_name:
+            return _tool_json_schema(tool)
+    return {}
+
+
+def _validate_tool_arguments_for_schema(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    tools: list[dict[str, Any]],
+    context: str,
+) -> None:
+    schema = _tool_schema_for_name(tools, tool_name=tool_name)
+    required = schema.get("required") if isinstance(schema, dict) else None
+    if not isinstance(required, list):
+        return
+    missing = [
+        str(name)
+        for name in required
+        if isinstance(name, str) and name not in arguments
+    ]
+    if missing:
+        joined = ", ".join(missing)
+        raise _tool_protocol_error(
+            f"{context} is missing required argument(s): {joined}"
+        )
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict):
+        return
+    if schema.get("additionalProperties") is False:
+        extra = sorted(str(name) for name in arguments if name not in properties)
+        if extra:
+            joined = ", ".join(extra)
+            raise _tool_protocol_error(
+                f"{context} contains unknown argument(s): {joined}"
+            )
+    for name, value in arguments.items():
+        param_schema = properties.get(name)
+        if not isinstance(param_schema, dict):
+            continue
+        if not _json_schema_value_matches(value, param_schema):
+            expected = _schema_type_label(param_schema)
+            raise _tool_protocol_error(
+                f"{context}.{name} must be {expected}, got {type(value).__name__}"
+            )
+
+
+def _json_schema_value_matches(value: Any, schema: dict[str, Any]) -> bool:
+    if not isinstance(schema, dict):
+        return True
+    if "anyOf" in schema and isinstance(schema["anyOf"], list):
+        return any(
+            isinstance(item, dict) and _json_schema_value_matches(value, item)
+            for item in schema["anyOf"]
+        )
+    if "oneOf" in schema and isinstance(schema["oneOf"], list):
+        return any(
+            isinstance(item, dict) and _json_schema_value_matches(value, item)
+            for item in schema["oneOf"]
+        )
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum and value not in enum:
+        return False
+    schema_types = _schema_type_names(schema)
+    if not schema_types:
+        return True
+    for schema_type in schema_types:
+        if schema_type == "null" and value is None:
+            return True
+        if schema_type == "string" and isinstance(value, str):
+            return True
+        if schema_type == "boolean" and isinstance(value, bool):
+            return True
+        if schema_type == "integer" and isinstance(value, int) and not isinstance(value, bool):
+            return True
+        if (
+            schema_type == "number"
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ):
+            return True
+        if schema_type == "array" and isinstance(value, list):
+            return True
+        if schema_type == "object" and isinstance(value, dict):
+            return True
+    return False
+
+
 def _schema_type_label(schema: Any) -> str:
     if not isinstance(schema, dict):
         return "any"
@@ -1518,7 +2078,9 @@ def _tool_signature(tool: dict[str, Any]) -> str | None:
     if not isinstance(properties, dict):
         return f"{name}()"
     required = schema.get("required")
-    required_names = [str(item) for item in required] if isinstance(required, list) else []
+    required_names = (
+        [str(item) for item in required] if isinstance(required, list) else []
+    )
     ordered_names: list[str] = []
     for prop in required_names:
         if prop in properties and prop not in ordered_names:
@@ -1546,7 +2108,9 @@ def _tool_call_example(tools: list[dict[str, Any]]) -> tuple[str, str]:
     required = schema.get("required")
     args: dict[str, str] = {}
     if isinstance(properties, dict):
-        required_names = [str(item) for item in required] if isinstance(required, list) else []
+        required_names = (
+            [str(item) for item in required] if isinstance(required, list) else []
+        )
         for prop in (required_names or list(properties))[:3]:
             if prop in properties:
                 label = _schema_type_label(properties.get(prop))
@@ -1588,6 +2152,29 @@ def _with_mtplx_tool_contract(
             first["content"] = f"{content.rstrip()}\n\n{contract}".strip()
         return messages
     return [{"role": "system", "content": contract}, *messages]
+
+
+_NO_SUBAGENTS_RE = re.compile(
+    r"\bno\s+(?:sub[- ]?agents?|subagents?|sub[- ]?tasks?|agent\s+tasks)\b",
+    re.IGNORECASE,
+)
+
+
+def _request_disallows_subagents(messages: list[ChatMessage]) -> bool:
+    for message in reversed(messages):
+        if str(message.role).lower() != "user":
+            continue
+        return bool(_NO_SUBAGENTS_RE.search(_content_to_text(message.content)))
+    return False
+
+
+def _filter_tool_specs_for_request(
+    tools: list[dict[str, Any]],
+    messages: list[ChatMessage],
+) -> list[dict[str, Any]]:
+    if not tools or not _request_disallows_subagents(messages):
+        return tools
+    return [tool for tool in tools if _tool_spec_name(tool) != "Task"]
 
 
 def _normalize_tool_specs(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -1656,7 +2243,7 @@ def _tools_active_for_request(
     return True
 
 
-def _json_object_string(value: Any, *, context: str) -> str:
+def _json_object_value(value: Any, *, context: str) -> dict[str, Any]:
     if value is None:
         parsed: Any = {}
     elif isinstance(value, str):
@@ -1674,6 +2261,11 @@ def _json_object_string(value: Any, *, context: str) -> str:
         parsed = value
     if not isinstance(parsed, dict):
         raise _tool_protocol_error(f"{context} arguments must be a JSON object")
+    return parsed
+
+
+def _json_object_string(value: Any, *, context: str) -> str:
+    parsed = _json_object_value(value, context=context)
     return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -1746,12 +2338,23 @@ def _parse_json_tool_call(block: str) -> tuple[str, Any] | None:
     return name_text, arguments
 
 
-def _parse_xml_tool_call(block: str) -> tuple[str, Any] | None:
+def _parse_xml_tool_call(
+    block: str,
+    *,
+    allow_unclosed_function: bool = False,
+) -> tuple[str, Any] | None:
     match = _TOOL_FUNCTION_BLOCK_RE.match(block)
     if match is None:
-        return None
+        if not allow_unclosed_function:
+            return None
+        match = _TOOL_FUNCTION_START_RE.match(block)
+        if match is None:
+            return None
     name = match.group(1).strip()
     body = match.group(2)
+    if allow_unclosed_function:
+        body = re.sub(r"\s*</function>\s*$", "", body, flags=re.IGNORECASE)
+        body = re.sub(r"\s*</tool_call\s*$", "", body, flags=re.IGNORECASE)
     arguments: dict[str, Any] = {}
     consumed: list[tuple[int, int]] = []
     for param_match in _TOOL_PARAMETER_BLOCK_RE.finditer(body):
@@ -1779,43 +2382,217 @@ def _parse_xml_tool_call(block: str) -> tuple[str, Any] | None:
     return name, arguments
 
 
+def _parse_invoke_tool_call(block: str) -> tuple[str, Any] | None:
+    match = _INVOKE_TOOL_BLOCK_RE.match(block)
+    if match is None:
+        return None
+    name = match.group(1).strip()
+    body = match.group(2)
+    arguments: dict[str, Any] = {}
+    consumed: list[tuple[int, int]] = []
+    for param_match in _INVOKE_PARAMETER_BLOCK_RE.finditer(body):
+        param_name = param_match.group(1).strip()
+        if not param_name:
+            raise _tool_protocol_error(
+                f"tool '{name}' contains an empty parameter name"
+            )
+        arguments[param_name] = _decode_tool_parameter_value(param_match.group(2))
+        consumed.append(param_match.span())
+    if consumed:
+        residue_parts: list[str] = []
+        cursor = 0
+        for start, end in consumed:
+            residue_parts.append(body[cursor:start])
+            cursor = end
+        residue_parts.append(body[cursor:])
+        residue = "".join(residue_parts).strip()
+        if residue:
+            raise _tool_protocol_error(
+                f"tool '{name}' contains text outside parameters"
+            )
+    elif body.strip():
+        raise _tool_protocol_error(f"tool '{name}' contains unwrapped parameter text")
+    return name, arguments
+
+
+def _tool_marker_pairs_from_tokenizer(tokenizer: Any | None) -> list[tuple[str, str]]:
+    if tokenizer is None:
+        return []
+    start = getattr(tokenizer, "tool_call_start", None)
+    end = getattr(tokenizer, "tool_call_end", None)
+    if not isinstance(start, str) or not start:
+        return []
+    if not isinstance(end, str) or not end:
+        return []
+    if start == "<tool_call>" and end == "</tool_call>":
+        return []
+    return [(start, end)]
+
+
+def _iter_generated_tool_call_envelopes(
+    text: str,
+    *,
+    marker_pairs: list[tuple[str, str]] | None = None,
+) -> list[tuple[int, int, str, tuple[str, Any] | None]]:
+    envelopes: list[tuple[int, int, str, tuple[str, Any] | None]] = []
+    for match in _TOOL_CALL_BLOCK_RE.finditer(text):
+        envelopes.append((match.start(), match.end(), match.group(1).strip(), None))
+    for match in _NAMESPACED_TOOL_CALL_BLOCK_RE.finditer(text):
+        envelopes.append((match.start(), match.end(), match.group(2).strip(), None))
+    for start_marker, end_marker in marker_pairs or []:
+        pattern = re.compile(
+            re.escape(start_marker) + r"\s*(.*?)\s*" + re.escape(end_marker),
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in pattern.finditer(text):
+            envelopes.append((match.start(), match.end(), match.group(1).strip(), None))
+    for match in _BRACKET_TOOL_CALL_RE.finditer(text):
+        name = match.group(1).strip()
+        raw_args = (match.group(2) or "").strip()
+        if raw_args:
+            try:
+                arguments: Any = json.loads(raw_args)
+            except json.JSONDecodeError as exc:
+                raise _tool_protocol_error(
+                    f"bracket tool_call '{name}' arguments are not valid JSON"
+                ) from exc
+        else:
+            arguments = {}
+        envelopes.append((match.start(), match.end(), "", (name, arguments)))
+    envelopes.sort(key=lambda item: item[0])
+    for previous, current in zip(envelopes, envelopes[1:]):
+        if current[0] < previous[1]:
+            raise _tool_protocol_error("overlapping tool_call envelopes")
+    return envelopes
+
+
+def _tool_like_marker_present(text: str, marker_pairs: list[tuple[str, str]]) -> bool:
+    lowered = text.lower()
+    if "<tool_call" in lowered or "</tool_call>" in lowered:
+        return True
+    if _NAMESPACED_TOOL_CALL_START_RE.search(text):
+        return True
+    if re.search(r"</[A-Za-z_][\w.-]*:tool_call>", text, flags=re.IGNORECASE):
+        return True
+    if any(prefix.lower() in lowered for prefix in _BRACKET_TOOL_PREFIXES):
+        return True
+    return any(start.lower() in lowered or end.lower() in lowered for start, end in marker_pairs)
+
+
+def _parse_tool_call_payload(
+    block: str,
+    *,
+    allow_unclosed_function: bool = False,
+) -> tuple[str, Any] | None:
+    parsed = _parse_json_tool_call(block)
+    if parsed is not None:
+        return parsed
+    parsed = _parse_xml_tool_call(
+        block,
+        allow_unclosed_function=allow_unclosed_function,
+    )
+    if parsed is not None:
+        return parsed
+    return _parse_invoke_tool_call(block)
+
+
+def _repair_unclosed_tool_call_payload(
+    text: str,
+    *,
+    marker_pairs: list[tuple[str, str]],
+) -> str | None:
+    candidates: list[tuple[int, int]] = []
+    plain = re.search(r"<tool_call>\s*", text, flags=re.IGNORECASE)
+    if plain:
+        candidates.append((plain.start(), plain.end()))
+    namespaced = re.search(
+        r"<[A-Za-z_][\w.-]*:tool_call>\s*",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if namespaced:
+        candidates.append((namespaced.start(), namespaced.end()))
+    for start_marker, _end_marker in marker_pairs:
+        idx = _find_casefold(text, start_marker)
+        if idx >= 0:
+            candidates.append((idx, idx + len(start_marker)))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    if len(candidates) > 1:
+        raise _tool_protocol_error("nested or unmatched tool_call block")
+    _start, payload_start = candidates[0]
+    payload = text[payload_start:].strip()
+    if not payload:
+        return None
+    return payload
+
+
 def _parse_generated_tool_calls(
     text: str,
     *,
     tools: list[dict[str, Any]],
+    tokenizer: Any | None = None,
 ) -> list[dict[str, Any]] | None:
     if not tools:
         return None
-    lowered = text.lower()
-    if "<tool_call" not in lowered and "</tool_call>" not in lowered:
+    marker_pairs = _tool_marker_pairs_from_tokenizer(tokenizer)
+    if not _tool_like_marker_present(text, marker_pairs):
         return None
-    blocks = list(_TOOL_CALL_BLOCK_RE.finditer(text))
-    if not blocks:
-        raise _tool_protocol_error("unclosed <tool_call> block")
-    residue = _TOOL_CALL_BLOCK_RE.sub("", text)
-    if "<tool_call" in residue.lower() or "</tool_call>" in residue.lower():
+    envelopes = _iter_generated_tool_call_envelopes(
+        text,
+        marker_pairs=marker_pairs,
+    )
+    if not envelopes:
+        repair_payload = _repair_unclosed_tool_call_payload(
+            text,
+            marker_pairs=marker_pairs,
+        )
+        if repair_payload is None:
+            raise _tool_protocol_error("unclosed tool_call block")
+        envelopes = [(0, len(text), repair_payload, None)]
+    residue_parts: list[str] = []
+    cursor = 0
+    for start, end, _block, _parsed in envelopes:
+        residue_parts.append(text[cursor:start])
+        cursor = end
+    residue_parts.append(text[cursor:])
+    residue = "".join(residue_parts)
+    if _tool_like_marker_present(residue, marker_pairs):
         raise _tool_protocol_error("nested or unmatched <tool_call> block")
     known = {name for tool in tools if (name := _tool_spec_name(tool))}
     calls: list[dict[str, Any]] = []
-    for index, block_match in enumerate(blocks):
-        block = block_match.group(1).strip()
-        parsed = _parse_json_tool_call(block)
+    for index, (_start, _end, block, parsed) in enumerate(envelopes):
         if parsed is None:
-            parsed = _parse_xml_tool_call(block)
+            parsed = _parse_tool_call_payload(
+                block,
+                allow_unclosed_function=True,
+            )
         if parsed is None:
             raise _tool_protocol_error("unsupported tool_call payload format")
         name, arguments = parsed
         if name not in known:
             raise _tool_protocol_error(f"unknown tool '{name}'")
+        arguments_value = _json_object_value(
+            arguments,
+            context=f"tool_call[{index}]",
+        )
+        _validate_tool_arguments_for_schema(
+            tool_name=name,
+            arguments=arguments_value,
+            tools=tools,
+            context=f"tool_call[{index}]",
+        )
         calls.append(
             {
                 "id": f"call_{uuid.uuid4().hex[:24]}",
                 "type": "function",
                 "function": {
                     "name": name,
-                    "arguments": _json_object_string(
-                        arguments,
-                        context=f"tool_call[{index}]",
+                    "arguments": json.dumps(
+                        arguments_value,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
                 },
             }
@@ -1827,12 +2604,17 @@ def _parse_generated_tool_calls_or_content(
     text: str,
     *,
     tools: list[dict[str, Any]],
+    tokenizer: Any | None = None,
     state: Any | None = None,
     response_id: str | None = None,
     stream: bool = False,
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
     try:
-        tool_calls = _parse_generated_tool_calls(text, tools=tools)
+        tool_calls = _parse_generated_tool_calls(
+            text,
+            tools=tools,
+            tokenizer=tokenizer,
+        )
     except HTTPException as exc:
         reason = _tool_protocol_reason(exc)
         _record_tool_parse_event(
@@ -1999,6 +2781,16 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
         return self._remaining_text
 
     def _finish_call(self, deltas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        try:
+            _validate_tool_arguments_for_schema(
+                tool_name=str(self._name or ""),
+                arguments=self._params,
+                tools=self._tools,
+                context=f"tool_call[{self._call_index}]",
+            )
+        except HTTPException as exc:
+            self._fallback_reason = _tool_protocol_reason(exc)
+            return []
         if not self._name_delta_emitted:
             deltas.append(
                 _tool_delta(
@@ -2062,9 +2854,7 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                 if function_close >= 0 and (
                     param_start < 0 or function_close < param_start
                 ):
-                    self._buf = self._buf[
-                        function_close + len(self._FUNCTION_CLOSE) :
-                    ]
+                    self._buf = self._buf[function_close + len(self._FUNCTION_CLOSE) :]
                     self._stage = "after_function"
                     continue
                 if param_start < 0:
@@ -2081,16 +2871,6 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                     return deltas
                 self._current_key = key
                 self._current_value_parts = []
-                if not self._name_delta_emitted:
-                    deltas.append(
-                        _tool_delta(
-                            self._call_index,
-                            call_id=self._call_id,
-                            name=str(self._name or ""),
-                            arguments="",
-                        )
-                    )
-                    self._name_delta_emitted = True
                 self._buf = self._buf[param_end + 1 :]
                 self._stage = "in_parameter"
                 continue
@@ -2150,6 +2930,13 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
         deltas = self.feed("")
         if self._done or self._fallback_reason:
             return deltas
+        if (
+            self._started
+            and self._name
+            and self._stage in {"find_parameter", "after_function"}
+            and (self._stage == "after_function" or bool(self._params))
+        ):
+            return self._finish_call(deltas)
         if self._started:
             self._fallback_reason = "unclosed <tool_call> block"
             return []
@@ -2166,9 +2953,11 @@ class _BufferedFallbackToolCallParser(_ToolCallStreamParser):
         *,
         tools: list[dict[str, Any]],
         argument_chunk_chars: int,
+        tokenizer: Any | None = None,
     ) -> None:
         self._tools = tools
         self._argument_chunk_chars = max(1, int(argument_chunk_chars))
+        self._tokenizer = tokenizer
         self._raw = ""
         self._tool_calls: list[dict[str, Any]] | None = None
         self._fallback_reason: str | None = None
@@ -2191,7 +2980,11 @@ class _BufferedFallbackToolCallParser(_ToolCallStreamParser):
 
     def finish(self) -> list[dict[str, Any]]:
         try:
-            tool_calls = _parse_generated_tool_calls(self._raw, tools=self._tools)
+            tool_calls = _parse_generated_tool_calls(
+                self._raw,
+                tools=self._tools,
+                tokenizer=self._tokenizer,
+            )
         except HTTPException as exc:
             self._fallback_reason = _tool_protocol_reason(exc)
             return []
@@ -2217,9 +3010,12 @@ class _ToolAwareContentStreamTranslator:
         *,
         tools: list[dict[str, Any]],
         argument_chunk_chars: int,
+        tokenizer: Any | None = None,
     ) -> None:
         self._tools = tools
         self._argument_chunk_chars = max(1, int(argument_chunk_chars))
+        self._tokenizer = tokenizer
+        self._marker_pairs = _tool_marker_pairs_from_tokenizer(tokenizer)
         self._pending = ""
         self._trailing = ""
         self._mode = "passthrough" if not tools else "undecided"
@@ -2227,6 +3023,7 @@ class _ToolAwareContentStreamTranslator:
         self.tool_calls: list[dict[str, Any]] | None = None
         self.fallback_reason: str | None = None
         self.tool_parser_dialect: str | None = None
+        self._suppress_remaining_tool_text = False
 
     @property
     def has_tool_calls(self) -> bool:
@@ -2238,8 +3035,10 @@ class _ToolAwareContentStreamTranslator:
         if field != "content" or self._mode == "passthrough":
             return [{field: text}]
         if self._mode == "done":
+            if self._suppress_remaining_tool_text:
+                return []
             self._trailing += text
-            idx = self._trailing.lower().find(self._START_MARKER)
+            idx = self._find_tool_start(self._trailing)
             if idx >= 0 and not self._trailing[:idx].strip():
                 self._pending = self._trailing[idx:]
                 self._trailing = ""
@@ -2262,11 +3061,11 @@ class _ToolAwareContentStreamTranslator:
         # any trailing partial-marker bytes so the marker can complete on a
         # later chunk.
 
-        idx = self._pending.lower().find(self._START_MARKER)
+        idx = self._find_tool_start(self._pending)
         if idx >= 0:
             deltas: list[dict[str, Any]] = []
             if idx > 0:
-                pre = self._pending[:idx]
+                pre = self._sanitize_prefix_before_tool(self._pending[:idx])
                 # In undecided mode, leading whitespace before the marker is
                 # decoration, not content - drop it to match the original
                 # behaviour for tool-only responses with a leading newline.
@@ -2288,10 +3087,9 @@ class _ToolAwareContentStreamTranslator:
             stripped = self._pending.lstrip()
             if not stripped:
                 return []
-            lowered = stripped.lower()
             # Whole stripped pending could still grow into a marker; keep waiting
             # (preserves the original behaviour for the tool-only case).
-            if self._START_MARKER.startswith(lowered):
+            if self._could_grow_into_marker(stripped):
                 return []
             # Commit to content mode but keep any partial-marker tail for the
             # next chunk to potentially complete the marker.
@@ -2311,24 +3109,128 @@ class _ToolAwareContentStreamTranslator:
         self._pending = self._pending[-held:]
         return [{"content": pre}]
 
+    def _find_tool_start(self, text: str) -> int:
+        candidates: list[int] = []
+        lowered = text.lower()
+        idx = lowered.find(self._START_MARKER)
+        if idx >= 0:
+            candidates.append(idx)
+        ns_match = _NAMESPACED_TOOL_CALL_START_RE.search(text)
+        if ns_match:
+            candidates.append(ns_match.start())
+        for prefix in _BRACKET_TOOL_PREFIXES:
+            bracket_idx = lowered.find(prefix.lower())
+            while bracket_idx >= 0:
+                candidate = text[bracket_idx:]
+                if _BRACKET_TOOL_CALL_RE.match(candidate):
+                    candidates.append(bracket_idx)
+                    break
+                close_idx = candidate.find("]")
+                if close_idx < 0:
+                    break
+                bracket_idx = lowered.find(prefix.lower(), bracket_idx + 1)
+        for start_marker, _end_marker in self._marker_pairs:
+            custom_idx = _find_casefold(text, start_marker)
+            if custom_idx >= 0:
+                candidates.append(custom_idx)
+        return min(candidates) if candidates else -1
+
+    def _sanitize_prefix_before_tool(self, text: str) -> str:
+        if not any(prefix in text for prefix in _BRACKET_TOOL_PREFIXES):
+            return text
+        out: list[str] = []
+        cursor = 0
+        while cursor < len(text):
+            bracket_idx = -1
+            bracket_prefix = ""
+            for prefix in _BRACKET_TOOL_PREFIXES:
+                idx = text.find(prefix, cursor)
+                if idx >= 0 and (bracket_idx < 0 or idx < bracket_idx):
+                    bracket_idx = idx
+                    bracket_prefix = prefix
+            if bracket_idx < 0:
+                out.append(text[cursor:])
+                break
+            out.append(text[cursor:bracket_idx])
+            after_prefix = bracket_idx + len(bracket_prefix)
+            close_idx = text.find("]", after_prefix)
+            if close_idx < 0:
+                cursor = after_prefix
+                continue
+            out.append(text[bracket_idx : close_idx + 1])
+            cursor = close_idx + 1
+        return "".join(out)
+
+    def _could_grow_into_marker(self, text: str) -> bool:
+        lowered = text.lower()
+        if self._START_MARKER.startswith(lowered):
+            return True
+        if any(prefix.lower().startswith(lowered) for prefix in _BRACKET_TOOL_PREFIXES):
+            return True
+        if self._could_be_partial_namespaced_open(text):
+            return True
+        return any(
+            start.lower().startswith(lowered) for start, _end in self._marker_pairs
+        )
+
+    @staticmethod
+    def _partial_prefix_len(text: str, marker: str) -> int:
+        max_len = min(len(text), len(marker) - 1)
+        for n in range(max_len, 0, -1):
+            if text.lower().endswith(marker[:n].lower()):
+                return n
+        return 0
+
+    @staticmethod
+    def _could_be_partial_namespaced_open(candidate: str) -> bool:
+        if not candidate.startswith("<") or ">" in candidate:
+            return False
+        body = candidate[1:]
+        if not body:
+            return True
+        if body.startswith("/"):
+            return False
+        if ":" not in body:
+            return re.match(r"^[A-Za-z_][\w.-]*$", body) is not None
+        namespace, suffix = body.split(":", 1)
+        if not re.match(r"^[A-Za-z_][\w.-]*$", namespace):
+            return False
+        return "tool_call".startswith(suffix.lower())
+
     def _partial_marker_tail_len(self, text: str) -> int:
         """Return the length of the trailing suffix of `text` that is a
-        prefix of `<tool_call`. 0 if no suffix matches.
+        possible tool-call opening marker. 0 if no suffix matches.
 
         Used to hold back bytes that *could* be the start of a tool_call
         marker spanning multiple stream chunks, so the marker can complete
         on a later chunk instead of being emitted as content prematurely."""
-        marker = self._START_MARKER
-        text_lower = text.lower()
-        for n in range(min(len(marker), len(text)), 0, -1):
-            if marker.startswith(text_lower[-n:]):
-                return n
-        return 0
+        keep = self._partial_prefix_len(text, self._START_MARKER)
+        for start_marker, _end_marker in self._marker_pairs:
+            keep = max(keep, self._partial_prefix_len(text, start_marker))
+        for prefix in _BRACKET_TOOL_PREFIXES:
+            keep = max(keep, self._partial_prefix_len(text, prefix))
+        last_lt = text.rfind("<")
+        if last_lt >= 0:
+            candidate = text[last_lt:]
+            if self._could_be_partial_namespaced_open(candidate):
+                keep = max(keep, len(candidate))
+        lowered = text.lower()
+        bracket_idx = -1
+        for prefix in _BRACKET_TOOL_PREFIXES:
+            idx = lowered.rfind(prefix.lower())
+            if idx > bracket_idx:
+                bracket_idx = idx
+        if bracket_idx >= 0 and "]" not in text[bracket_idx:]:
+            return max(keep, len(text) - bracket_idx)
+        return min(keep, 128)
 
     def finish(self) -> list[dict[str, Any]]:
         if self._mode == "tool":
             return self._tool_deltas_if_complete(final=True)
         if self._mode == "done":
+            if self._suppress_remaining_tool_text:
+                self._trailing = ""
+                return []
             if self._trailing.strip():
                 stripped_trailing = self._trailing.strip().lower()
                 if self._CLOSE_MARKER.endswith(stripped_trailing):
@@ -2373,10 +3275,10 @@ class _ToolAwareContentStreamTranslator:
             chunk = ""
             if self._tool_parser.fallback_reason:
                 self.fallback_reason = self._tool_parser.fallback_reason
-                content = self._tool_parser.raw_text
                 self._tool_parser = None
-                self._mode = "content"
-                return [{"content": content}]
+                self._mode = "done"
+                self._suppress_remaining_tool_text = True
+                return []
             if self._tool_parser.tool_calls:
                 self.tool_calls = (self.tool_calls or []) + self._tool_parser.tool_calls
                 remaining = getattr(self._tool_parser, "remaining_text", "")
@@ -2384,7 +3286,7 @@ class _ToolAwareContentStreamTranslator:
                 if not remaining:
                     self._mode = "done"
                     return deltas
-                idx = remaining.lower().find(self._START_MARKER)
+                idx = self._find_tool_start(remaining)
                 if idx >= 0 and not remaining[:idx].strip():
                     self._tool_parser = _QwenXMLToolCallStreamParser(
                         tools=self._tools,
@@ -2410,7 +3312,7 @@ class _ToolAwareContentStreamTranslator:
                 if not remaining:
                     self._mode = "done"
                     return deltas
-                idx = remaining.lower().find(self._START_MARKER)
+                idx = self._find_tool_start(remaining)
                 if idx >= 0 and not remaining[:idx].strip():
                     self._tool_parser = _QwenXMLToolCallStreamParser(
                         tools=self._tools,
@@ -2425,13 +3327,14 @@ class _ToolAwareContentStreamTranslator:
                 return deltas
             if self._tool_parser.fallback_reason:
                 self.fallback_reason = self._tool_parser.fallback_reason
-                content = self._tool_parser.raw_text
                 self._tool_parser = None
-                self._mode = "content"
-                return [{"content": content}]
+                self._mode = "done"
+                self._suppress_remaining_tool_text = True
+                return deltas
             buffered = _BufferedFallbackToolCallParser(
                 tools=self._tools,
                 argument_chunk_chars=self._argument_chunk_chars,
+                tokenizer=self._tokenizer,
             )
             self.tool_parser_dialect = buffered.dialect
             buffered.feed(self._tool_parser.raw_text)
@@ -2443,9 +3346,9 @@ class _ToolAwareContentStreamTranslator:
                 return deltas + buffered_deltas
             if buffered.fallback_reason:
                 self.fallback_reason = buffered.fallback_reason
-                content = buffered.raw_text
-                self._mode = "content"
-                return [{"content": content}]
+                self._mode = "done"
+                self._suppress_remaining_tool_text = True
+                return deltas
             content = buffered.raw_text
             self._mode = "content"
             return [{"content": content}]
@@ -2529,8 +3432,10 @@ def _coerce_token_ids(encoded: Any) -> list[int]:
         for item in encoded:
             if isinstance(item, int):
                 tokens.append(int(item))
-            elif hasattr(item, "ids") or hasattr(item, "tolist") or isinstance(
-                item, (list, tuple, dict)
+            elif (
+                hasattr(item, "ids")
+                or hasattr(item, "tolist")
+                or isinstance(item, (list, tuple, dict))
             ):
                 tokens.extend(_coerce_token_ids(item))
             else:
@@ -2656,7 +3561,9 @@ def _encode_rendered_chat_text_segmented(
     for boundary in sorted(set(int(boundary) for boundary in boundaries)):
         if boundary <= start or boundary >= len(rendered):
             continue
-        token_ids.extend(_encode_rendered_chat_text(tokenizer, rendered[start:boundary]))
+        token_ids.extend(
+            _encode_rendered_chat_text(tokenizer, rendered[start:boundary])
+        )
         start = boundary
     if start < len(rendered):
         token_ids.extend(_encode_rendered_chat_text(tokenizer, rendered[start:]))
@@ -2936,9 +3843,7 @@ def _postcommit_next_turn_prefix_ids(
     if not prefix_text:
         return None
     boundaries = (
-        _tool_history_generation_boundaries(prefix_text)
-        if assistant_tool_calls
-        else []
+        _tool_history_generation_boundaries(prefix_text) if assistant_tool_calls else []
     )
     return _encode_rendered_chat_text_segmented(tokenizer, prefix_text, boundaries)
 
@@ -3089,6 +3994,7 @@ def _opencode_title_response(
         "total_tokens": stats["completion_tokens"],
     }
     if request.stream:
+
         def stream():
             first = {
                 "id": response_id,
@@ -3113,9 +4019,7 @@ def _opencode_title_response(
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
-                "choices": [
-                    {"index": 0, "delta": {}, "finish_reason": "stop"}
-                ],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 "usage": usage,
                 "mtplx_stats": stats,
             }
@@ -3381,11 +4285,14 @@ def _temporary_env(updates: dict[str, str | None]):
                 os.environ[key] = value
 
 
-def _dynamic_paged_kv_initial_new_token_budget(max_new_tokens: int) -> tuple[int, int | None]:
+def _dynamic_paged_kv_initial_new_token_budget(
+    max_new_tokens: int,
+) -> tuple[int, int | None]:
     raw = (
-        os.environ.get("MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS")
-        or "16384"
-    ).strip().lower()
+        (os.environ.get("MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS") or "16384")
+        .strip()
+        .lower()
+    )
     requested = max(0, int(max_new_tokens))
     if raw in {"0", "off", "false", "no", "none", "unlimited"}:
         return requested, None
@@ -3405,9 +4312,7 @@ def _dynamic_paged_kv_reservation(
     requested_new = max(0, int(max_new_tokens))
     reserved_new, cap = _dynamic_paged_kv_initial_new_token_budget(requested_new)
     reserved_tokens = (
-        max(0, int(prompt_tokens))
-        + max(0, int(reserved_new))
-        + max(0, int(mtp_depth))
+        max(0, int(prompt_tokens)) + max(0, int(reserved_new)) + max(0, int(mtp_depth))
     )
     return {
         "env": {"MTPLX_DYNAMIC_PAGED_KV_TOKENS": str(reserved_tokens)},
@@ -3438,12 +4343,9 @@ def _session_keep_live_refs_for_request(
     session_id: str | None,
     tool_names: list[str] | tuple[str, ...] | None = None,
 ) -> bool:
-    if (
-        os.environ.get("MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS", "")
-        .strip()
-        .lower()
-        in {"1", "true", "yes", "on"}
-    ):
+    if os.environ.get(
+        "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}:
         return True
     source = str(session_source or "")
     if source.startswith("header.") or source.startswith("metadata."):
@@ -3457,16 +4359,16 @@ def _session_keep_live_refs_for_request(
     # capacity. A benchmark with 65k max_tokens and many one-off prompts can
     # otherwise pin huge unused buffers for no reuse benefit.
     return bool(
-        session_id
-        and not session_id.startswith("anon-")
-        and source == "longest_prefix"
+        session_id and not session_id.startswith("anon-") and source == "longest_prefix"
     )
 
 
 def _anonymous_coding_agent_tool_request(
     tool_names: list[str] | tuple[str, ...] | None,
 ) -> bool:
-    names = {str(name).strip().lower() for name in (tool_names or []) if str(name).strip()}
+    names = {
+        str(name).strip().lower() for name in (tool_names or []) if str(name).strip()
+    }
     if not names:
         return False
     coding_agent_tools = {
@@ -3492,9 +4394,7 @@ def _clear_mlx_cache_after_request(
     *,
     reason: str,
 ) -> dict[str, Any]:
-    raw = (
-        os.environ.get("MTPLX_CLEAR_CACHE_AFTER_REQUEST") or "auto"
-    ).strip().lower()
+    raw = (os.environ.get("MTPLX_CLEAR_CACHE_AFTER_REQUEST") or "auto").strip().lower()
     if raw in {"0", "false", "no", "off", "never"}:
         return {"cleared": False, "reason": "disabled"}
     lock = getattr(state, "lock", None)
@@ -3572,7 +4472,9 @@ def _mlx_allocator_public_stats() -> dict[str, int]:
     return stats
 
 
-def _generation_truth_stats(state: "ServerState", effective_mode: str) -> dict[str, Any]:
+def _generation_truth_stats(
+    state: "ServerState", effective_mode: str
+) -> dict[str, Any]:
     load_mtp = bool(getattr(state.args, "load_mtp", True))
     runtime_mtp_enabled = bool(getattr(state.runtime, "mtp_enabled", False))
     draft_head = getattr(state, "draft_lm_head", None)
@@ -3769,7 +4671,11 @@ def _request_observability(
     ]
     model_extra_keys = sorted((getattr(request, "model_extra", None) or {}).keys())
     user_agent = headers.get("user-agent") or headers.get("User-Agent") or ""
-    client_hint = "android_studio" if "android" in user_agent.lower() or "jetbrains" in user_agent.lower() else None
+    client_hint = (
+        "android_studio"
+        if "android" in user_agent.lower() or "jetbrains" in user_agent.lower()
+        else None
+    )
     user_texts = [
         _content_to_text(message.content)
         for message in request.messages
@@ -4092,7 +4998,9 @@ def _store_retokenized_history_snapshot(
                 policy_fingerprint=policy_fingerprint,
                 mtp_history_snapshot=mtp_snapshot,
                 snapshot_epoch=len(history_ids),
-                mtp_snapshot_epoch=len(history_ids) if mtp_snapshot is not None else None,
+                mtp_snapshot_epoch=len(history_ids)
+                if mtp_snapshot is not None
+                else None,
             )
         except PostcommitAbort:
             return {
@@ -4508,12 +5416,8 @@ def _schedule_idle_postcommit_snapshot(
                             "stored": False,
                             "mode": "abandoned_stale",
                             "reason": "stale_session_revision",
-                            "expected_session_revision": int(
-                                expected_session_revision
-                            ),
-                            "observed_session_revision": int(
-                                observed_revision or -1
-                            ),
+                            "expected_session_revision": int(expected_session_revision),
+                            "observed_session_revision": int(observed_revision or -1),
                         }
                     )
                     return
@@ -4850,14 +5754,18 @@ def _run_generation(
                         trace_label=trace_label,
                         trace_metadata=trace_metadata,
                         adaptive_policy=adaptive_policy,
-                        online_correction_cache=bool(state.args.online_correction_cache),
+                        online_correction_cache=bool(
+                            state.args.online_correction_cache
+                        ),
                         online_correction_cache_min_depth=int(
                             state.args.online_correction_cache_min_depth
                         ),
                         online_correction_cache_key=str(
                             state.args.online_correction_cache_key
                         ),
-                        prompt_correction_cache=bool(state.args.prompt_correction_cache),
+                        prompt_correction_cache=bool(
+                            state.args.prompt_correction_cache
+                        ),
                         prompt_correction_cache_min_depth=int(
                             state.args.prompt_correction_cache_min_depth
                         ),
@@ -4965,9 +5873,7 @@ def _run_generation(
             generation_limits=generation_limits,
         )
         envelope["dynamic_paged_kv"] = {
-            key: value
-            for key, value in dynamic_kv_reservation.items()
-            if key != "env"
+            key: value for key, value in dynamic_kv_reservation.items() if key != "env"
         }
         envelope.update(_mlx_allocator_public_stats())
         envelope["generation_mode"] = effective_mode
@@ -5028,7 +5934,9 @@ def _run_generation(
         if seed_is_explicit or out.text.strip():
             break
     assert last is not None
-    if not bool((request_observability or {}).get("warmup")) and not _server_console_enabled(state):
+    if not bool(
+        (request_observability or {}).get("warmup")
+    ) and not _server_console_enabled(state):
         print(
             json.dumps(
                 {
@@ -6755,7 +7663,9 @@ def _set_server_reasoning_mode(state: ServerState, mode: str) -> None:
 def _server_settings_payload(state: ServerState) -> dict[str, Any]:
     reasoning = getattr(state.args, "reasoning", None)
     if reasoning not in {"auto", "on", "off"}:
-        reasoning = "on" if bool(getattr(state.args, "enable_thinking", True)) else "off"
+        reasoning = (
+            "on" if bool(getattr(state.args, "enable_thinking", True)) else "off"
+        )
     return {
         "ok": True,
         "reasoning": reasoning,
@@ -6819,7 +7729,9 @@ def _server_console_handle_command(state: ServerState, raw: str) -> str | None:
             return f"MTP: on (depth={int(getattr(state.args, 'depth', 1) or 1)})"
         return "usage: /mtp on|off|status"
     if command in {"/stats", "stats"}:
-        latest = state.last_metrics[-1] if getattr(state, "last_metrics", None) else None
+        latest = (
+            state.last_metrics[-1] if getattr(state, "last_metrics", None) else None
+        )
         if not latest:
             return "No generation stats yet."
         public = {
@@ -7282,7 +8194,10 @@ def create_app(state: ServerState) -> FastAPI:
             "stateless",
             "off",
         }
-        tool_specs = _normalize_tool_specs(request.tools)
+        tool_specs = _filter_tool_specs_for_request(
+            _normalize_tool_specs(request.tools),
+            request.messages,
+        )
         tools_active = _tools_active_for_request(tool_specs, request.tool_choice)
         background = is_background_request(
             messages=request.messages,
@@ -7381,7 +8296,9 @@ def create_app(state: ServerState) -> FastAPI:
             _record_tool_parse_event(state, event="android_studio_request_detected")
         prefix_diagnostic = getattr(state.sessions, "last_prefix_diagnostic", None)
         if isinstance(prefix_diagnostic, dict):
-            request_observability["request_session_prefix_diagnostic"] = prefix_diagnostic
+            request_observability["request_session_prefix_diagnostic"] = (
+                prefix_diagnostic
+            )
         session_keep_live_ref = _session_keep_live_refs_for_request(
             session_source=session_source,
             session_id=session_id,
@@ -7604,6 +8521,7 @@ def create_app(state: ServerState) -> FastAPI:
                 tool_stream = _ToolAwareContentStreamTranslator(
                     tools=tool_specs if tools_active else [],
                     argument_chunk_chars=stream_interval,
+                    tokenizer=state.runtime.tokenizer,
                 )
                 pending_stream_tokens: list[int] = []
                 commit_event = Event()
@@ -7708,7 +8626,9 @@ def create_app(state: ServerState) -> FastAPI:
                                             assistant_tool_calls=assistant_tool_calls,
                                             thinking_enabled=thinking_enabled,
                                             policy_fingerprint=policy_fingerprint,
-                                            tool_specs=tool_specs if tools_active else None,
+                                            tool_specs=tool_specs
+                                            if tools_active
+                                            else None,
                                             keep_live_ref=session_keep_live_ref,
                                         )
                                     else:
@@ -7722,7 +8642,9 @@ def create_app(state: ServerState) -> FastAPI:
                                             assistant_tool_calls=assistant_tool_calls,
                                             thinking_enabled=thinking_enabled,
                                             policy_fingerprint=policy_fingerprint,
-                                            tool_specs=tool_specs if tools_active else None,
+                                            tool_specs=tool_specs
+                                            if tools_active
+                                            else None,
                                             keep_live_ref=session_keep_live_ref,
                                         )
                                         if not postcommit.get("stored"):
@@ -7859,9 +8781,13 @@ def create_app(state: ServerState) -> FastAPI:
                         except BaseException:
                             scheduler_stats = {}
                     pending_postcommit_detail = None
-                    if session is not None and hasattr(session, "pending_postcommit_admin"):
+                    if session is not None and hasattr(
+                        session, "pending_postcommit_admin"
+                    ):
                         try:
-                            pending_postcommit_detail = session.pending_postcommit_admin()
+                            pending_postcommit_detail = (
+                                session.pending_postcommit_admin()
+                            )
                         except BaseException:
                             pending_postcommit_detail = None
                     print(
@@ -7876,9 +8802,15 @@ def create_app(state: ServerState) -> FastAPI:
                                     seconds_since_last_token,
                                     6,
                                 ),
-                                "scheduler_active_kind": scheduler_stats.get("active_kind"),
-                                "scheduler_foreground_pending": scheduler_stats.get("foreground_pending"),
-                                "scheduler_idle_pending": scheduler_stats.get("idle_pending"),
+                                "scheduler_active_kind": scheduler_stats.get(
+                                    "active_kind"
+                                ),
+                                "scheduler_foreground_pending": scheduler_stats.get(
+                                    "foreground_pending"
+                                ),
+                                "scheduler_idle_pending": scheduler_stats.get(
+                                    "idle_pending"
+                                ),
                                 "postcommit_active": bool(
                                     pending_postcommit_detail
                                     and pending_postcommit_detail.get("active")
@@ -8058,7 +8990,9 @@ def create_app(state: ServerState) -> FastAPI:
                                             yield mark_sse_sent(chunk)
                             for field, text in splitter.finish():
                                 if text:
-                                    for chunk in stream_content_delta_chunks(field, text):
+                                    for chunk in stream_content_delta_chunks(
+                                        field, text
+                                    ):
                                         yield mark_sse_sent(chunk)
                             for chunk in finish_translated_stream_chunks():
                                 yield mark_sse_sent(chunk)
@@ -8168,12 +9102,14 @@ def create_app(state: ServerState) -> FastAPI:
                                     unsafe_reason = str(
                                         postcommit.get("reason") or "unsafe_history"
                                     )
-                                    postcommit_snapshot = _skipped_idle_postcommit_snapshot(
-                                        unsafe_reason=unsafe_reason,
-                                        assistant_tool_calls=assistant_tool_calls,
-                                        prompt_prefix_len=(
-                                            prompt_prefix_commit.prefix_len
-                                        ),
+                                    postcommit_snapshot = (
+                                        _skipped_idle_postcommit_snapshot(
+                                            unsafe_reason=unsafe_reason,
+                                            assistant_tool_calls=assistant_tool_calls,
+                                            prompt_prefix_len=(
+                                                prompt_prefix_commit.prefix_len
+                                            ),
+                                        )
                                     )
                                     if postcommit_snapshot is not None:
                                         postcommit_snapshot = (
@@ -8318,6 +9254,7 @@ def create_app(state: ServerState) -> FastAPI:
             tool_calls, tool_fallback_reason = _parse_generated_tool_calls_or_content(
                 str(generated["text"]),
                 tools=tool_specs,
+                tokenizer=state.runtime.tokenizer,
                 state=state,
                 response_id=response_id,
                 stream=False,
@@ -8405,6 +9342,26 @@ def create_app(state: ServerState) -> FastAPI:
         payload = _anthropic_payload_from_openai(openai_payload)
         return JSONResponse(payload, status_code=response.status_code)
 
+    @app.post("/v1/messages/count_tokens")
+    async def anthropic_count_tokens(request: AnthropicMessagesRequest) -> Any:
+        if not request.messages:
+            raise HTTPException(status_code=400, detail="messages must not be empty")
+        chat_request = _anthropic_to_chat_request(request)
+        tool_specs = _filter_tool_specs_for_request(
+            _normalize_tool_specs(chat_request.tools),
+            chat_request.messages,
+        )
+        tools_active = _tools_active_for_request(tool_specs, chat_request.tool_choice)
+        thinking_enabled = _thinking_enabled_for_request(state, chat_request)
+        prompt_ids = _encode_messages(
+            state.runtime.tokenizer,
+            chat_request.messages,
+            enable_thinking=thinking_enabled,
+            strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+            tools=tool_specs if tools_active else None,
+        )
+        return {"input_tokens": len(prompt_ids)}
+
     @app.post("/v1/completions")
     async def completions(request: CompletionRequest) -> Any:
         prompt_ids = _encode_prompt(state.runtime.tokenizer, request.prompt)
@@ -8468,7 +9425,9 @@ def create_app(state: ServerState) -> FastAPI:
         )
 
     @app.exception_handler(HTTPException)
-    async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+    async def http_exception_handler(
+        _request: Request, exc: HTTPException
+    ) -> JSONResponse:
         _record_tool_parse_event(state, event="openai_error_response")
         return JSONResponse(
             status_code=exc.status_code,
@@ -8487,7 +9446,11 @@ def create_app(state: ServerState) -> FastAPI:
         _record_tool_parse_event(state, event="openai_error_response")
         first = exc.errors()[0] if exc.errors() else {}
         loc = first.get("loc") if isinstance(first, dict) else None
-        param = ".".join(str(item) for item in loc) if isinstance(loc, (list, tuple)) else None
+        param = (
+            ".".join(str(item) for item in loc)
+            if isinstance(loc, (list, tuple))
+            else None
+        )
         message = first.get("msg") if isinstance(first, dict) else str(exc)
         return JSONResponse(
             status_code=422,
@@ -8695,9 +9658,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--strip-assistant-reasoning-history",
         action="store_true",
-        help=(
-            "Backward-compatible alias for --preserve-thinking off."
-        ),
+        help=("Backward-compatible alias for --preserve-thinking off."),
     )
     parser.add_argument(
         "--normalize-thinking-tags",
@@ -8878,7 +9839,9 @@ def main(argv: list[str] | None = None) -> None:
             _startup_line("Opening Pi in Terminal...")
             _open_pi_later(command, model_id=str(args.model_id))
         else:
-            _startup_line("warning: --launch-pi was set but no Pi command was provided.")
+            _startup_line(
+                "warning: --launch-pi was set but no Pi command was provided."
+            )
     if args.launch_opencode:
         _startup_line("Opening OpenCode Desktop...")
         _open_opencode_later()

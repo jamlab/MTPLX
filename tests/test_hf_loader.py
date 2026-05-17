@@ -16,7 +16,7 @@ from mtplx.hf_loader import (
     safe_model_name,
     validate_mtplx_model_files,
 )
-from mtplx.profiles import DEFAULT_HF_MODEL_ID, QUALITY_HF_MODEL_ID
+from mtplx.profiles import DEFAULT_HF_MODEL_ID, LEGACY_OPTIMIZED_HF_MODEL_ID, QUALITY_HF_MODEL_ID
 
 
 def test_repo_id_from_model_ref_accepts_hf_url_and_repo_id():
@@ -31,6 +31,7 @@ def test_repo_id_from_model_ref_accepts_hf_url_and_repo_id():
 def test_repo_id_from_model_ref_maps_known_public_aliases():
     assert repo_id_from_model_ref("Qwen3.6-27B-MTPLX-Optimized-Quality") == QUALITY_HF_MODEL_ID
     assert repo_id_from_model_ref("Qwen3.6-27B-MTPLX-Optimized-Speed") == DEFAULT_HF_MODEL_ID
+    assert repo_id_from_model_ref("Qwen3.6-27B-MTPLX-Optimized") == LEGACY_OPTIMIZED_HF_MODEL_ID
 
 
 def test_known_public_alias_wins_over_bare_cwd_folder(tmp_path: Path, monkeypatch):

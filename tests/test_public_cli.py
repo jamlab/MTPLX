@@ -14,6 +14,7 @@ from mtplx.profiles import (
     DEFAULT_FP16_HF_MODEL_ID,
     DEFAULT_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    QUALITY_HF_MODEL_ID,
     QUALITY_PUBLIC_MODEL_ID,
 )
 from mtplx.version import DISPLAY_VERSION, __version__
@@ -773,6 +774,50 @@ def test_quickstart_public_quality_alias_missing_cache_is_not_no_mtp(tmp_path, c
     assert "try: mtplx quickstart --download" in captured
     assert "error: model cannot run with MTPLX" not in captured
     assert "tier: no-MTP" not in captured
+
+
+def test_quickstart_model_id_quality_without_model_loads_quality(tmp_path, capsys):
+    code = main(
+        [
+            "quickstart",
+            "--max",
+            "--model-id",
+            QUALITY_HF_MODEL_ID,
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--yes",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    captured = capsys.readouterr().out
+    assert code == 1
+    assert f"model: {QUALITY_HF_MODEL_ID}" in captured
+    assert f"detail: Model {QUALITY_HF_MODEL_ID} is not cached" in captured
+    assert "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed" not in captured
+
+
+def test_serve_model_id_quality_without_model_loads_quality(tmp_path, capsys):
+    code = main(
+        [
+            "serve",
+            "--max",
+            "--model-id",
+            QUALITY_HF_MODEL_ID,
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--yes",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    captured = capsys.readouterr().out
+    assert code == 1
+    assert f"model: {QUALITY_HF_MODEL_ID}" in captured
+    assert f"detail: Model {QUALITY_HF_MODEL_ID} is not cached" in captured
+    assert "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed" not in captured
 
 
 def test_quickstart_default_missing_cache_is_not_legacy_models_path(tmp_path, capsys):
@@ -2496,6 +2541,24 @@ def test_integrate_openwebui_json(capsys):
     assert payload["docker_api_base_url"] == "http://host.docker.internal:18012/v1"
     assert "host.docker.internal:18012/v1" in payload["docker_command"]
     assert "--no-stats-footer" in payload["server_command"]
+
+
+def test_integrate_claude_code_json_uses_anthropic_root_and_auth_token(capsys):
+    code = main(["integrate", "claude-code", "--port", "18012", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    env = payload["environment"]
+    assert code == 0
+    assert payload["integration"] == "claude-code"
+    assert payload["base_url"] == "http://127.0.0.1:18012"
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:18012"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "$MTPLX_AUTH"
+    assert env["ANTHROPIC_API_KEY"] == ""
+    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == payload["model_id"]
+    assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == payload["model_id"]
+    assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == payload["model_id"]
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == payload["model_id"]
+    assert env["API_TIMEOUT_MS"] == "3000000"
 
 
 def test_integrate_opencode_json_uses_raw_reasoning_contract(capsys):

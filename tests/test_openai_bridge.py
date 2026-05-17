@@ -368,9 +368,7 @@ def test_idle_async_postcommit_attempts_commit_for_tool_call_responses(
     assert '"stored": true' in log
 
 
-def test_idle_async_postcommit_abandons_when_model_lock_stays_busy(
-    capsys, monkeypatch
-):
+def test_idle_async_postcommit_abandons_when_model_lock_stays_busy(capsys, monkeypatch):
     """If the model lock never frees, the async commit must abandon
     rather than block forever. The loop now drives the non-blocking acquire
     inside `_store_retokenized_history_snapshot` as the correctness gate."""
@@ -378,12 +376,8 @@ def test_idle_async_postcommit_abandons_when_model_lock_stays_busy(
     state.has_foreground = lambda: True  # intentionally ignored by this path
 
     # Make the wait short so the test stays fast.
-    monkeypatch.setattr(
-        "mtplx.server.openai._IDLE_POSTCOMMIT_MAX_WAIT_S", 0.1
-    )
-    monkeypatch.setattr(
-        "mtplx.server.openai._IDLE_POSTCOMMIT_POLL_INTERVAL_S", 0.05
-    )
+    monkeypatch.setattr("mtplx.server.openai._IDLE_POSTCOMMIT_MAX_WAIT_S", 0.1)
+    monkeypatch.setattr("mtplx.server.openai._IDLE_POSTCOMMIT_POLL_INTERVAL_S", 0.05)
 
     called: list[dict] = []
 
@@ -525,6 +519,130 @@ def test_anthropic_request_translates_to_openai_chat_request():
     ]
 
 
+def test_anthropic_request_translates_claude_code_tools_and_history():
+    request = AnthropicMessagesRequest(
+        model="mtplx",
+        system=[
+            {"type": "text", "text": "x-anthropic-billing-header: noise"},
+            {"type": "text", "text": "real system"},
+        ],
+        max_tokens=64,
+        stop_sequences=["</stop>"],
+        metadata={"session_id": "claude-code-smoke"},
+        thinking={"type": "enabled"},
+        tools=[
+            {
+                "name": "Bash",
+                "description": "Run a shell command",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+            {
+                "type": "web_search_20250305",
+                "name": "web_search",
+            },
+        ],
+        tool_choice={"type": "tool", "name": "Bash"},
+        messages=[
+            AnthropicMessage(role="user", content="Run ./test.sh"),
+            AnthropicMessage(
+                role="assistant",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Bash",
+                        "input": {"command": "./test.sh"},
+                    }
+                ],
+            ),
+            AnthropicMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{"type": "text", "text": "ok"}],
+                    }
+                ],
+            ),
+        ],
+    )
+
+    chat = _anthropic_to_chat_request(request)
+
+    assert [(message.role, message.content) for message in chat.messages] == [
+        ("system", "real system"),
+        ("user", "Run ./test.sh"),
+        ("assistant", ""),
+        ("tool", "ok"),
+    ]
+    assert chat.messages[2].tool_calls == [
+        {
+            "id": "toolu_1",
+            "type": "function",
+            "function": {"name": "Bash", "arguments": '{"command":"./test.sh"}'},
+        }
+    ]
+    assert chat.messages[3].tool_call_id == "toolu_1"
+    assert chat.tools == [
+        {
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    ]
+    assert chat.tool_choice == {"type": "function", "function": {"name": "Bash"}}
+    assert chat.stop == ["</stop>"]
+    assert chat.metadata == {"session_id": "claude-code-smoke"}
+    assert chat.enable_thinking is True
+
+
+def test_anthropic_request_keeps_broader_claude_code_client_tools():
+    tool_names = [
+        "Bash",
+        "Read",
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "Glob",
+        "Grep",
+        "LS",
+        "TodoWrite",
+    ]
+    request = AnthropicMessagesRequest(
+        model="mtplx",
+        max_tokens=64,
+        messages=[AnthropicMessage(role="user", content="work")],
+        tools=[
+            {
+                "name": name,
+                "description": f"{name} tool",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                },
+            }
+            for name in tool_names
+        ],
+    )
+
+    chat = _anthropic_to_chat_request(request)
+
+    assert [tool["function"]["name"] for tool in chat.tools or []] == tool_names
+    assert all(tool["type"] == "function" for tool in chat.tools or [])
+
+
 def test_anthropic_payload_from_openai_response():
     payload = _anthropic_payload_from_openai(
         {
@@ -545,6 +663,44 @@ def test_anthropic_payload_from_openai_response():
     assert payload["content"] == [{"type": "text", "text": "hello"}]
     assert payload["usage"] == {"input_tokens": 12, "output_tokens": 3}
     assert payload["mtplx_stats"] == {"tok_s": 42.0}
+
+
+def test_anthropic_payload_from_openai_tool_call_response():
+    payload = _anthropic_payload_from_openai(
+        {
+            "model": "mtplx",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "Bash",
+                                    "arguments": '{"command":"./test.sh"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3},
+        }
+    )
+
+    assert payload["content"] == [
+        {
+            "type": "tool_use",
+            "id": "call_1",
+            "name": "Bash",
+            "input": {"command": "./test.sh"},
+        }
+    ]
+    assert payload["stop_reason"] == "tool_use"
 
 
 def test_public_mtplx_stats_excludes_internal_trace_fields():
@@ -583,6 +739,17 @@ def test_public_mtplx_stats_excludes_internal_trace_fields():
     }
 
 
+def _anthropic_stream_events(chunks):
+    frames = [frame for frame in "".join(chunks).split("\n\n") if frame]
+    events = []
+    for frame in frames:
+        lines = frame.splitlines()
+        event = lines[0].removeprefix("event: ")
+        data = json.loads(lines[1].removeprefix("data: "))
+        events.append((event, data))
+    return events
+
+
 def test_anthropic_stream_translates_openai_sse_events():
     async def upstream():
         yield (
@@ -612,13 +779,7 @@ def test_anthropic_stream_translates_openai_sse_events():
         ]
 
     chunks = asyncio.run(collect())
-    frames = [frame for frame in "".join(chunks).split("\n\n") if frame]
-    events = []
-    for frame in frames:
-        lines = frame.splitlines()
-        event = lines[0].removeprefix("event: ")
-        data = json.loads(lines[1].removeprefix("data: "))
-        events.append((event, data))
+    events = _anthropic_stream_events(chunks)
 
     assert [event for event, _data in events] == [
         "message_start",
@@ -635,6 +796,75 @@ def test_anthropic_stream_translates_openai_sse_events():
     assert events[5][1]["delta"]["stop_reason"] == "end_turn"
     assert events[5][1]["usage"] == {"output_tokens": 2}
     assert events[5][1]["mtplx_stats"] == {"tok_s": 12.5}
+
+
+def test_anthropic_stream_translates_openai_tool_call_deltas():
+    async def upstream():
+        yield (
+            'data: {"choices":[{"delta":{"role":"assistant"},'
+            '"finish_reason":null}]}\n\n'
+        )
+        yield (
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            '"id":"call_1","type":"function","function":{"name":"Bash",'
+            '"arguments":""}}]},"finish_reason":null}]}\n\n'
+        )
+        yield (
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            '"function":{"arguments":"{\\"command\\":"}}]},'
+            '"finish_reason":null}]}\n\n'
+        )
+        yield (
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            '"function":{"arguments":"\\"./test.sh\\"}"}}]},'
+            '"finish_reason":null}]}\n\n'
+        )
+        yield (
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],'
+            '"usage":{"prompt_tokens":5,"completion_tokens":2}}\n\n'
+        )
+        yield "data: [DONE]\n\n"
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in _anthropic_stream_from_openai_sse(
+                upstream(),
+                model="mtplx",
+            )
+        ]
+
+    chunks = asyncio.run(collect())
+    joined = "".join(chunks)
+    events = _anthropic_stream_events(chunks)
+
+    assert [event for event, _data in events] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert events[1][1]["index"] == 0
+    assert events[1][1]["content_block"] == {
+        "type": "tool_use",
+        "id": "call_1",
+        "name": "Bash",
+        "input": {},
+    }
+    assert events[2][1]["delta"] == {
+        "type": "input_json_delta",
+        "partial_json": '{"command":',
+    }
+    assert events[3][1]["delta"] == {
+        "type": "input_json_delta",
+        "partial_json": '"./test.sh"}',
+    }
+    assert events[5][1]["delta"]["stop_reason"] == "tool_use"
+    assert "<tool_call" not in joined
+    assert '"type": "text"' not in joined
 
 
 class RecordingTokenizer:

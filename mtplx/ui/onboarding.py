@@ -38,6 +38,13 @@ from mtplx.server_urls import bind_label, is_wildcard_bind, local_url_for_bind
 
 DEFAULT_HF_MODEL = DEFAULT_HF_MODEL_ID
 STATE_PATH = Path("~/.mtplx/quickstart.json").expanduser()
+OPTIMIZED_QUALITY_MODEL_MARKER = "qwen3.6-27b-mtplx-optimized-quality"
+LEGACY_OPTIMIZED_MODEL_NAMES = frozenset(
+    {
+        "qwen3.6-27b-mtplx-optimized",
+        "youssofal--qwen3.6-27b-mtplx-optimized",
+    }
+)
 
 # Tier ranks for sorting scanned-model lists. Lower = surfaced higher in the
 # picker. The intent is "verified first, runnable next, blocked last" so the
@@ -1374,6 +1381,14 @@ def _quickstart_state_is_reusable(last: dict) -> bool:
     target = str(last.get("target") or "")
     profile = last.get("profile")
     max_mode = bool(last.get("max"))
+    normalized_model = model.replace("_", "-").lower()
+    normalized_model_name = Path(model).expanduser().name.replace("_", "-").lower()
+    if (
+        OPTIMIZED_QUALITY_MODEL_MARKER in normalized_model
+        or normalized_model == "youssofal/qwen3.6-27b-mtplx-optimized"
+        or normalized_model_name in LEGACY_OPTIMIZED_MODEL_NAMES
+    ):
+        return False
     if profile == "performance-cold" and not max_mode:
         return False
     if profile not in {"performance-cold", "sustained"}:

@@ -64,9 +64,16 @@ from mtplx.backends.registry import (
     architecture_catalog,
 )
 from mtplx.profiles import (
+    DEFAULT_FP16_HF_MODEL_ID,
+    DEFAULT_FP16_PUBLIC_MODEL_ID,
+    DEFAULT_HF_MODEL_ID,
     DEFAULT_MODEL_ID,
     DEFAULT_PROFILE_NAME,
     DEFAULT_PUBLIC_MODEL_ID,
+    LEGACY_OPTIMIZED_HF_MODEL_ID,
+    LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    QUALITY_HF_MODEL_ID,
+    QUALITY_PUBLIC_MODEL_ID,
     apply_profile_env,
     get_profile,
 )
@@ -5043,8 +5050,49 @@ def _serve_should_onboard(args: Any) -> bool:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return False
     cli_flags = getattr(args, "_cli_flags", set()) or set()
-    if {"model", "profile", "max"} & set(cli_flags):
+    if {"model", "model-id", "profile", "max"} & set(cli_flags):
         return False
+    return True
+
+
+def _model_ref_from_public_model_id(model_id: str | None) -> str | None:
+    text = str(model_id or "").strip()
+    if not text:
+        return None
+    key = text.replace("_", "-").lower()
+    if key.startswith("mtplx/"):
+        key = key.split("/", 1)[1]
+    mapping = {
+        DEFAULT_PUBLIC_MODEL_ID.lower(): DEFAULT_HF_MODEL_ID,
+        DEFAULT_HF_MODEL_ID.lower(): DEFAULT_HF_MODEL_ID,
+        DEFAULT_MODEL_ID.lower(): DEFAULT_HF_MODEL_ID,
+        Path(DEFAULT_HF_MODEL_ID).name.lower(): DEFAULT_HF_MODEL_ID,
+        DEFAULT_FP16_PUBLIC_MODEL_ID.lower(): DEFAULT_FP16_HF_MODEL_ID,
+        DEFAULT_FP16_HF_MODEL_ID.lower(): DEFAULT_FP16_HF_MODEL_ID,
+        Path(DEFAULT_FP16_HF_MODEL_ID).name.lower(): DEFAULT_FP16_HF_MODEL_ID,
+        LEGACY_OPTIMIZED_PUBLIC_MODEL_ID.lower(): LEGACY_OPTIMIZED_HF_MODEL_ID,
+        LEGACY_OPTIMIZED_HF_MODEL_ID.lower(): LEGACY_OPTIMIZED_HF_MODEL_ID,
+        Path(LEGACY_OPTIMIZED_HF_MODEL_ID).name.lower(): LEGACY_OPTIMIZED_HF_MODEL_ID,
+        QUALITY_PUBLIC_MODEL_ID.lower(): QUALITY_HF_MODEL_ID,
+        QUALITY_HF_MODEL_ID.lower(): QUALITY_HF_MODEL_ID,
+        Path(QUALITY_HF_MODEL_ID).name.lower(): QUALITY_HF_MODEL_ID,
+    }
+    return mapping.get(key)
+
+
+def _apply_model_id_as_model_default(args: Any, *, has_explicit_model: bool) -> bool:
+    """Use known MTPLX public model ids as model refs when --model is omitted."""
+
+    if has_explicit_model:
+        return False
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if "model-id" not in cli_flags:
+        return False
+    model_ref = _model_ref_from_public_model_id(getattr(args, "model_id", None))
+    if not model_ref:
+        return False
+    args.model = model_ref
+    args._model_from_model_id = True
     return True
 
 
@@ -5064,6 +5112,11 @@ def cmd_serve_public(args: Any) -> int:
             print(f"try: mtplx {server_command} --host 127.0.0.1")
             print(f"try: mtplx {server_command} --host 0.0.0.0 --api-key $MTPLX_AUTH")
         return 2
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    _apply_model_id_as_model_default(
+        args,
+        has_explicit_model="model" in cli_flags,
+    )
     if _serve_should_onboard(args):
         from mtplx.ui.onboarding import run_serve_flow
 
@@ -7360,7 +7413,11 @@ def cmd_quickstart_public(args: Any) -> int:
     is_tty = sys.stdin.isatty() and sys.stdout.isatty()
     has_explicit_target = raw_target is not None
     has_explicit_model = "model" in cli_flags
-    args._model_explicit = has_explicit_model
+    model_from_model_id = _apply_model_id_as_model_default(
+        args,
+        has_explicit_model=has_explicit_model,
+    )
+    args._model_explicit = has_explicit_model or model_from_model_id
     has_explicit_profile_flag = "profile" in cli_flags
     has_explicit_depth = "depth" in cli_flags
     args._explicit_depth = has_explicit_depth
@@ -7376,6 +7433,7 @@ def cmd_quickstart_public(args: Any) -> int:
         or is_yes
         or has_explicit_target
         or has_explicit_model
+        or model_from_model_id
         or has_explicit_profile_flag
         or has_explicit_max
         or not is_tty
@@ -7801,7 +7859,15 @@ def cmd_integrate_public(args: Any) -> int:
             "model_id": model_id,
             "environment": {
                 "ANTHROPIC_BASE_URL": server_url,
-                "ANTHROPIC_API_KEY": f"${args.api_key_env}",
+                "ANTHROPIC_AUTH_TOKEN": f"${args.api_key_env}",
+                "ANTHROPIC_API_KEY": "",
+                "ANTHROPIC_MODEL": model_id,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": model_id,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": model_id,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": model_id,
+                "CLAUDE_CODE_SUBAGENT_MODEL": model_id,
+                "API_TIMEOUT_MS": "3000000",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             },
             "server_command": (
                 f"mtplx quickstart --profile sustained --host {args.host} --port {args.port} "

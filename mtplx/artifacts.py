@@ -19,12 +19,17 @@ from .constants import (
     EXPECTED_MTP_TENSOR_COUNT,
     MULTIMODAL_SIDECARS,
 )
-from .profiles import DEFAULT_FP16_HF_MODEL_ID, DEFAULT_HF_MODEL_ID, QUALITY_HF_MODEL_ID
+from .profiles import (
+    DEFAULT_FP16_HF_MODEL_ID,
+    DEFAULT_HF_MODEL_ID,
+    LEGACY_OPTIMIZED_HF_MODEL_ID,
+    QUALITY_HF_MODEL_ID,
+)
 
 MTP_KEY_PREFIXES = ("mtp.", "language_model.mtp.")
 _KNOWN_PUBLIC_MODEL_ALIASES = {
     "qwen3.6-27b-mtplx-optimized-speed": DEFAULT_HF_MODEL_ID,
-    "qwen3.6-27b-mtplx-optimized": DEFAULT_HF_MODEL_ID,
+    "qwen3.6-27b-mtplx-optimized": LEGACY_OPTIMIZED_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized-speed-fp16": DEFAULT_FP16_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized-quality": QUALITY_HF_MODEL_ID,
 }

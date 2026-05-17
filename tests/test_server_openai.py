@@ -17,15 +17,11 @@ from mtplx.server.openai import _RateLimiter, create_app, parse_args
 
 def test_runtime_mode_label_distinguishes_sustained_max_and_burst():
     assert (
-        openai._health_runtime_mode_label(
-            "sustained", "mtp", fan_boost_active=False
-        )
+        openai._health_runtime_mode_label("sustained", "mtp", fan_boost_active=False)
         == "Sustained MTP"
     )
     assert (
-        openai._health_runtime_mode_label(
-            "sustained", "mtp", fan_boost_active=True
-        )
+        openai._health_runtime_mode_label("sustained", "mtp", fan_boost_active=True)
         == "Sustained Max MTP"
     )
     assert (
@@ -35,9 +31,7 @@ def test_runtime_mode_label_distinguishes_sustained_max_and_burst():
         == "Burst MTP"
     )
     assert (
-        openai._health_runtime_mode_label(
-            "sustained", "ar", fan_boost_active=False
-        )
+        openai._health_runtime_mode_label("sustained", "ar", fan_boost_active=False)
         == "Sustained AR"
     )
 
@@ -923,7 +917,9 @@ def test_invalid_generation_mode_returns_400():
     )
 
     assert response.status_code == 400
-    assert response.json()["error"]["message"] == "generation_mode must be 'mtp' or 'ar'"
+    assert (
+        response.json()["error"]["message"] == "generation_mode must be 'mtp' or 'ar'"
+    )
     assert response.json()["error"]["type"] == "invalid_request_error"
 
 
@@ -962,9 +958,9 @@ def test_android_studio_issue58_replay_fixture_is_accepted(monkeypatch):
     state.runtime.tokenizer = CaptureTokenizer()
     client = TestClient(create_app(state))
     fixture = json.loads(
-        (Path(__file__).parent / "fixtures" / "android_studio_issue58_chat.json").read_text(
-            encoding="utf-8"
-        )
+        (
+            Path(__file__).parent / "fixtures" / "android_studio_issue58_chat.json"
+        ).read_text(encoding="utf-8")
     )
     fixture["stream"] = False
     seen_max_tokens: list[int | None] = []
@@ -1019,7 +1015,9 @@ class QwenToolHistoryBoundaryTokenizer:
     merged = 900_001
 
     def apply_chat_template(self, messages, **kwargs):
-        rendered = self._render(messages, add_generation_prompt=bool(kwargs.get("add_generation_prompt")))
+        rendered = self._render(
+            messages, add_generation_prompt=bool(kwargs.get("add_generation_prompt"))
+        )
         if kwargs.get("tokenize"):
             return self.encode(rendered, add_special_tokens=False)
         return rendered
@@ -1041,7 +1039,9 @@ class QwenToolHistoryBoundaryTokenizer:
     def decode(self, tokens, **_kwargs):
         parts: list[str] = []
         for token in tokens:
-            parts.append("\n\n</think>" if int(token) == self.merged else chr(int(token)))
+            parts.append(
+                "\n\n</think>" if int(token) == self.merged else chr(int(token))
+            )
         return "".join(parts)
 
     def _render(self, messages, *, add_generation_prompt: bool) -> str:
@@ -1102,6 +1102,25 @@ def _add_tool_schema():
                     "b": {"type": "integer"},
                 },
                 "required": ["a", "b"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _task_tool_schema():
+    return {
+        "type": "function",
+        "function": {
+            "name": "Task",
+            "description": "Launch a subagent task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "prompt": {"type": "string"},
+                },
+                "required": ["description", "prompt"],
                 "additionalProperties": False,
             },
         },
@@ -1213,6 +1232,23 @@ def _stream_payloads(response_text: str) -> list[dict]:
     ]
 
 
+def _anthropic_events(response_text: str) -> list[tuple[str, dict]]:
+    events: list[tuple[str, dict]] = []
+    for frame in response_text.split("\n\n"):
+        if not frame.strip():
+            continue
+        event = None
+        data = None
+        for line in frame.splitlines():
+            if line.startswith("event: "):
+                event = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data = json.loads(line.removeprefix("data: "))
+        if event and data is not None:
+            events.append((event, data))
+    return events
+
+
 def test_chat_tools_are_passed_to_qwen_template_and_inherit_default_thinking(
     monkeypatch,
 ):
@@ -1242,6 +1278,38 @@ def test_chat_tools_are_passed_to_qwen_template_and_inherit_default_thinking(
     assert "session_status" in messages[0]["content"]
     assert kwargs["tools"] == [_tool_schema()]
     assert kwargs["enable_thinking"] is True
+
+
+def test_chat_tools_hide_task_when_latest_user_disallows_subagents(monkeypatch):
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(
+        openai, "_run_generation", lambda *_args, **_kwargs: _fake_generation("ok")
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [
+                {"role": "user", "content": "Make the change. No subagents."}
+            ],
+            "tools": [_tool_schema(), _task_tool_schema()],
+            "tool_choice": "auto",
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    _messages, kwargs = state.runtime.tokenizer.calls[0]
+    tool_names = [
+        tool["function"]["name"]
+        for tool in kwargs["tools"]
+        if isinstance(tool.get("function"), dict)
+    ]
+    assert tool_names == ["session_status"]
 
 
 def test_tool_contract_includes_exact_schema_keys_for_opencode_write(monkeypatch):
@@ -1432,7 +1500,10 @@ def test_tool_template_schema_failure_retries_with_compact_contract(monkeypatch)
     assert "tools" not in second_kwargs
     assert first_messages == second_messages
     assert "MTPLX tool contract:" in second_messages[0]["content"]
-    assert "write(filePath:string, content:string, createDirs?:boolean)" in second_messages[0]["content"]
+    assert (
+        "write(filePath:string, content:string, createDirs?:boolean)"
+        in second_messages[0]["content"]
+    )
 
 
 def test_chat_tools_honor_explicit_disable_thinking(monkeypatch):
@@ -1693,6 +1764,267 @@ def test_chat_tool_json_returns_openai_tool_calls_nonstream(monkeypatch):
     assert choice["message"]["tool_calls"][0]["function"]["arguments"] == "{}"
 
 
+def test_anthropic_messages_returns_tool_use_nonstream(monkeypatch):
+    client = TestClient(create_app(_fake_state()))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: _fake_generation(
+            "<tool_call>\n"
+            "<function=Bash>\n"
+            "<parameter=command>\n"
+            "./test.sh\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        ),
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "Run ./test.sh"}],
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "Run a shell command.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                }
+            ],
+            "tool_choice": {"type": "auto"},
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["stop_reason"] == "tool_use"
+    assert payload["content"][0]["type"] == "tool_use"
+    assert payload["content"][0]["name"] == "Bash"
+    assert payload["content"][0]["input"] == {"command": "./test.sh"}
+    assert "<tool_call" not in response.text
+
+
+def test_anthropic_messages_streams_tool_use_without_text_leak(monkeypatch):
+    client = TestClient(create_app(_fake_state()))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        _fake_streaming_generation(
+            "<tool_call>\n"
+            "<function=Bash>\n"
+            "<parameter=command>\n"
+            "./test.sh\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        ),
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 16,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Run ./test.sh"}],
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "Run a shell command.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                }
+            ],
+            "tool_choice": {"type": "auto"},
+        },
+    )
+
+    assert response.status_code == 200
+    events = _anthropic_events(response.text)
+    event_names = [event for event, _payload in events]
+    assert "content_block_start" in event_names
+    assert any(
+        payload.get("content_block", {}).get("type") == "tool_use"
+        and payload["content_block"]["name"] == "Bash"
+        for event, payload in events
+        if event == "content_block_start"
+    )
+    assert any(
+        payload.get("delta", {}).get("type") == "input_json_delta"
+        and "./test.sh" in payload["delta"].get("partial_json", "")
+        for event, payload in events
+        if event == "content_block_delta"
+    )
+    assert any(
+        event == "message_delta" and payload["delta"]["stop_reason"] == "tool_use"
+        for event, payload in events
+    )
+    assert "<tool_call" not in response.text
+    assert '"type": "text"' not in response.text
+
+
+def test_anthropic_messages_streams_repaired_unclosed_tool_use(monkeypatch):
+    client = TestClient(create_app(_fake_state()))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        _fake_streaming_generation(
+            "<tool_call>\n"
+            "<function=Bash>\n"
+            "<parameter=command>\n"
+            "pwd\n"
+            "</parameter>\n"
+            "<parameter=description>\n"
+            "Print working directory\n"
+            "</parameter>"
+        ),
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 64,
+            "stream": True,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "Run pwd"}],
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "Run a shell command.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["command", "description"],
+                    },
+                }
+            ],
+            "tool_choice": {"type": "auto"},
+        },
+    )
+
+    assert response.status_code == 200
+    events = _anthropic_events(response.text)
+    assert any(
+        payload.get("content_block", {}).get("type") == "tool_use"
+        and payload["content_block"]["name"] == "Bash"
+        for event, payload in events
+        if event == "content_block_start"
+    )
+    assert "Print working directory" in response.text
+    assert "<tool_call" not in response.text
+    assert "<function=" not in response.text
+
+
+def test_anthropic_messages_streams_namespaced_tool_use(monkeypatch):
+    client = TestClient(create_app(_fake_state()))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        _fake_streaming_generation(
+            "Checking."
+            "<foo-bar:tool_call>"
+            '<invoke name="Bash">'
+            '<parameter name="command">"pwd"</parameter>'
+            '<parameter name="description">"Print working directory"</parameter>'
+            "</invoke>"
+            "</foo-bar:tool_call>"
+        ),
+    )
+
+    response = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 64,
+            "stream": True,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "Run pwd"}],
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "Run a shell command.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["command", "description"],
+                    },
+                }
+            ],
+            "tool_choice": {"type": "auto"},
+        },
+    )
+
+    assert response.status_code == 200
+    events = _anthropic_events(response.text)
+    streamed_text = "".join(
+        payload["delta"]["text"]
+        for event, payload in events
+        if event == "content_block_delta"
+        and payload.get("delta", {}).get("type") == "text_delta"
+    )
+    assert streamed_text == "Checking."
+    assert any(
+        payload.get("content_block", {}).get("type") == "tool_use"
+        and payload["content_block"]["name"] == "Bash"
+        for event, payload in events
+        if event == "content_block_start"
+    )
+    assert "<foo-bar:tool_call>" not in response.text
+    assert "<invoke" not in response.text
+
+
+def test_anthropic_count_tokens_uses_converted_tools():
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    client = TestClient(create_app(state))
+
+    response = client.post(
+        "/v1/messages/count_tokens",
+        json={
+            "model": "mtplx-test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"input_tokens": 3}
+    _messages, kwargs = state.runtime.tokenizer.calls[-1]
+    assert kwargs["tools"][0]["function"]["name"] == "Bash"
+
+
 def test_chat_stream_tool_calls_emit_delta_tool_calls(monkeypatch):
     client = TestClient(create_app(_fake_state()))
     monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
@@ -1736,7 +2068,9 @@ def test_chat_stream_consecutive_qwen_xml_tool_calls_emit_ordered_deltas(monkeyp
         "three.py\n</parameter>\n<parameter=content>\nprint(3)\n</parameter>\n"
         "</function>\n</tool_call>"
     )
-    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(generated))
+    monkeypatch.setattr(
+        openai, "_run_generation", _fake_streaming_generation(generated)
+    )
 
     response = client.post(
         "/v1/chat/completions",
@@ -1761,9 +2095,7 @@ def test_chat_stream_consecutive_qwen_xml_tool_calls_emit_ordered_deltas(monkeyp
         for item in payload["choices"][0]["delta"].get("tool_calls", [])
     ]
     name_deltas = [
-        item
-        for item in tool_deltas
-        if item.get("function", {}).get("name") == "write"
+        item for item in tool_deltas if item.get("function", {}).get("name") == "write"
     ]
     assert [item["index"] for item in name_deltas] == [0, 1, 2]
     assert any(
@@ -1782,7 +2114,9 @@ def test_chat_stream_qwen_xml_shell_arguments_are_typed(monkeypatch):
         "<parameter=timeout>\n60000\n</parameter>\n"
         "</function>\n</tool_call>"
     )
-    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(generated))
+    monkeypatch.setattr(
+        openai, "_run_generation", _fake_streaming_generation(generated)
+    )
 
     response = client.post(
         "/v1/chat/completions",
@@ -1830,7 +2164,9 @@ def test_chat_stream_qwen_xml_questions_arguments_are_arrays(monkeypatch):
         f"<parameter=questions>\n{questions}\n</parameter>\n"
         "</function>\n</tool_call>"
     )
-    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(generated))
+    monkeypatch.setattr(
+        openai, "_run_generation", _fake_streaming_generation(generated)
+    )
 
     response = client.post(
         "/v1/chat/completions",
@@ -2226,7 +2562,7 @@ def test_chat_tools_unknown_generated_tool_falls_back_to_content(monkeypatch):
     assert "unknown tool 'Agent'" in stats["tool_parse_fallback_reason"]
 
 
-def test_chat_stream_unknown_generated_tool_falls_back_to_content(monkeypatch):
+def test_chat_stream_unknown_generated_tool_is_suppressed(monkeypatch):
     state = _fake_state()
     state.args.stream_interval = 1
     state.args.stats_footer = False
@@ -2256,10 +2592,11 @@ def test_chat_stream_unknown_generated_tool_falls_back_to_content(monkeypatch):
     streamed_content = "".join(
         payload["choices"][0]["delta"].get("content", "") for payload in payloads
     )
-    assert streamed_content == text
+    assert streamed_content == ""
     assert not any(
         payload["choices"][0]["delta"].get("tool_calls") for payload in payloads
     )
+    assert "<tool_call" not in response.text
     final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
     assert final[-1]["choices"][0]["finish_reason"] == "stop"
     stats = final[-1]["mtplx_stats"]
@@ -2294,7 +2631,7 @@ def test_chat_stream_unclosed_tool_call_falls_back_and_finishes(monkeypatch):
     streamed_content = "".join(
         payload["choices"][0]["delta"].get("content", "") for payload in payloads
     )
-    assert streamed_content == text
+    assert streamed_content == ""
     assert not any(
         payload["choices"][0]["delta"].get("tool_calls") for payload in payloads
     )
@@ -2302,6 +2639,50 @@ def test_chat_stream_unclosed_tool_call_falls_back_and_finishes(monkeypatch):
     assert final[-1]["choices"][0]["finish_reason"] == "stop"
     assert final[-1]["mtplx_stats"]["tool_parse_fallback_kind"] == "unclosed_tool_call"
     assert "data: [DONE]" in response.text
+
+
+def test_chat_stream_missing_required_tool_argument_does_not_emit_empty_call(monkeypatch):
+    state = _fake_state()
+    state.args.stream_interval = 1
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    text = "<tool_call>\n<function=run_shell>\n</function>\n</tool_call>"
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(text))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Run a command."}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "run_shell",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 16,
+        },
+    )
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(response.text)
+    assert not any(
+        payload["choices"][0]["delta"].get("tool_calls") for payload in payloads
+    )
+    assert "<tool_call" not in response.text
+    final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
+    assert final[-1]["choices"][0]["finish_reason"] == "stop"
+    assert final[-1]["mtplx_stats"]["tool_parse_fallback"] is True
 
 
 def test_server_state_emits_startup_progress(monkeypatch, capsys):

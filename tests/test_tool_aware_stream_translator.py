@@ -92,10 +92,11 @@ OPENCODE_QUESTIONS_TOOL_SPECS = [
 ]
 
 
-def _make(*, tools=TOOL_SPECS):
+def _make(*, tools=TOOL_SPECS, tokenizer=None):
     return _ToolAwareContentStreamTranslator(
         tools=tools,
         argument_chunk_chars=64,
+        tokenizer=tokenizer,
     )
 
 
@@ -282,38 +283,44 @@ def test_leading_whitespace_before_marker_still_dropped():
     assert any("tool_calls" in d for d in (out + finish_deltas))
 
 
-def test_unknown_tool_name_falls_back_to_content():
+def test_unknown_tool_name_is_suppressed_not_leaked():
     t = _make()
     text = (
         "<tool_call>\n<function=Agent>\n"
         "<parameter=description>\nList files\n</parameter>\n"
         "</function>\n</tool_call>"
     )
-    assert t.feed("content", text) == [{"content": text}]
+    assert t.feed("content", text) == []
     assert t.finish() == []
     assert t.has_tool_calls is False
     assert t.fallback_reason == "unknown tool 'Agent'"
 
 
-def test_unclosed_tool_call_falls_back_to_content():
+def test_unclosed_tool_call_is_suppressed_not_leaked():
     t = _make()
     text = "<tool_call>\n<function=lookup>\n"
     assert t.feed("content", text) == []
-    assert t.finish() == [{"content": text}]
+    assert t.finish() == []
     assert t.has_tool_calls is False
     assert t.fallback_reason == "unclosed <tool_call> block"
 
 
-def test_qwen_xml_tool_call_streams_name_before_long_arguments():
+def test_missing_required_tool_argument_is_suppressed_not_emitted():
+    t = _make(tools=OPENCODE_SHELL_TOOL_SPECS)
+    text = "<tool_call>\n<function=bash>\n</function>\n</tool_call>"
+    assert t.feed("content", text) == []
+    assert t.finish() == []
+    assert t.has_tool_calls is False
+    assert "missing required argument" in (t.fallback_reason or "")
+    assert "command" in (t.fallback_reason or "")
+
+
+def test_qwen_xml_tool_call_emits_after_arguments_validate():
     t = _make(tools=WRITE_FILE_TOOL_SPECS)
     assert t.feed("content", "<tool_call>\n") == []
     assert t.feed("content", "<function=write_file>\n") == []
     name_deltas = t.feed("content", "<parameter=path>")
-    assert any(
-        item.get("function", {}).get("name") == "write_file"
-        for delta in name_deltas
-        for item in delta.get("tool_calls", [])
-    )
+    assert name_deltas == []
     arg_deltas = []
     arg_deltas.extend(t.feed("content", "app.js</parameter>\n"))
     arg_deltas.extend(t.feed("content", "<parameter=contents>const label = 'he"))
@@ -533,8 +540,121 @@ def test_opencode_questions_xml_stream_emits_array_not_string():
 def test_existing_json_tool_call_final_parse_still_works():
     t = _make()
     text = '<tool_call>{"name":"lookup","arguments":{"q":"hello"}}</tool_call>'
-    assert t.feed("content", text) == []
-    deltas = t.finish()
+    deltas = t.feed("content", text)
+    deltas.extend(t.finish())
     assert t.has_tool_calls is True
     assert json.loads(_argument_text(deltas)) == {"q": "hello"}
     assert t.tool_parser_dialect == "buffered"
+
+
+def test_unclosed_complete_qwen_xml_tool_call_is_repaired_at_finish():
+    t = _make(tools=OPENCODE_SHELL_TOOL_SPECS)
+    text = (
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\npwd\n</parameter>\n"
+        "<parameter=description>\nPrint working directory\n</parameter>"
+    )
+    assert t.feed("content", text) == []
+    deltas = t.finish()
+
+    assert t.has_tool_calls is True
+    args = json.loads(_argument_text(deltas))
+    assert args == {
+        "command": "pwd",
+        "description": "Print working directory",
+    }
+
+
+def test_unclosed_incomplete_parameter_stays_suppressed():
+    t = _make(tools=OPENCODE_SHELL_TOOL_SPECS)
+    text = (
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\npwd\n</parameter>\n"
+        "<parameter=description>\n"
+    )
+    deltas = t.feed("content", text)
+    deltas.extend(t.finish())
+    assert deltas == []
+    assert t.has_tool_calls is False
+    assert t.fallback_reason == "unclosed <tool_call> block"
+
+
+def test_namespaced_tool_call_parses_without_markup_leak():
+    t = _make()
+    text = (
+        "Let me check."
+        "<foo-bar:tool_call>"
+        '<invoke name="lookup">'
+        '<parameter name="q">"scene"</parameter>'
+        "</invoke>"
+        "</foo-bar:tool_call>"
+    )
+    out = _feed_in_chunks(t, text, [3, 2, 11, 5, 7, 13])
+
+    content = _content_text(out)
+    assert content == "Let me check."
+    _assert_no_tool_markup_leaked(content)
+    assert "<foo-bar:tool_call>" not in content
+    assert t.tool_calls is not None
+    assert json.loads(t.tool_calls[0]["function"]["arguments"]) == {"q": "scene"}
+
+
+def test_bracket_tool_call_parses_and_suppresses_partial_prefix():
+    t = _make()
+    out = []
+    out.extend(t.feed("content", "Let me check. [Calling tool:"))
+    out.extend(t.feed("content", ' lookup({"q":"scene"})]'))
+    out.extend(t.finish())
+
+    content = _content_text(out)
+    assert content == "Let me check. "
+    assert "[Calling tool:" not in content
+    assert t.tool_calls is not None
+    assert json.loads(t.tool_calls[0]["function"]["arguments"]) == {"q": "scene"}
+
+
+def test_literal_bracket_prefix_before_valid_tool_call_is_sanitized_not_leaked():
+    t = _make()
+    text = (
+        "Before [Calling tool: unfinished and then "
+        '[Calling tool: lookup({"q":"scene"})] done'
+    )
+    out = _feed_in_chunks(t, text, [len(text)])
+
+    content = _content_text(out)
+    assert "[Calling tool:" not in content
+    assert content == "Before  unfinished and then "
+    assert t.tool_calls is not None
+    assert json.loads(t.tool_calls[0]["function"]["arguments"]) == {"q": "scene"}
+
+
+class _CustomToolTokenizer:
+    tool_call_start = "<|tool|>"
+    tool_call_end = "<|/tool|>"
+
+
+def test_tokenizer_defined_tool_delimiters_parse_json_payload():
+    t = _make(tokenizer=_CustomToolTokenizer())
+    text = 'Before <|tool|>{"name":"lookup","arguments":{"q":"scene"}}<|/tool|>'
+    out = _feed_in_chunks(t, text, [6, 4, 9, 3, 5, 8])
+
+    content = _content_text(out)
+    assert content == "Before "
+    assert "<|tool|>" not in content
+    assert t.tool_calls is not None
+    assert json.loads(t.tool_calls[0]["function"]["arguments"]) == {"q": "scene"}
+
+
+def test_schema_type_mismatch_is_suppressed_before_client_validation_error():
+    t = _make(tools=OPENCODE_SHELL_TOOL_SPECS)
+    text = (
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\npwd\n</parameter>\n"
+        "<parameter=description>\nPrint working directory\n</parameter>\n"
+        "<parameter=timeout>\nsoon\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    assert t.feed("content", text) == []
+    assert t.finish() == []
+    assert t.has_tool_calls is False
+    assert "timeout must be number" in (t.fallback_reason or "")

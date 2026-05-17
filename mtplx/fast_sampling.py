@@ -94,7 +94,8 @@ def sparse_distribution_from_mlx_logits(
 
     token_ids = token_ids[keep]
     probs = probs_full[keep]
-    if probs.sum() <= 0:
+    total = probs.sum()
+    if not np.isfinite(total) or total <= 0:
         token_ids = token_ids[:1]
         probs = np.array([1.0], dtype=np.float64)
 
@@ -146,7 +147,8 @@ def sparse_distributions_from_mlx_logits(
 
         kept_ids = token_ids[keep]
         probs = probs_full[keep]
-        if probs.sum() <= 0:
+        total = probs.sum()
+        if not np.isfinite(total) or total <= 0:
             kept_ids = kept_ids[:1]
             probs = np.array([1.0], dtype=np.float64)
 
@@ -203,7 +205,7 @@ def batched_sparse_distributions_from_mlx_logits(
         prob_rows = np.where(keep, prob_rows, 0.0)
 
     row_sums = prob_rows.sum(axis=1)
-    bad = row_sums <= 0
+    bad = (~np.isfinite(row_sums)) | (row_sums <= 0)
     if np.any(bad):
         prob_rows[bad, :] = 0.0
         prob_rows[bad, 0] = 1.0

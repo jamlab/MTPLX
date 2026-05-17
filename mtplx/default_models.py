@@ -34,10 +34,9 @@ OPTIMIZED_SPEED_DESCRIPTION = "Q4 target with Q4 MTP sidecar"
 OPTIMIZED_QUALITY_LABEL = "Qwen3.6 27B MTPLX Optimized Quality"
 OPTIMIZED_QUALITY_DESCRIPTION = "Flat8 target with INT8 MTP sidecar"
 _OPTIMIZED_SPEED_LOCAL_CANDIDATES = (
-    "~/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized",
+    "~/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
     "~/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized-Speed",
     "~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
-    "~/Documents/MTPLX/hf-staging/Qwen3.6-27B-MTPLX-Optimized",
     "~/Documents/MTPLX/hf-staging/Qwen3.6-27B-MTPLX-Optimized-Speed",
 )
 _OPTIMIZED_QUALITY_LOCAL_CANDIDATES = (
@@ -46,8 +45,6 @@ _OPTIMIZED_QUALITY_LOCAL_CANDIDATES = (
 )
 _VERIFIED_DEFAULT_LOCAL_NAMES = frozenset(
     {
-        "Qwen3.6-27B-MTPLX-Optimized",
-        "Youssofal--Qwen3.6-27B-MTPLX-Optimized",
         "Qwen3.6-27B-MTPLX-Optimized-Speed",
         "Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
         "Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
@@ -183,6 +180,8 @@ def _artifact_role_model_id(role: str) -> str | None:
         return QUALITY_PUBLIC_MODEL_ID
     if "fp16" in normalized or "float16" in normalized:
         return DEFAULT_FP16_PUBLIC_MODEL_ID
+    if "gdn8" in normalized or normalized in {"optimized", "legacy-optimized"}:
+        return LEGACY_OPTIMIZED_PUBLIC_MODEL_ID
     if "speed" in normalized or "flat4" in normalized or "maximum-speed" in normalized:
         return DEFAULT_PUBLIC_MODEL_ID
     return None

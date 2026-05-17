@@ -164,7 +164,7 @@ def test_invalid_default_model_variant_env_falls_back_to_auto(monkeypatch):
 def test_verified_default_refs_include_speed_and_fp16():
     assert is_verified_default_model_ref(DEFAULT_HF_MODEL_ID)
     assert is_verified_default_model_ref(DEFAULT_FP16_HF_MODEL_ID)
-    assert is_verified_default_model_ref(
+    assert not is_verified_default_model_ref(
         "/Users/example/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized"
     )
     assert is_verified_default_model_ref(
@@ -178,7 +178,7 @@ def test_verified_default_refs_include_speed_and_fp16():
 
 
 def test_optimized_speed_prefers_complete_local_env_model(tmp_path, monkeypatch):
-    local_speed = _make_complete_model(tmp_path / "Qwen3.6-27B-MTPLX-Optimized")
+    local_speed = _make_complete_model(tmp_path / "Qwen3.6-27B-MTPLX-Optimized-Speed")
     monkeypatch.setenv(SPEED_MODEL_ENV, str(local_speed))
 
     selection = select_default_model(
@@ -238,6 +238,17 @@ def test_public_model_id_for_ref_uses_runtime_metadata_before_folder_name(tmp_pa
     )
 
     assert public_model_id_for_ref(model) == QUALITY_PUBLIC_MODEL_ID
+
+
+def test_public_model_id_for_ref_maps_gdn8_metadata_to_legacy_optimized(tmp_path):
+    model = tmp_path / "whatever-local-folder"
+    model.mkdir()
+    (model / "mtplx_runtime.json").write_text(
+        json.dumps({"artifact_role": "gdn8-speed4"}),
+        encoding="utf-8",
+    )
+
+    assert public_model_id_for_ref(model) == LEGACY_OPTIMIZED_PUBLIC_MODEL_ID
 
 
 def test_public_model_id_for_ref_maps_mixed_q4_speed_metadata_to_speed(tmp_path):
