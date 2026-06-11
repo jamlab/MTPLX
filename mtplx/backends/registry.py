@@ -983,27 +983,32 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
         support = architecture_support_for(arch_id)
         blocker = _runtime_contract_blocker(contract)
         if blocker:
+            # Contract evidence (exactness baseline, speed verdicts) is a
+            # label, never a load gate: the model is architecturally
+            # runnable, so it runs as unverified and the verdict explains
+            # why the verified badge is withheld. Refusals are reserved
+            # for artifacts that physically cannot execute.
             return CompatibilityVerdict(
                 tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
                 arch_id=arch_id,
                 supported=False,
                 recognized=support is not None,
-                can_run=False,
+                can_run=True,
                 exit_code=EXIT_UNVERIFIED,
                 message=(
-                    "Runtime contract is not launch-ready: "
-                    f"{blocker}. Repair or regenerate the artifact with Forge "
-                    "before using it as a verified MTPLX model."
+                    "Runtime contract is not verified: "
+                    f"{blocker}. The model runs as unverified; regenerate "
+                    "the contract with Forge to restore the verified badge."
                 ),
                 recommended_backend=(support.backend if support else None),
                 recommended_profile=contract.recommended_profile,
                 runtime_contract=contract,
                 runtime_contract_path=contract_path,
                 runtime_contract_error=contract_error,
-                unsafe_force_required=True,
+                unsafe_force_required=False,
                 unverified_model=True,
                 mtp_supported="partial" if has_mtp else "no",
-                runtime_compatibility="runtime-contract-blocked",
+                runtime_compatibility="runtime-contract-unverified",
                 support_level=(
                     "native-backend-needs-contract-repair"
                     if support is not None

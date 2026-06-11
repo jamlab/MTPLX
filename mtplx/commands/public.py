@@ -424,7 +424,10 @@ def _model_gate(
     compatibility = inspection.get("compatibility") or {}
     tier = compatibility.get("tier")
     exit_code = int(compatibility.get("exit_code", EXIT_UNSUPPORTED_MODEL))
-    if exit_code == 0 and compatibility.get("can_run"):
+    # The gate asks one question: can this artifact execute. Verification
+    # tier stays a label (inspect exit codes still report it); it must
+    # never block loading.
+    if compatibility.get("can_run"):
         if compatibility.get("unverified_model"):
             print(
                 "WARNING: running a family-compatible MTPLX model without a "
@@ -527,7 +530,7 @@ def _model_gate_error_lines(inspection: dict[str, Any]) -> list[str]:
             "fix: choose a model with real MTP weights, or graft an MTP sidecar "
             "into this base model."
         )
-    elif tier == TIER_ARCH_COMPATIBLE_UNVERIFIED:
+    elif compatibility.get("tier") == TIER_ARCH_COMPATIBLE_UNVERIFIED:
         lines.append(
             "try: add --unsafe-force-unverified --yes to run without support guarantees"
         )

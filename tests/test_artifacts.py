@@ -654,11 +654,11 @@ def test_runtime_contract_public_release_blocker_is_not_verified(monkeypatch, tm
 
     result = inspect_model(tmp_path)
 
-    assert result.passes_primary_gate is False
+    assert result.passes_primary_gate is True
     assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
-    assert result.compatibility["can_run"] is False
-    assert result.compatibility["runtime_compatibility"] == "runtime-contract-blocked"
-    assert result.compatibility["unsafe_force_required"] is True
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["runtime_compatibility"] == "runtime-contract-unverified"
+    assert result.compatibility["unsafe_force_required"] is False
     assert "public_release_blocker" in result.compatibility["message"]
 
 
@@ -700,8 +700,8 @@ def test_runtime_contract_failed_speed_evidence_is_not_verified(monkeypatch, tmp
 
     result = inspect_model(tmp_path)
 
-    assert result.passes_primary_gate is False
-    assert result.compatibility["runtime_compatibility"] == "runtime-contract-blocked"
+    assert result.passes_primary_gate is True
+    assert result.compatibility["runtime_compatibility"] == "runtime-contract-unverified"
     assert "no_mtp_depth_beat_ar" in result.compatibility["message"]
 
 
@@ -739,8 +739,8 @@ def test_runtime_contract_pending_status_prefix_is_not_verified(monkeypatch, tmp
 
     result = inspect_model(tmp_path)
 
-    assert result.passes_primary_gate is False
-    assert result.compatibility["runtime_compatibility"] == "runtime-contract-blocked"
+    assert result.passes_primary_gate is True
+    assert result.compatibility["runtime_compatibility"] == "runtime-contract-unverified"
     assert "pending-cyankiwi-35b-moe-benchmark" in result.compatibility["message"]
 
 
@@ -1936,3 +1936,50 @@ def test_gemma4_target_subfolder_alone_still_refuses():
 
     assert verdict.can_run is False
     assert verdict.runtime_compatibility == "incomplete-assistant-pair"
+
+
+def test_user_promoted_contract_runs_as_unverified_label(monkeypatch, tmp_path):
+    # The published Optimized Quality shape (#98): a human promoted the
+    # artifact at publish time. Verification is a label, never a load
+    # gate, so the model must stay runnable.
+    import json as _json
+
+    from mtplx import artifacts
+    from mtplx.artifacts import MTPInspection
+
+    (tmp_path / "config.json").write_text(
+        _json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "mtp_num_hidden_layers": 1,
+                "hidden_size": 5120,
+                "num_hidden_layers": 64,
+                "vocab_size": 248320,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        artifacts,
+        "inspect_mtp_tensors",
+        lambda *_args, **_kwargs: MTPInspection(
+            mtp_file=str(tmp_path / "mtp.safetensors"),
+            exists=True,
+            tensor_count=15,
+            missing_expected_keys=(),
+        ),
+    )
+    _write_runtime_contract(
+        tmp_path,
+        exactness_baseline={"status": "candidate-promoted-by-user-decision"},
+    )
+
+    result = inspect_model(tmp_path)
+
+    compatibility = result.compatibility
+    assert compatibility["tier"] == "architecture-compatible-but-unverified"
+    assert compatibility["can_run"] is True
+    assert compatibility["unsafe_force_required"] is False
+    assert compatibility["runtime_compatibility"] == "runtime-contract-unverified"
+    assert "runs as unverified" in compatibility["message"]

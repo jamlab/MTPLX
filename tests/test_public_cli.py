@@ -6858,3 +6858,31 @@ def test_eval_attribution_dry_run_is_real_command(capsys):
     assert "--prefix-tokens" in payload["command"]
     assert "outputs,recurrent;recurrent,outputs" in payload["command"]
     assert "larger owned kernel boundary" in payload["purpose"]
+
+
+def test_model_gate_error_lines_render_for_every_tier():
+    # Regression for #98: the unverified-tier branch crashed with a
+    # NameError instead of printing the gate explanation.
+    from mtplx.commands.public import _model_gate_error_lines
+
+    tiers = (
+        "verified",
+        "architecture-compatible-but-unverified",
+        "incompatible-architecture",
+        "no-MTP",
+        None,
+    )
+    for tier in tiers:
+        inspection = {
+            "model": "/tmp/example",
+            "compatibility": {
+                "tier": tier,
+                "can_run": False,
+                "message": "example reason",
+            },
+            "mtp": {"exists": True, "tensor_count": 3, "passes_tensor_gate": True},
+            "mtp_num_hidden_layers": 1,
+        }
+        lines = _model_gate_error_lines(inspection)
+        assert lines, tier
+        assert any("try:" in line for line in lines), (tier, lines)
