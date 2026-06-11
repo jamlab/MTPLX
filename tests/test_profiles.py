@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from mtplx.profiles import (
     DEFAULT_PROFILE_NAME,
     NATIVE_MTP_60_FAST_PATH_ENV,
@@ -12,6 +14,7 @@ from mtplx.profiles import (
     profile_env_status,
     restore_profile_env,
     resolve_long_context_mtp_depth,
+    resolve_profile_name,
     runtime_env_with_contract_overrides,
 )
 
@@ -249,3 +252,17 @@ def test_long_context_depth_cap_is_explicit_diagnostic_only() -> None:
     assert details["reason"] == "long_context_depth_cap"
     assert details["requested_depth"] == 3
     assert details["effective_depth"] == 2
+
+
+def test_legacy_app_profile_strings_resolve_to_shipping_profiles() -> None:
+    # The V1 app Settings picker wrote "auto" and "sustained-max" into
+    # persisted configs; both must stay launchable forever.
+    assert resolve_profile_name("auto") == "sustained"
+    assert resolve_profile_name("sustained-max") == "sustained"
+    assert resolve_profile_name("sustained_max") == "sustained"
+    assert get_profile("auto").name == "sustained"
+
+
+def test_unknown_profile_error_lists_canonical_choices() -> None:
+    with pytest.raises(ValueError, match="expected one of: stable"):
+        resolve_profile_name("banana")

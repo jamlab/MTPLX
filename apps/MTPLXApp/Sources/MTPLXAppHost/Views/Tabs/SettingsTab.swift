@@ -866,11 +866,13 @@ struct SettingsTab: View {
                 }
 
                 FormRow(label: "Profile") {
+                    // Only engine-launchable profiles may appear here; a
+                    // stray tag value persists into config and kills serve
+                    // at argparse. Max fans is the Fan mode row, not a
+                    // profile.
                     Picker("Profile", selection: $draftConfig.profile) {
                         Text("Sustained").tag("sustained")
-                        Text("Sustained Max").tag("sustained-max")
                         Text("Performance Cold (Burst)").tag("performance-cold")
-                        Text("Auto").tag("auto")
                     }
                     .pickerStyle(.menu)
                     .labelsHidden()

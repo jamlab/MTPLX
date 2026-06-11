@@ -496,9 +496,20 @@ public final class MTPLXBackendStore: ObservableObject {
     /// merged onto the user's Settings. Picking a target persists it as
     /// `lastLaunchTarget` so a subsequent click can skip the picker.
     public func startDaemon(target: LaunchTarget?) async {
-        let target = target ?? defaultLaunchTarget(for: configuration)
         clientHandoffNotice = nil
         portFallbackNotice = nil
+        await startDaemon(target: target, attemptedPortRemediation: false)
+    }
+
+    /// `attemptedPortRemediation` bounds the relaunch to one retry: a
+    /// port-conflict failure remediates (replace our own stale daemon,
+    /// or move to a free port) and relaunches once; a second failure
+    /// surfaces through the normal degraded path.
+    private func startDaemon(
+        target: LaunchTarget?,
+        attemptedPortRemediation: Bool
+    ) async {
+        let target = target ?? defaultLaunchTarget(for: configuration)
         if let target {
             var next = configuration
             next.lastLaunchTarget = target.rawValue
@@ -593,6 +604,20 @@ public final class MTPLXBackendStore: ObservableObject {
                 activeLaunchID = nil
             }
         } catch {
+            if !attemptedPortRemediation,
+               !cancelledLaunchIDs.contains(launchID),
+               Self.failureIndicatesPortConflict(error),
+               await remediatePortConflict(target: target, launchID: launchID) {
+                if activeLaunchID == launchID {
+                    activeLaunchID = nil
+                }
+                await supervisor.logs.append(
+                    "retrying daemon launch after port remediation",
+                    stream: .system
+                )
+                await startDaemon(target: target, attemptedPortRemediation: true)
+                return
+            }
             let failureDescription = Self.humanizedStartFailure(
                 error,
                 port: configuration.port
@@ -700,7 +725,7 @@ public final class MTPLXBackendStore: ObservableObject {
         configuration = next
         try? settingsStore.save(next)
         portFallbackNotice =
-            "Port \(occupiedPort) was in use by \(occupantDescription) — MTPLX now uses port \(freePort)."
+            "Port \(occupiedPort) was in use by \(occupantDescription). MTPLX now uses port \(freePort)."
         await supervisor.logs.append(
             "port preflight: \(occupiedPort) occupied by \(occupantDescription); switched to \(freePort)",
             stream: .system
@@ -715,6 +740,58 @@ public final class MTPLXBackendStore: ObservableObject {
     ) async -> (port: Int, notice: String?) {
         await preflightConfiguredPort(target: target, launchID: launchID)
         return (configuration.port, portFallbackNotice)
+    }
+
+    /// One-shot remediation between launch attempts after the bind
+    /// itself failed. The standard preflight handles occupants it can
+    /// see (replace our own stale daemon in place, sidestep foreign
+    /// listeners). When the probe sees nothing yet the bind still
+    /// failed, trust the bind error over the probe: IPv6-only and
+    /// other-user wildcard listeners are invisible to a localhost HTTP
+    /// probe but still collide, so move to the next free port outright.
+    func remediatePortConflict(
+        target: LaunchTarget?,
+        launchID: String
+    ) async -> Bool {
+        let occupiedPort = configuration.port
+        let occupant = await PortPreflight.classify(
+            baseURL: baseURL,
+            apiKey: configuration.apiKey
+        )
+        switch occupant {
+        case .mtplxServer, .foreign:
+            await preflightConfiguredPort(target: target, launchID: launchID)
+            return true
+        case .free:
+            guard let freePort = PortPreflight.nextFreePort(after: occupiedPort) else {
+                return false
+            }
+            var next = configuration
+            next.port = freePort
+            configuration = next
+            try? settingsStore.save(next)
+            portFallbackNotice =
+                "Port \(occupiedPort) was busy. MTPLX now uses port \(freePort)."
+            await supervisor.logs.append(
+                "launch hit a port conflict on \(occupiedPort) the probe could not see; switched to \(freePort)",
+                stream: .system
+            )
+            return true
+        }
+    }
+
+    /// True when a launch failure means the port itself was lost:
+    /// the supervisor's pre-spawn probe found a foreign MTPLX daemon,
+    /// or the serve process exited with its own port-busy error.
+    nonisolated static func failureIndicatesPortConflict(_ error: Error) -> Bool {
+        if case DaemonSupervisorError.portOccupied = error {
+            return true
+        }
+        if case DaemonSupervisorError.launchFailed(let detail) = error {
+            let lowered = detail.lowercased()
+            return lowered.contains("already in use") || lowered.contains("errno 48")
+        }
+        return false
     }
 
     /// Occupant-aware copy for startup failures. Port collisions get a

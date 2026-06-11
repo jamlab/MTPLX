@@ -142,15 +142,20 @@ public struct MTPLXCommandBuilder: Sendable {
             processEnvironment: environment
         )
 
+        // Final allowlist before argv: no config string, however it got
+        // persisted, may produce a serve command argparse refuses.
         var arguments = [
             "serve",
             "--host", configuration.host,
             "--port", String(configuration.port),
             "--model", configuration.model,
-            "--profile", resolved.profile,
+            "--profile", MTPLXAppConfiguration.launchableProfile(resolved.profile),
         ]
-        if configuration.generationMode != "mtp" {
-            arguments.append(contentsOf: ["--generation-mode", configuration.generationMode])
+        let launchGenerationMode = MTPLXAppConfiguration.launchableGenerationMode(
+            configuration.generationMode
+        )
+        if launchGenerationMode != "mtp" {
+            arguments.append(contentsOf: ["--generation-mode", launchGenerationMode])
         }
         if !configuration.loadMTP {
             arguments.append("--no-load-mtp")

@@ -361,6 +361,28 @@ def test_server_cli_surfaces_default_to_sustained_profile():
     assert serve_args.profile == "sustained"
 
 
+def test_serve_parser_accepts_legacy_app_profile_strings():
+    # Shipped app builds persisted profile "auto" / "sustained-max"; the
+    # parser must canonicalize them instead of exiting 2 at startup.
+    parser = build_parser()
+
+    auto_args = parser.parse_args(["serve", "--yes", "--profile", "auto"])
+    max_args = parser.parse_args(["serve", "--yes", "--profile", "sustained-max"])
+
+    assert auto_args.profile == "sustained"
+    assert max_args.profile == "sustained"
+
+
+def test_serve_parser_accepts_auto_generation_mode_as_engine_default():
+    from mtplx.commands.public import _generation_mode_from_args
+
+    parser = build_parser()
+    args = parser.parse_args(["serve", "--yes", "--generation-mode", "auto"])
+
+    assert args.generation_mode == "auto"
+    assert _generation_mode_from_args(args) == "mtp"
+
+
 def test_serve_cli_accepts_native_app_thermal_poll_flag():
     parser = build_parser()
 

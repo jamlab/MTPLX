@@ -473,6 +473,13 @@ PROFILE_ALIASES = {
     "native_mtp_60_cold": "performance-cold",
     "long_response_exact_staged": "stable",
     "max": "max-diagnostic",
+    # The V1 app Settings picker briefly offered these as profile values,
+    # so configs in the wild persist them. "auto" means the engine
+    # default; "sustained-max" was sustained plus max fans, and fan mode
+    # travels on --fan-mode, never inside the profile name.
+    "auto": DEFAULT_PROFILE_NAME,
+    "sustained-max": "sustained",
+    "sustained_max": "sustained",
 }
 
 

@@ -621,6 +621,9 @@ def _validate_public_depth(args: Any, *, printer=print) -> int | None:
 
 def _normalize_generation_mode(value: Any) -> str:
     text = str(value or GENERATION_MODE_MTP).strip().lower()
+    if text == "auto":
+        # Older app builds persisted "auto"; it means the engine default.
+        return GENERATION_MODE_MTP
     if text not in GENERATION_MODES:
         raise ValueError("generation mode must be 'mtp' or 'ar'")
     return text

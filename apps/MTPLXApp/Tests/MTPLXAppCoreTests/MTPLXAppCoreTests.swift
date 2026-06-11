@@ -630,6 +630,87 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(env["PATH"]?.contains(fake.deletingLastPathComponent().path) ?? false)
     }
 
+    // MARK: - Launch-critical config sanitization (degraded-on-start class)
+
+    private func decodeConfiguration(json: String) throws -> MTPLXAppConfiguration {
+        try JSONDecoder().decode(MTPLXAppConfiguration.self, from: Data(json.utf8))
+    }
+
+    func testPersistedLegacyProfileStringsDecodeLaunchable() throws {
+        let auto = try decodeConfiguration(json: #"{"profile": "auto"}"#)
+        XCTAssertEqual(auto.profile, "sustained")
+
+        let unknown = try decodeConfiguration(
+            json: #"{"profile": "banana", "generation_mode": "auto"}"#
+        )
+        XCTAssertEqual(unknown.profile, "sustained")
+        XCTAssertEqual(unknown.generationMode, "mtp")
+    }
+
+    func testPersistedSustainedMaxMigratesToSustainedPlusMaxFans() throws {
+        let config = try decodeConfiguration(json: #"{"profile": "sustained-max"}"#)
+
+        XCTAssertEqual(config.profile, "sustained")
+        XCTAssertEqual(config.fanMode, MTPLXFanMode.max.rawValue)
+        XCTAssertTrue(config.pinFansAtMaxOnStart)
+    }
+
+    func testServeCommandNeverEmitsUnlaunchableProfileOrMode() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: [
+            "PATH": fake.deletingLastPathComponent().path,
+            "HOME": temporaryDirectory().path,
+        ])
+        var configuration = MTPLXAppConfiguration(
+            model: "/models/qwen",
+            profile: "sustained"
+        )
+        // In-memory state as an older build could hold it, before any
+        // decode-time sanitization has a chance to run.
+        configuration.profile = "auto"
+        configuration.generationMode = "auto"
+
+        let command = try builder.buildServeCommand(configuration: configuration)
+
+        let arguments = command.arguments
+        let profileIndex = try XCTUnwrap(arguments.firstIndex(of: "--profile"))
+        XCTAssertEqual(arguments[arguments.index(after: profileIndex)], "sustained")
+        XCTAssertFalse(
+            arguments.contains("--generation-mode"),
+            arguments.joined(separator: " ")
+        )
+    }
+
+    func testFailureIndicatesPortConflictMatchesBothDetectionLayers() {
+        XCTAssertTrue(
+            MTPLXBackendStore.failureIndicatesPortConflict(
+                DaemonSupervisorError.portOccupied(pid: 123, launchID: "abc")
+            )
+        )
+        XCTAssertTrue(
+            MTPLXBackendStore.failureIndicatesPortConflict(
+                DaemonSupervisorError.launchFailed(
+                    "daemon exited before /health became ready: error: port 8000 is already in use"
+                )
+            )
+        )
+        XCTAssertTrue(
+            MTPLXBackendStore.failureIndicatesPortConflict(
+                DaemonSupervisorError.launchFailed("[Errno 48] Address already in use")
+            )
+        )
+        XCTAssertFalse(
+            MTPLXBackendStore.failureIndicatesPortConflict(
+                DaemonSupervisorError.launchFailed("ImportError: missing module")
+            )
+        )
+        XCTAssertFalse(
+            MTPLXBackendStore.failureIndicatesPortConflict(
+                DaemonSupervisorError.healthTimeout
+            )
+        )
+    }
+
     func testAppSubprocessEnvironmentStripsInheritedPipOverrides() throws {
         let fake = try makeExecutable(named: "mtplx")
 

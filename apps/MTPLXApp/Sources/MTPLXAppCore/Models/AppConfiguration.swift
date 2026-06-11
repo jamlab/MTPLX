@@ -532,6 +532,40 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         ) ?? defaults.tunedControlRecordsByModel
         customModels = try container.decodeIfPresent([MTPLXModelOption].self, forKey: .customModels) ?? defaults.customModels
         huggingFaceHandle = try container.decodeIfPresent(String.self, forKey: .huggingFaceHandle)
+        sanitizeLaunchCriticalFields()
+    }
+
+    /// Engine-launchable allowlists. SYNC PAIR: mtplx/profiles.py
+    /// PROFILE_CHOICES and mtplx GENERATION_MODES. A value outside these
+    /// kills `mtplx serve` at argument parsing, which the user experiences
+    /// as a daemon that is degraded on every start, so any persisted
+    /// config must decode back to something launchable.
+    static let engineProfiles: Set<String> = [
+        "stable", "performance-cold", "sustained", "exact", "max-diagnostic",
+    ]
+    static let engineGenerationModes: Set<String> = ["mtp", "ar"]
+
+    public static func launchableProfile(_ raw: String) -> String {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return engineProfiles.contains(value) ? value : "sustained"
+    }
+
+    public static func launchableGenerationMode(_ raw: String) -> String {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return engineGenerationModes.contains(value) ? value : "mtp"
+    }
+
+    /// Early V1 builds wrote picker values the engine never accepted
+    /// ("auto", "sustained-max"). "sustained-max" meant sustained plus
+    /// pinned fans, so the fan intent survives the profile rewrite.
+    public mutating func sanitizeLaunchCriticalFields() {
+        let profileValue = profile.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if profileValue == "sustained-max" || profileValue == "sustained_max" {
+            fanMode = MTPLXFanMode.max.rawValue
+            pinFansAtMaxOnStart = true
+        }
+        profile = Self.launchableProfile(profile)
+        generationMode = Self.launchableGenerationMode(generationMode)
     }
 
     public mutating func applySchedulingPreset(_ raw: String) {

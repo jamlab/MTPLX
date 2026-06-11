@@ -20,9 +20,22 @@ from .profiles import (
     PROFILE_CHOICES,
     get_profile,
     list_profiles,
+    resolve_profile_name,
 )
 from .runtime_options import normalize_paged_kv_quantization
 from .version import DISPLAY_VERSION, __version__
+
+# Help/usage advertises only the canonical profiles; the parser itself
+# resolves through resolve_profile_name so historical aliases that
+# shipped app configs still carry ("auto", "sustained-max") keep working.
+_PROFILE_METAVAR = "{" + ",".join(PROFILE_CHOICES) + "}"
+
+
+def _profile_arg(value: str) -> str:
+    try:
+        return resolve_profile_name(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 DEFAULT_TRUTH_MODES = (
@@ -1900,7 +1913,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_flow_p.add_argument("--cache-dir")
     start_flow_p.add_argument(
         "--profile",
-        choices=PROFILE_CHOICES,
+        type=_profile_arg, metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
         help="Runtime profile; start defaults to Sustained. Use --profile performance-cold --max for Burst.",
     )
@@ -1982,7 +1995,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup_p.add_argument("--config", default="~/.mtplx/config.toml")
     setup_p.add_argument("--model", default=DEFAULT_HF_MODEL_ID, help="Default verified model repo id or path")
     setup_p.add_argument("--model-dir", help="Model cache directory; defaults to MTPLX_MODEL_DIR or ~/.mtplx/models")
-    setup_p.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
+    setup_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default=DEFAULT_PROFILE_NAME)
     setup_p.add_argument("--thermal-control", choices=("auto", "none"), default="auto")
     setup_p.add_argument("--download", action="store_true", help="Download the selected model into the cache")
     setup_p.add_argument("--force", action="store_true", help="Rewrite config even when it already exists")
@@ -2039,7 +2052,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask_p.add_argument("prompt_arg", nargs="?", help="Prompt text")
     ask_p.add_argument("--model", default=default_model)
     ask_p.add_argument("--cache-dir")
-    ask_p.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
+    ask_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default=DEFAULT_PROFILE_NAME)
     ask_p.add_argument("--unsafe-force-unverified", action="store_true")
     ask_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
     ask_p.add_argument("--prompt", help="Prompt text, as an alternative to the positional prompt")
@@ -2080,7 +2093,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     quickstart_server_p.add_argument(
         "--profile",
-        choices=PROFILE_CHOICES,
+        type=_profile_arg, metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
         help="Runtime profile. Direct server quickstart defaults to Sustained; use --profile performance-cold --max for Burst.",
     )
@@ -2242,7 +2255,7 @@ def build_parser() -> argparse.ArgumentParser:
     tune_p.add_argument("--draft-top-p", type=float, help=argparse.SUPPRESS)
     tune_p.add_argument("--draft-top-k", type=int, help=argparse.SUPPRESS)
     tune_p.add_argument("--prompt-suite", help=argparse.SUPPRESS)
-    tune_p.add_argument("--profile", choices=PROFILE_CHOICES, default="performance-cold", help=argparse.SUPPRESS)
+    tune_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default="performance-cold", help=argparse.SUPPRESS)
     tune_p.add_argument("--_candidate", choices=["ar", "1", "2", "3", "4", "5", "6", "7", "8"], dest="_tune_candidate", help=argparse.SUPPRESS)
     tune_p.add_argument("--_candidate-output", dest="_tune_candidate_output", help=argparse.SUPPRESS)
     tune_p.set_defaults(func=cmd_tune_public)
@@ -2368,7 +2381,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_p.add_argument("--config", default="~/.mtplx/config.toml")
     init_p.add_argument("--model", default=DEFAULT_HF_MODEL_ID, help="Default verified model repo id or path")
     init_p.add_argument("--model-dir", help="Model cache directory; defaults to MTPLX_MODEL_DIR or ~/.mtplx/models")
-    init_p.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
+    init_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default=DEFAULT_PROFILE_NAME)
     init_p.add_argument("--thermal-control", choices=("auto", "none"), default="auto")
     init_p.add_argument("--download", action="store_true", help="Download the selected model into the cache")
     init_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
@@ -2409,7 +2422,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("prompt_arg", nargs="?", help="Prompt text")
     run_p.add_argument("--model", default=default_model)
     run_p.add_argument("--cache-dir")
-    run_p.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
+    run_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default=DEFAULT_PROFILE_NAME)
     run_p.add_argument("--unsafe-force-unverified", action="store_true")
     run_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
     run_p.add_argument("--prompt", help="Prompt text, as an alternative to the positional prompt")
@@ -2439,7 +2452,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat_p = sub.add_parser("chat", help="Run one native-MTP chat smoke generation")
     chat_p.add_argument("--model", default=default_model)
     chat_p.add_argument("--cache-dir")
-    chat_p.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
+    chat_p.add_argument("--profile", type=_profile_arg, metavar=_PROFILE_METAVAR, default=DEFAULT_PROFILE_NAME)
     chat_p.add_argument("--unsafe-force-unverified", action="store_true")
     chat_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
     chat_p.add_argument("--prompt", required=True)
@@ -2474,7 +2487,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_p.add_argument(
         "--profile",
-        choices=PROFILE_CHOICES,
+        type=_profile_arg, metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
         help=(
             "Runtime profile. Server defaults to Sustained so long-context "
@@ -2490,11 +2503,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mtp_toggle_args(serve_p)
     serve_p.add_argument(
         "--generation-mode",
-        choices=["mtp", "ar"],
+        choices=["mtp", "ar", "auto"],
         default=None,
         help=(
             "Daemon decode mode. AR is target-only generation; MTP is native "
-            "speculative decode."
+            "speculative decode. auto means the engine default and exists "
+            "for configs written by older app builds."
         ),
     )
     serve_p.add_argument(
