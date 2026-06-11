@@ -186,6 +186,21 @@ struct SettingsTab: View {
                                 width: 64
                             )
                         }
+                        Divider().overlay(Brand.separator)
+                        FormRow(
+                            label: "HF download mirror",
+                            caption: "Hugging Face endpoint for model downloads. Your HF token is never sent to a mirror."
+                        ) {
+                            TextField(
+                                "https://hf-mirror.com",
+                                text: Binding(
+                                    get: { draftConfig.hfEndpoint ?? "" },
+                                    set: { draftConfig.hfEndpoint = $0.isEmpty ? nil : $0 }
+                                )
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 220)
+                        }
                     }
                 } label: {
                     Text("Advanced")

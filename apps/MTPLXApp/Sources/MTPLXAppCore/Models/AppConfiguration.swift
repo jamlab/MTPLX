@@ -160,6 +160,11 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     /// the user explicitly publishes; we never sniff this from the
     /// Keychain token or filesystem.
     public var huggingFaceHandle: String?
+    /// Optional Hugging Face endpoint override for model downloads
+    /// (issue #96: huggingface.co is blocked in mainland China). Applied
+    /// to daemon and pull subprocesses as HF_ENDPOINT; the stored HF
+    /// token never travels to a non-official endpoint.
+    public var hfEndpoint: String?
 
     public init(
         executablePath: String? = nil,
@@ -214,7 +219,8 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         tunedControlRecord: TunedControlRecord? = nil,
         tunedControlRecordsByModel: [String: TunedControlRecord] = [:],
         customModels: [MTPLXModelOption] = [],
-        huggingFaceHandle: String? = nil
+        huggingFaceHandle: String? = nil,
+        hfEndpoint: String? = nil
     ) {
         self.executablePath = executablePath
         self.model = model
@@ -276,6 +282,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         self.tunedControlRecordsByModel = tunedControlRecordsByModel
         self.customModels = customModels
         self.huggingFaceHandle = huggingFaceHandle
+        self.hfEndpoint = hfEndpoint
     }
 
     /// Fresh installs must be portable. Installed local copies are discovered
@@ -453,6 +460,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         case tunedControlRecordsByModel = "tuned_control_records_by_model"
         case customModels = "custom_models"
         case huggingFaceHandle = "hugging_face_handle"
+        case hfEndpoint = "hf_endpoint"
     }
 
     public init(from decoder: Decoder) throws {
@@ -532,6 +540,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         ) ?? defaults.tunedControlRecordsByModel
         customModels = try container.decodeIfPresent([MTPLXModelOption].self, forKey: .customModels) ?? defaults.customModels
         huggingFaceHandle = try container.decodeIfPresent(String.self, forKey: .huggingFaceHandle)
+        hfEndpoint = try container.decodeIfPresent(String.self, forKey: .hfEndpoint)
         sanitizeLaunchCriticalFields()
     }
 
@@ -553,6 +562,33 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     public static func launchableGenerationMode(_ raw: String) -> String {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return engineGenerationModes.contains(value) ? value : "mtp"
+    }
+
+    /// Environment additions for Hugging Face downloads when the user
+    /// configured a mirror. huggingface_hub sends the stored token to
+    /// whatever HF_ENDPOINT points at, so both token variables are
+    /// overridden to empty alongside any non-official endpoint. Returns
+    /// nil when no valid mirror is configured (including the official
+    /// host, where nothing should change).
+    public static func hfMirrorEnvironment(_ rawEndpoint: String?) -> [String: String]? {
+        guard let rawEndpoint else { return nil }
+        let trimmed = rawEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host, !host.isEmpty
+        else {
+            return nil
+        }
+        if host.lowercased() == "huggingface.co" {
+            return nil
+        }
+        return [
+            "HF_ENDPOINT": trimmed,
+            "HF_TOKEN": "",
+            "HUGGING_FACE_HUB_TOKEN": "",
+        ]
     }
 
     /// Early V1 builds wrote picker values the engine never accepted

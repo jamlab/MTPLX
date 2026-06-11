@@ -303,6 +303,9 @@ public struct MTPLXCommandBuilder: Sendable {
         if let launchID, !launchID.isEmpty {
             environment["MTPLX_APP_LAUNCH_ID"] = launchID
         }
+        if let mirror = MTPLXAppConfiguration.hfMirrorEnvironment(configuration.hfEndpoint) {
+            environment.merge(mirror) { _, new in new }
+        }
         return DaemonCommand(
             executableURL: executableURL,
             arguments: arguments,

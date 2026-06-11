@@ -108,6 +108,10 @@ struct OnboardingExperienceView: View {
         var config = backend.configuration
         config.onboardingCompletedAt = Date()
         config.lastLaunchTarget = LaunchTarget.chat.rawValue
+        if MTPLXAppConfiguration.hfMirrorEnvironment(orchestrator.hfMirrorEndpoint) != nil {
+            config.hfEndpoint = orchestrator.hfMirrorEndpoint
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         if let tuned = orchestrator.tuneResult, tuned.bestDepth >= 1 {
             let tunedAt = Date()
             let modelID = orchestrator.state.resolvedModel?.hfModelID

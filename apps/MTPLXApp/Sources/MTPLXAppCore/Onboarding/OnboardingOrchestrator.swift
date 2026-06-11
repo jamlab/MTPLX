@@ -32,6 +32,11 @@ public final class OnboardingOrchestrator: ObservableObject {
     @Published public private(set) var isDetectingHardware: Bool
     @Published public private(set) var isDownloading: Bool
     @Published public private(set) var isTuning: Bool
+    /// Optional Hugging Face mirror for the wizard's download step
+    /// (issue #96: huggingface.co is blocked in mainland China). The
+    /// completion handler carries a valid value into the saved app
+    /// configuration.
+    @Published public var hfMirrorEndpoint: String = ""
 
     public init(
         hardwareInspector: HardwareInspector = HardwareInspector(),
@@ -348,9 +353,14 @@ public final class OnboardingOrchestrator: ObservableObject {
         downloadProgress = nil
         isDownloading = true
         let downloader = modelDownloader
+        let extraEnvironment = MTPLXAppConfiguration.hfMirrorEnvironment(hfMirrorEndpoint) ?? [:]
         downloadTask?.cancel()
-        downloadTask = Task.detached(priority: .userInitiated) { [weak self, downloader, repo, totalBytes] in
-            for await event in downloader.stream(repo: repo, totalBytes: totalBytes) {
+        downloadTask = Task.detached(priority: .userInitiated) { [weak self, downloader, repo, totalBytes, extraEnvironment] in
+            for await event in downloader.stream(
+                repo: repo,
+                totalBytes: totalBytes,
+                extraEnvironment: extraEnvironment
+            ) {
                 if Task.isCancelled { break }
                 await MainActor.run {
                     self?.handleDownloadEvent(event)
@@ -370,6 +380,22 @@ public final class OnboardingOrchestrator: ObservableObject {
             snapshot.statusMessage = "Paused"
             downloadProgress = snapshot
         }
+    }
+
+    /// Wizard-facing failure copy. Network-shaped failures point at the
+    /// mirror field rendered directly under the banner; everything else
+    /// passes through untouched.
+    nonisolated static func downloadFailureMessage(stderrTail: String, mirrorActive: Bool) -> String {
+        let base = stderrTail.isEmpty ? "Download failed." : stderrTail
+        let lower = base.lowercased()
+        let networkShaped = lower.contains("timed out")
+            || lower.contains("connection")
+            || lower.contains("network")
+            || lower.contains("max retries")
+            || lower.contains("unreachable")
+        guard networkShaped, !mirrorActive else { return base }
+        return base
+            + "\nIf huggingface.co is blocked on your network, set a download mirror below and retry."
     }
 
     private func handleDownloadEvent(_ event: DownloadEvent) {
@@ -457,7 +483,10 @@ public final class OnboardingOrchestrator: ObservableObject {
             // step bump is the canonical signal.
             state.goNext()
         case .failed(_, let stderrTail):
-            downloadFailure = stderrTail.isEmpty ? "Download failed." : stderrTail
+            downloadFailure = Self.downloadFailureMessage(
+                stderrTail: stderrTail,
+                mirrorActive: MTPLXAppConfiguration.hfMirrorEnvironment(hfMirrorEndpoint) != nil
+            )
             isDownloading = false
         case .cancelled:
             isDownloading = false

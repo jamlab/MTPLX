@@ -1142,8 +1142,14 @@ public final class MTPLXBackendStore: ObservableObject {
         modelDownloadProgress = nil
         isModelDownloading = true
         let downloader = modelDownloader
-        modelDownloadTask = Task.detached(priority: .userInitiated) { [weak self, downloader, request] in
-            for await event in downloader.stream(repo: request.repoID, totalBytes: request.totalBytes) {
+        let extraEnvironment =
+            MTPLXAppConfiguration.hfMirrorEnvironment(configuration.hfEndpoint) ?? [:]
+        modelDownloadTask = Task.detached(priority: .userInitiated) { [weak self, downloader, request, extraEnvironment] in
+            for await event in downloader.stream(
+                repo: request.repoID,
+                totalBytes: request.totalBytes,
+                extraEnvironment: extraEnvironment
+            ) {
                 if Task.isCancelled { break }
                 await self?.handleModelDownloadEvent(event, request: request)
             }
@@ -2132,6 +2138,11 @@ public final class MTPLXBackendStore: ObservableObject {
             return "There is not enough free disk space to finish this download."
         }
         if lower.contains("timed out") || lower.contains("network") || lower.contains("connection") {
+            if MTPLXAppConfiguration.hfMirrorEnvironment(configuration.hfEndpoint) == nil {
+                return "The download could not reach Hugging Face. Check the network connection and try again. "
+                    + "If huggingface.co is blocked on your network, set an HF download mirror in "
+                    + "Settings under Advanced, for example https://hf-mirror.com."
+            }
             return "The download could not reach Hugging Face. Check the network connection and try again."
         }
         return trimmed.isEmpty ? "Download failed. Try again." : trimmed

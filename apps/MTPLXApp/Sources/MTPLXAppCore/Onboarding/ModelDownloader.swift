@@ -74,7 +74,11 @@ public struct ModelDownloader: Sendable {
     /// fires a `.cancelled` event. Partial bytes survive on disk so
     /// a subsequent run resumes via `huggingface_hub`'s native Range
     /// support.
-    public func stream(repo: String, totalBytes: Int64?) -> AsyncStream<DownloadEvent> {
+    public func stream(
+        repo: String,
+        totalBytes: Int64?,
+        extraEnvironment: [String: String] = [:]
+    ) -> AsyncStream<DownloadEvent> {
         AsyncStream { continuation in
             let destination = self.cachedModelPath(for: repo)
             // Make the destination dir up-front so the first poll
@@ -115,6 +119,7 @@ public struct ModelDownloader: Sendable {
             // the app was launched by Finder.
             var env = self.processEnvironment
             env["PATH"] = MTPLXCommandBuilder.expandedPATH(environment: self.processEnvironment)
+            env.merge(extraEnvironment) { _, new in new }
             process.environment = env
 
             let errPipe = Pipe()

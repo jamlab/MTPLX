@@ -49,7 +49,7 @@ struct DownloadStep: View {
             Text("Already on your Mac")
                 .font(.system(size: 16, weight: .semibold, design: .rounded))
                 .foregroundStyle(Brand.typeHi)
-            Text("Skipping download — moving on.")
+            Text("Skipping download. Moving on.")
                 .font(.system(size: 12))
                 .foregroundStyle(Brand.typeSecondary)
         }
@@ -176,7 +176,7 @@ struct DownloadStep: View {
             }
             if stalled >= 30 {
                 Label(
-                    "Stalled for \(stalled)s — checking Hugging Face…",
+                    "Stalled for \(stalled)s, checking Hugging Face…",
                     systemImage: "exclamationmark.triangle.fill"
                 )
                 .font(.caption2)
@@ -200,6 +200,16 @@ struct DownloadStep: View {
                     .foregroundStyle(Brand.typeSecondary)
                     .lineLimit(4)
                     .fixedSize(horizontal: false, vertical: true)
+                TextField(
+                    "Optional mirror, e.g. https://hf-mirror.com",
+                    text: $orchestrator.hfMirrorEndpoint
+                )
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11))
+                .padding(.top, 4)
+                Text("Downloads use the mirror instead of huggingface.co. Your HF token is never sent to a mirror.")
+                    .font(.caption2)
+                    .foregroundStyle(Brand.typeTertiary)
             }
         }
         .padding(10)

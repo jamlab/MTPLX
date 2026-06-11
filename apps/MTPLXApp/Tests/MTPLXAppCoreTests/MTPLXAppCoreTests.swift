@@ -681,6 +681,71 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
     }
 
+    // MARK: - HF download mirror (issue #96)
+
+    func testHFMirrorEnvironmentSetsEndpointAndWithholdsTokens() throws {
+        let env = try XCTUnwrap(
+            MTPLXAppConfiguration.hfMirrorEnvironment("https://hf-mirror.com")
+        )
+
+        XCTAssertEqual(env["HF_ENDPOINT"], "https://hf-mirror.com")
+        XCTAssertEqual(env["HF_TOKEN"], "")
+        XCTAssertEqual(env["HUGGING_FACE_HUB_TOKEN"], "")
+    }
+
+    func testHFMirrorEnvironmentRejectsInvalidAndOfficialEndpoints() {
+        XCTAssertNil(MTPLXAppConfiguration.hfMirrorEnvironment(nil))
+        XCTAssertNil(MTPLXAppConfiguration.hfMirrorEnvironment(""))
+        XCTAssertNil(MTPLXAppConfiguration.hfMirrorEnvironment("   "))
+        XCTAssertNil(MTPLXAppConfiguration.hfMirrorEnvironment("not a url"))
+        XCTAssertNil(MTPLXAppConfiguration.hfMirrorEnvironment("ftp://hf-mirror.com"))
+        // The official host is not a mirror; tokens must keep working.
+        XCTAssertNil(MTPLXAppConfiguration.hfMirrorEnvironment("https://huggingface.co"))
+    }
+
+    func testServeCommandCarriesMirrorEnvironmentWhenConfigured() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: [
+            "PATH": fake.deletingLastPathComponent().path,
+            "HOME": temporaryDirectory().path,
+        ])
+        var configuration = MTPLXAppConfiguration(
+            model: "/models/qwen",
+            profile: "sustained"
+        )
+        configuration.hfEndpoint = "https://hf-mirror.com"
+
+        let command = try builder.buildServeCommand(configuration: configuration)
+
+        XCTAssertEqual(command.environment["HF_ENDPOINT"], "https://hf-mirror.com")
+        XCTAssertEqual(command.environment["HF_TOKEN"], "")
+
+        configuration.hfEndpoint = nil
+        let plain = try builder.buildServeCommand(configuration: configuration)
+        XCTAssertNil(plain.environment["HF_ENDPOINT"])
+        XCTAssertNil(plain.environment["HF_TOKEN"])
+    }
+
+    func testOnboardingDownloadFailureCopySuggestsMirrorOnlyForNetworkFailures() {
+        let blocked = OnboardingOrchestrator.downloadFailureMessage(
+            stderrTail: "ConnectionError: HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded",
+            mirrorActive: false
+        )
+        XCTAssertTrue(blocked.contains("download mirror"), blocked)
+
+        let alreadyMirrored = OnboardingOrchestrator.downloadFailureMessage(
+            stderrTail: "ConnectionError: Max retries exceeded",
+            mirrorActive: true
+        )
+        XCTAssertFalse(alreadyMirrored.contains("download mirror"), alreadyMirrored)
+
+        let disk = OnboardingOrchestrator.downloadFailureMessage(
+            stderrTail: "OSError: No space left on device",
+            mirrorActive: false
+        )
+        XCTAssertFalse(disk.contains("download mirror"), disk)
+    }
+
     func testFailureIndicatesPortConflictMatchesBothDetectionLayers() {
         XCTAssertTrue(
             MTPLXBackendStore.failureIndicatesPortConflict(
