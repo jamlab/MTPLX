@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
+import mlx.core as mx
 
+from mtplx.fast_sampling import sample_token_ids_from_mlx_logits
 from mtplx.sampling import (
     SamplerConfig,
     SparseDistribution,
@@ -76,3 +78,34 @@ def test_sparse_distribution_sampling_returns_original_token_ids():
         vocab_size=12,
     )
     assert sample_from_distribution(dist, np.random.default_rng(0)) == 11
+
+
+def test_sparse_distribution_zero_or_nan_mass_falls_back_to_safe_token():
+    dist = SparseDistribution(
+        token_ids=np.array([7, 11]),
+        probs=np.array([0.0, np.nan]),
+        vocab_size=12,
+    )
+
+    assert dist.token_ids.tolist() == [7]
+    assert np.allclose(dist.probs, [1.0])
+
+
+def test_residual_distribution_nan_mass_falls_back_to_target():
+    target = np.array([0.25, 0.75])
+    draft = np.array([np.nan, np.nan])
+
+    residual = residual_distribution(target, draft)
+
+    assert np.allclose(residual, target)
+
+
+def test_sample_token_ids_from_mlx_logits_keeps_top_p_top1_on_device():
+    logits = mx.array([[4.0, 3.0, 1.0], [0.0, 2.0, 5.0]], dtype=mx.float32)
+    sampled = sample_token_ids_from_mlx_logits(
+        logits,
+        SamplerConfig(temperature=0.6, top_p=0.01, top_k=2),
+    )
+    mx.eval(sampled)
+
+    assert np.asarray(sampled).tolist() == [0, 2]

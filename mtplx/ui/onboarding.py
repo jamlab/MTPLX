@@ -23,6 +23,8 @@ from mtplx.constants import (
     EXPECTED_ALL_PREQUANTIZED_MTP_KEYS,
     EXPECTED_MTP_KEYS,
     EXPECTED_PREQUANTIZED_MTP_KEYS,
+    EXPECTED_QWEN_MOE_MTP_KEYS,
+    EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS,
 )
 from mtplx.default_models import (
     DefaultModelSelection,
@@ -258,6 +260,12 @@ def _scan_for_models(
 
 
 def _expected_embedded_mtp_keys(config: dict[str, Any]) -> set[str]:
+    if _is_qwen_moe_mtp_config(config):
+        mtp_quant = config.get("mtplx_mtp_quantization", {})
+        prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
+        if prequantized:
+            return set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS)
+        return set(EXPECTED_QWEN_MOE_MTP_KEYS)
     mtp_quant = config.get("mtplx_mtp_quantization", {})
     prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
     quant_policy = str(mtp_quant.get("policy") or "") if isinstance(mtp_quant, dict) else ""
@@ -266,6 +274,17 @@ def _expected_embedded_mtp_keys(config: dict[str, Any]) -> set[str]:
     if prequantized:
         return set(EXPECTED_PREQUANTIZED_MTP_KEYS)
     return set(EXPECTED_MTP_KEYS)
+
+
+def _is_qwen_moe_mtp_config(config: dict[str, Any]) -> bool:
+    tcfg = config.get("text_config", config) if isinstance(config, dict) else {}
+    markers = (
+        str(config.get("model_type") or ""),
+        str(tcfg.get("model_type") or ""),
+        " ".join(str(item) for item in (config.get("architectures") or [])),
+        " ".join(str(item) for item in (tcfg.get("architectures") or [])),
+    )
+    return any("qwen3_5_moe" in marker.lower() or "qwen3_5moe" in marker.lower() for marker in markers)
 
 
 def _is_mtp_weight_key(key: str) -> bool:
@@ -820,114 +839,152 @@ def _print_summary(
 
 
 # ---------- screens ---------------------------------------------------------
-def screen_model(*, configured: str | None = None) -> str:
+_MAX_INSTALLED_PICKER_ROWS = 6
+
+
+def _installed_models_for_screen() -> list[Any]:
+    """Complete installs from the local cache for the 'On this Mac' group."""
+
+    try:
+        from mtplx.model_catalog import scan_installed_models
+
+        return list(scan_installed_models())[:_MAX_INSTALLED_PICKER_ROWS]
+    except Exception:
+        return []
+
+
+def _app_settings_model() -> str | None:
+    """The macOS app's configured model, when the app has been set up."""
+
+    try:
+        from mtplx.app_settings import read_app_settings
+
+        settings = read_app_settings()
+    except Exception:
+        return None
+    return settings.model if settings is not None else None
+
+
+def _installed_matches_model_ref(item: Any, ref: str | None) -> bool:
+    if not ref:
+        return False
+    text = str(ref).strip()
+    if not text:
+        return False
+    if str(item.path) == text or item.name == Path(text).expanduser().name:
+        return True
+    catalog = getattr(item, "catalog", None)
+    if catalog is None:
+        return False
+    try:
+        from mtplx.model_catalog import catalog_model_matching
+
+        matched = catalog_model_matching(text)
+    except Exception:
+        return False
+    return matched is not None and matched.id == catalog.id
+
+
+def screen_model(
+    *,
+    configured: str | None = None,
+    installed: list[Any] | None = None,
+    app_model: str | None = None,
+) -> str:
     """Render screen 1 and return the user's choice.
 
+    Models already on this Mac (``installed``, from the model-cache scan)
+    lead the list so a returning user never re-downloads what they have.
+    The default selection prefers the MTPLX app's configured model when it
+    is installed, then the verified default for this hardware.
+
     If ``configured`` is set and differs from the canonical default, it is
-    surfaced as the first option for deliberate reuse. Pressing Enter still
-    picks the current verified default, so stale saved configs cannot silently
+    surfaced for deliberate reuse. Pressing Enter still picks the verified
+    default (or the app's model), so stale saved configs cannot silently
     keep an old model as the speed lane.
     """
 
-    verified_default = _verified_default_model()
-    verified_label = _verified_default_label()
+    verified_selection = _verified_default_selection()
+    verified_default = verified_selection.model
+    verified_label = verified_selection.label
     show_configured = (
         bool(configured)
         and not is_verified_default_model_ref(configured)
         and not is_optimized_quality_model_ref(configured)
     )
 
-    options: list[tuple[str, str, str]] = []
-    if show_configured:
-        options.append(
-            (
-                "1",
-                "Use your configured model",
-                _pretty_path(configured),
-            )
+    installed_rows = list(installed or [])
+    # (title, detail, resolved value or sentinel)
+    rows: list[tuple[str, str, str]] = []
+    app_row_index: int | None = None
+    verified_row_index: int | None = None
+    verified_covered_by_install = False
+    quality_covered_by_install = False
+    for item in installed_rows:
+        catalog = getattr(item, "catalog", None)
+        title = str(item.display_name)
+        covers_verified = (
+            catalog is not None
+            and catalog.hf_model_id == verified_selection.hf_model
         )
-        options.append(
-            (
-                "2",
-                "Verified default for this Mac",
-                verified_label,
-            )
+        if covers_verified:
+            title = f"{title}  ·  verified default"
+            verified_covered_by_install = True
+        if catalog is not None and catalog.id == "optimized-quality":
+            quality_covered_by_install = True
+        rows.append((title, f"installed  ·  {_pretty_path(item.path)}", str(item.path)))
+        if app_row_index is None and _installed_matches_model_ref(item, app_model):
+            app_row_index = len(rows) - 1
+        if covers_verified and verified_row_index is None:
+            verified_row_index = len(rows) - 1
+    if show_configured and not any(
+        str(item.path) == str(configured) for item in installed_rows
+    ):
+        rows.append(
+            ("Use your configured model", _pretty_path(configured), str(configured))
         )
-        options.append(
-            (
-                "3",
-                "Optimized Quality",
-                _optimized_quality_label(),
-            )
+    if not verified_covered_by_install:
+        rows.append(("Verified default for this Mac", verified_label, verified_default))
+        verified_row_index = len(rows) - 1
+    if not quality_covered_by_install:
+        rows.append(
+            ("Optimized Quality", _optimized_quality_label(), "__quality__")
         )
-        options.append(
-            (
-                "4",
-                "Custom Hugging Face repo",
-                "e.g. Qwen/Qwen3-Next-80B-A3B-Instruct",
-            )
+    rows.append(
+        (
+            "Custom Hugging Face repo",
+            "e.g. Qwen/Qwen3-Next-80B-A3B-Instruct",
+            "__hf__",
         )
-        options.append(
-            (
-                "5",
-                "Local folder",
-                "e.g. ~/models/your-model  ·  or a parent like ~/.lmstudio/models",
-            )
+    )
+    rows.append(
+        (
+            "Local folder",
+            "e.g. ~/models/your-model  ·  or a parent like ~/.lmstudio/models",
+            "__local__",
         )
-    else:
-        options.append(
-            (
-                "1",
-                "Verified default for this Mac",
-                verified_label,
-            )
-        )
-        options.append(
-            (
-                "2",
-                "Optimized Quality",
-                _optimized_quality_label(),
-            )
-        )
-        options.append(
-            (
-                "3",
-                "Custom Hugging Face repo",
-                "e.g. Qwen/Qwen3-Next-80B-A3B-Instruct",
-            )
-        )
-        options.append(
-            (
-                "4",
-                "Local folder",
-                "e.g. ~/models/your-model  ·  or a parent like ~/.lmstudio/models",
-            )
-        )
+    )
+
+    options = [
+        (str(index + 1), title, detail)
+        for index, (title, detail, _value) in enumerate(rows)
+    ]
+    default_index = (
+        app_row_index if app_row_index is not None else verified_row_index
+    )
+    default_choice = str((default_index or 0) + 1)
 
     _step_panel(step=1, total=3, title="Choose your model", options=options)
-    valid_choices = [opt[0] for opt in options]
-    choice = _prompt_choice("Select", valid_choices, default="2" if show_configured else "1")
-
-    if show_configured:
-        if choice == "1":
-            return str(configured)
-        if choice == "2":
-            return verified_default
-        if choice == "3":
-            return optimized_quality_model_ref()
-        if choice == "4":
-            return _prompt_hf_repo_id(default=verified_default)
-        # choice == "5"
-        return _pick_local_model(default=str(configured))
-
-    if choice == "1":
-        return verified_default
-    if choice == "2":
+    valid_choices = [option[0] for option in options]
+    choice = _prompt_choice("Select", valid_choices, default=default_choice)
+    value = rows[int(choice) - 1][2]
+    if value == "__quality__":
         return optimized_quality_model_ref()
-    if choice == "3":
+    if value == "__hf__":
         return _prompt_hf_repo_id(default=verified_default)
-    # choice == "4"
-    return _pick_local_model(default=None)
+    if value == "__local__":
+        return _pick_local_model(default=str(configured) if show_configured else None)
+    return value
 
 
 def _pick_local_model(*, default: str | None) -> str:
@@ -1087,7 +1144,7 @@ def screen_mode() -> tuple[str, bool]:
 
 
 def screen_interface() -> str:
-    """Return the target string (``openwebui``, ``terminal``, ``pi``, ``opencode``, or ``swival``)."""
+    """Return the target string (``openwebui``, ``terminal``, ``pi``, ``opencode``, ``swival``, or ``dashboard``)."""
 
     _step_panel(
         step=3,
@@ -1119,9 +1176,14 @@ def screen_interface() -> str:
                 "Connect to Swival [coding agent]",
                 "Prints the Swival generic-provider command and starts the server.",
             ),
+            (
+                "6",
+                "Live Dashboard [browser at http://127.0.0.1:8000/dashboard]",
+                "Live TPS gauge · acceptance · cache · memory · fans · request log. Drive load from any client (Web UI, Pi, OpenCode, hippo).",
+            ),
         ],
     )
-    choice = _prompt_choice("Select", ["1", "2", "3", "4", "5"], default="1")
+    choice = _prompt_choice("Select", ["1", "2", "3", "4", "5", "6"], default="1")
     if choice == "1":
         return "openwebui"
     if choice == "2":
@@ -1130,7 +1192,49 @@ def screen_interface() -> str:
         return "pi"
     if choice == "4":
         return "opencode"
-    return "swival"
+    if choice == "5":
+        return "swival"
+    return "dashboard"
+
+
+# Targets for which a separate "also open the live dashboard?" companion
+# question makes sense. Terminal/CLI runs the model in-process with no
+# server, so the dashboard can't attach. "dashboard" already IS the
+# dashboard target, no point asking again.
+DASHBOARD_COMPANION_TARGETS = ("openwebui", "pi", "opencode", "swival", "hermes")
+
+
+def screen_dashboard_companion(target: str, *, default: bool = False) -> bool:
+    """Offer to open the live Dashboard alongside the chosen client.
+
+    Returns True iff the user picks "Yes". Only call this for targets in
+    ``DASHBOARD_COMPANION_TARGETS`` — for terminal/cli (no server) and
+    "dashboard" (already opens it) the question is non-sensical.
+    """
+
+    if target not in DASHBOARD_COMPANION_TARGETS:
+        return False
+    _step_panel(
+        step=4,
+        total=4,
+        title="Also open the Live Dashboard in your browser?",
+        options=[
+            (
+                "1",
+                "Yes [opens http://127.0.0.1:8000/dashboard in a second tab]",
+                "Live TPS gauge, acceptance, cache, memory, fans, request log. "
+                "Updates in real time while your chosen client drives load.",
+            ),
+            (
+                "2",
+                "No, just the chosen client",
+                "Skip the dashboard. You can always run `mtplx dashboard` "
+                "later against the running server.",
+            ),
+        ],
+    )
+    choice = _prompt_choice("Select", ["1", "2"], default="1" if default else "2")
+    return choice == "1"
 
 
 def screen_tuning_offer() -> bool:
@@ -1194,7 +1298,11 @@ def screen_server_surface(
     return choice == "2"
 
 
-def run_onboarding_screens(*, configured_model: str | None = None) -> dict:
+def run_onboarding_screens(
+    *,
+    configured_model: str | None = None,
+    open_dashboard_override: bool | None = None,
+) -> dict:
     """Walk all three screens and return the chosen state dict.
 
     When the user picks a fan-backed mode but no fan controller is detected,
@@ -1202,19 +1310,35 @@ def run_onboarding_screens(*, configured_model: str | None = None) -> dict:
     declined or fails, the wizard falls back to Sustained without fan boost so
     the rest of the pipeline does not promise a fan-backed mode it cannot
     deliver.
+
+    ``open_dashboard_override`` controls the dashboard companion prompt:
+    ``True``/``False`` skip the question; ``None`` (default) asks.
     """
 
-    model = screen_model(configured=configured_model)
+    model = screen_model(
+        configured=configured_model,
+        installed=_installed_models_for_screen(),
+        app_model=_app_settings_model(),
+    )
     profile, max_mode = screen_mode()
     if max_mode and not ensure_thermal_control_installed():
         profile = "sustained"
         max_mode = False
     target = screen_interface()
+    # Only ask about the dashboard companion for targets that spawn a
+    # server (openwebui/pi/opencode/swival). Terminal runs in-process with
+    # no server, "dashboard" already opens the dashboard, so neither
+    # benefits from the companion question.
+    if open_dashboard_override is not None:
+        open_dashboard = bool(open_dashboard_override) and target in DASHBOARD_COMPANION_TARGETS
+    else:
+        open_dashboard = screen_dashboard_companion(target)
     state = {
         "model": model,
         "profile": profile,
         "max": max_mode,
         "target": target,
+        "open_dashboard": open_dashboard,
     }
     if is_verified_default_model_ref(model):
         state["model_selection"] = _verified_default_selection().to_dict()
@@ -1230,7 +1354,11 @@ def run_serve_onboarding_screens(
 ) -> dict:
     """Walk the advanced server setup screens and return the chosen state."""
 
-    model = screen_model(configured=configured_model)
+    model = screen_model(
+        configured=configured_model,
+        installed=_installed_models_for_screen(),
+        app_model=_app_settings_model(),
+    )
     profile, max_mode = screen_mode()
     if max_mode and not ensure_thermal_control_installed():
         profile = "sustained"
@@ -1240,12 +1368,21 @@ def run_serve_onboarding_screens(
         port=port,
         default_open_browser=default_open_browser,
     )
+    target = "openwebui" if open_browser else "server"
+    # The serve flow doesn't spawn a coding-agent client, but it still
+    # spawns a server — so the dashboard companion is meaningful for the
+    # "Open browser chat too" branch. For "API server only" we skip the
+    # question (the user wanted minimal UI).
+    open_dashboard = (
+        screen_dashboard_companion(target) if target == "openwebui" else False
+    )
     state = {
         "model": model,
         "profile": profile,
         "max": max_mode,
-        "target": "openwebui" if open_browser else "server",
+        "target": target,
         "open_browser": open_browser,
+        "open_dashboard": open_dashboard,
     }
     if is_verified_default_model_ref(model):
         state["model_selection"] = _verified_default_selection().to_dict()
@@ -1406,6 +1543,11 @@ def _quickstart_state_is_reusable(last: dict) -> bool:
         "oc",
         "swival",
         "sv",
+        "hermes",
+        "hermes-agent",
+        "dashboard",
+        "live-dashboard",
+        "live",
     }:
         return False
     if not model or "\n" in model or "\r" in model:
@@ -1482,20 +1624,135 @@ def confirm_same_as_last(last: dict) -> bool:
     return answer in {"", "y", "yes", "same"}
 
 
+def _detect_running_daemon() -> Any | None:
+    """Probe for an attachable MTPLX daemon; never raises.
+
+    Honors the ``MTPLX_START_ATTACH_PROBE=off`` kill switch inside
+    ``detect_attachable_daemon`` so tests and automation stay hermetic.
+    """
+
+    try:
+        from mtplx.daemon_client import detect_attachable_daemon
+
+        return detect_attachable_daemon()
+    except Exception:
+        return None
+
+
+def screen_attach_running_daemon(daemon: Any) -> bool:
+    """Offer to chat with an already-running daemon instead of setting up.
+
+    Returns ``True`` when the user wants to attach. The running model is
+    already in memory, so attaching is the zero-cost, zero-surprise path
+    and therefore the default.
+    """
+
+    owner = "the MTPLX app" if getattr(daemon, "owned_by_app", False) else "a terminal"
+    model = getattr(daemon, "model", None) or "a model"
+    _choice_panel(
+        heading="MTPLX is already running",
+        intro=(
+            f"{model}  ·  port {daemon.port}  ·  started by {owner}. "
+            "The model is already loaded."
+        ),
+        options=[
+            (
+                "1",
+                "Chat with the running model",
+                "Attach to the running server — nothing new loads.",
+            ),
+            (
+                "2",
+                "Set up something else",
+                "Continue to model / mode / interface setup.",
+            ),
+        ],
+        border_style="green",
+    )
+    return _prompt_choice("Select", ["1", "2"], default="1") == "1"
+
+
+def _returning_user_decision(last: dict, *, app_model: str | None) -> str:
+    """Returning-user choice: ``same`` | ``app`` | ``fresh``.
+
+    When the MTPLX app has a configured model that differs from the saved
+    CLI state, "Same as the MTPLX app" appears alongside "same as last
+    time" so app-first users get their app setup in one keystroke.
+    """
+
+    show_app_option = bool(app_model) and not _models_equivalent(
+        app_model, last.get("model")
+    )
+    if not show_app_option:
+        return "same" if confirm_same_as_last(last) else "fresh"
+    _choice_panel(
+        heading="Welcome back",
+        options=[
+            (
+                "1",
+                "Same as last time",
+                f"{_model_display(last.get('model')) or '?'}  ·  "
+                f"{mode_label(last)}  ·  {interface_label(last.get('target'))}",
+            ),
+            (
+                "2",
+                "Same as the MTPLX app",
+                f"{_model_display(app_model)}  ·  keeps your mode and interface",
+            ),
+            (
+                "3",
+                "Set up fresh",
+                "Walk through model / mode / interface again.",
+            ),
+        ],
+        border_style="cyan",
+    )
+    choice = _prompt_choice("Select", ["1", "2", "3"], default="1")
+    if choice == "2":
+        return "app"
+    if choice == "3":
+        return "fresh"
+    return "same"
+
+
+def _models_equivalent(lhs: str | None, rhs: str | None) -> bool:
+    left = str(lhs or "").strip()
+    right = str(rhs or "").strip()
+    if not left or not right:
+        return left == right
+    if left == right:
+        return True
+    try:
+        from mtplx.model_catalog import catalog_model_matching
+
+        left_match = catalog_model_matching(left)
+        right_match = catalog_model_matching(right)
+    except Exception:
+        return False
+    return (
+        left_match is not None
+        and right_match is not None
+        and left_match.id == right_match.id
+    )
+
+
 def run_quickstart_flow(
     *,
     fresh: bool = False,
     configured_model: str | None = None,
+    open_dashboard_override: bool | None = None,
 ) -> dict | None:
-    """Decide between 'same as last time' or fresh onboarding.
+    """Decide between attach, 'same as last time', or fresh onboarding.
 
-    Returns the chosen config dict (with keys ``model``, ``profile``, ``max``,
-    ``target``), or ``None`` if the user aborted (Ctrl-C / EOF).
+    Returns the chosen config dict (with keys ``model``, ``profile``,
+    ``max``, ``target``, ``open_dashboard``), an attach request
+    (``{"attach": {...}}``) when the user chose to chat with an
+    already-running daemon, or ``None`` if the user aborted (Ctrl-C / EOF).
 
-    ``configured_model`` is the model already resolved from
-    ``~/.mtplx/config.toml`` (if any). When set and not the canonical default,
-    screen 1 surfaces it as the top choice so accepting the default does not
-    force a re-download of an HF mirror that's already on disk elsewhere.
+    ``open_dashboard_override`` lets the CLI ``--open-dashboard`` /
+    ``--no-open-dashboard`` flags bypass the wizard companion question:
+    ``True`` skips the prompt and forces open, ``False`` skips and
+    forces closed, ``None`` (default) asks.
     """
 
     last = None if fresh else load_state()
@@ -1507,22 +1764,54 @@ def run_quickstart_flow(
         refreshed_default_state = normalized != last
         last = normalized
     try:
+        daemon = _detect_running_daemon()
+        if daemon is not None and screen_attach_running_daemon(daemon):
+            return {
+                "attach": {
+                    "host": daemon.host,
+                    "port": daemon.port,
+                    "model": daemon.model,
+                    "owned_by_app": daemon.owned_by_app,
+                }
+            }
+
+        def reuse_state(state: dict) -> dict:
+            nonlocal refreshed_default_state
+            # If the saved state says a fan-backed mode but ThermalForge
+            # has gone away (uninstalled, new machine), re-offer install
+            # rather than silently dump a JSON warning at runtime.
+            if state.get("max") and not ensure_thermal_control_installed():
+                state = dict(state)
+                state["profile"] = "sustained"
+                state["max"] = False
+                save_state(state)
+            elif refreshed_default_state:
+                save_state(state)
+            if open_dashboard_override is not None:
+                state = dict(state)
+                state["open_dashboard"] = bool(open_dashboard_override)
+            return state
+
         if last and not fresh:
-            if confirm_same_as_last(last):
-                # If the saved state says a fan-backed mode but ThermalForge
-                # has gone away (uninstalled, new machine), re-offer install
-                # rather than silently dump a JSON warning at runtime.
-                if last.get("max") and not ensure_thermal_control_installed():
-                    last = dict(last)
-                    last["profile"] = "sustained"
-                    last["max"] = False
-                    save_state(last)
-                elif refreshed_default_state:
-                    save_state(last)
-                return last
+            decision = _returning_user_decision(
+                last, app_model=_app_settings_model()
+            )
+            if decision == "same":
+                return reuse_state(last)
+            if decision == "app":
+                app_state = dict(last)
+                app_state["model"] = str(_app_settings_model())
+                # The selection metadata described the previous model.
+                app_state.pop("model_selection", None)
+                save_state(app_state)
+                refreshed_default_state = False
+                return reuse_state(app_state)
         else:
             _print_welcome()
-        choice = run_onboarding_screens(configured_model=configured_model)
+        choice = run_onboarding_screens(
+            configured_model=configured_model,
+            open_dashboard_override=open_dashboard_override,
+        )
         save_state(choice)
         _print_summary(choice)
         return choice
@@ -1639,4 +1928,6 @@ def interface_label(target: str | None) -> str:
         return "OpenCode Desktop  ·  coding agent"
     if target in ("swival", "sv"):
         return "Swival  ·  coding agent"
+    if target in ("dashboard", "live-dashboard", "live"):
+        return "Live Dashboard  ·  browser"
     return target or "?"

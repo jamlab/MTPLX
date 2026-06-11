@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from safetensors.numpy import save_file
 
-from mtplx.artifacts import expected_mtp_file, inspect_model
+from mtplx.artifacts import expected_mtp_file, inspect_model, inspect_mtp_tensors
 from mtplx.backends.registry import (
     UnverifiedArchitectureError,
     architecture_catalog,
@@ -16,6 +16,10 @@ from mtplx.constants import (
     EXPECTED_ALL_PREQUANTIZED_MTP_KEYS,
     EXPECTED_MTP_KEYS,
     EXPECTED_PREQUANTIZED_MTP_KEYS,
+    EXPECTED_QWEN_MOE_MTP_KEYS,
+    EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS,
+    EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS,
+    EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS,
 )
 
 
@@ -24,15 +28,20 @@ def _write_runtime_contract(
     *,
     arch_id="qwen3-next-mtp",
     profile="stable",
+    exactness_baseline=None,
+    speed_evidence=None,
     recommended_draft_lm_head=None,
     recommended_draft_sampler=None,
+    runtime_env_overrides=None,
 ):
     contract = {
         "mtplx_version": "0.1.4",
         "arch_id": arch_id,
         "mtp_depth_max": 3,
         "recommended_profile": profile,
-        "exactness_baseline": {"phase0h": "smoke", "max_abs_diff": 0.0},
+        "exactness_baseline": exactness_baseline
+        if exactness_baseline is not None
+        else {"phase0h": "smoke", "max_abs_diff": 0.0},
         "verified_on": {
             "timestamp": "2026-05-02T00:00:00Z",
             "hardware": "test",
@@ -43,6 +52,10 @@ def _write_runtime_contract(
         contract["recommended_draft_lm_head"] = recommended_draft_lm_head
     if recommended_draft_sampler is not None:
         contract["recommended_draft_sampler"] = recommended_draft_sampler
+    if runtime_env_overrides is not None:
+        contract["runtime_env_overrides"] = runtime_env_overrides
+    if speed_evidence is not None:
+        contract["speed_evidence"] = speed_evidence
     (path / "mtplx_runtime.json").write_text(
         json.dumps(contract),
         encoding="utf-8",
@@ -155,6 +168,10 @@ def test_runtime_contract_preserves_recommended_draft_metadata(monkeypatch, tmp_
         profile="performance-cold",
         recommended_draft_lm_head={"bits": "3", "group_size": "64", "mode": "affine"},
         recommended_draft_sampler={"temperature": "0.7", "top_p": "0.95", "top_k": "20"},
+        runtime_env_overrides={
+            "MTPLX_LAZY_VERIFY_LOGITS": False,
+            "MTPLX_BATCH_TARGET_ARRAYS": "0",
+        },
     )
 
     result = inspect_model(tmp_path)
@@ -168,6 +185,10 @@ def test_runtime_contract_preserves_recommended_draft_metadata(monkeypatch, tmp_
         "temperature": 0.7,
         "top_p": 0.95,
         "top_k": 20,
+    }
+    assert result.compatibility["runtime_contract"]["runtime_env_overrides"] == {
+        "MTPLX_LAZY_VERIFY_LOGITS": "0",
+        "MTPLX_BATCH_TARGET_ARRAYS": "0",
     }
     assert result.compatibility["tier"] == "verified"
 
@@ -208,6 +229,30 @@ def test_prequantized_mtp_sidecar_accepts_mlx_affine_scale_bias_tensors(tmp_path
     assert result.passes_primary_gate is True
 
 
+def test_dense_fp16_mtp_sidecar_reports_fp16_format(tmp_path):
+    config = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "mtp_num_hidden_layers": 1,
+        "hidden_size": 5120,
+        "num_hidden_layers": 64,
+        "vocab_size": 248320,
+        "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    save_file(
+        {key: np.ones((1,), dtype=np.float16) for key in EXPECTED_MTP_KEYS},
+        tmp_path / "mtp.safetensors",
+    )
+
+    result = inspect_mtp_tensors(tmp_path, config)
+
+    assert result.sidecar_format == "fp16"
+    assert result.tensor_count == 15
+    assert result.missing_expected_keys == ()
+    assert result.extra_keys == ()
+
+
 def test_all_prequantized_mtp_sidecar_accepts_quantized_fc_tensors(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -244,6 +289,294 @@ def test_all_prequantized_mtp_sidecar_accepts_quantized_fc_tensors(tmp_path):
     assert result.passes_primary_gate is True
     assert result.compatibility["tier"] == "verified"
     assert result.compatibility["recommended_profile"] == "performance-cold"
+
+
+def test_qwen_moe_mtp_sidecar_accepts_native_expert_layout(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "model_type": "qwen3_5_moe_text",
+                "mtp_num_hidden_layers": 1,
+                "hidden_size": 2048,
+                "num_hidden_layers": 40,
+                "vocab_size": 248320,
+                "num_experts": 256,
+                "num_experts_per_tok": 8,
+                "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {key: np.ones((1,), dtype=np.float32) for key in EXPECTED_QWEN_MOE_MTP_KEYS},
+        tmp_path / "mtp.safetensors",
+    )
+    _write_runtime_contract(tmp_path, profile="performance-cold")
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp is not None
+    assert result.mtp.sidecar_format == "bf16-qwen-moe"
+    assert result.mtp.tensor_count == 19
+    assert result.mtp.missing_expected_keys == ()
+    assert result.mtp.extra_keys == ()
+    assert result.passes_primary_gate is True
+    assert result.compatibility["tier"] == "verified"
+
+
+def test_qwen_moe_prequantized_mtp_sidecar_accepts_mlx_affine_layout(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "model_type": "qwen3_5_moe_text",
+                "mtp_num_hidden_layers": 1,
+                "hidden_size": 2048,
+                "num_hidden_layers": 40,
+                "vocab_size": 248320,
+                "num_experts": 256,
+                "num_experts_per_tok": 8,
+                "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
+                "mtplx_mtp_quantization": {
+                    "policy": "cyankiwi",
+                    "bits": 4,
+                    "group_size": 64,
+                    "mode": "affine",
+                    "prequantized": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            key: np.ones((1,), dtype=np.float32)
+            for key in EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS
+        },
+        tmp_path / "mtp.safetensors",
+    )
+    _write_runtime_contract(tmp_path, profile="performance-cold")
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp is not None
+    assert result.mtp.sidecar_format == "prequantized-mlx-affine-qwen-moe"
+    assert result.mtp.tensor_count == 37
+    assert result.mtp.missing_expected_keys == ()
+    assert result.mtp.extra_keys == ()
+    assert result.passes_primary_gate is True
+    assert result.compatibility["tier"] == "verified"
+
+
+def test_qwen_moe_prequantized_mtp_sidecar_accepts_numbered_expert_layout(tmp_path):
+    num_experts = 4
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "mtp_num_hidden_layers": 1,
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 40,
+                    "vocab_size": 248320,
+                    "num_experts": num_experts,
+                    "num_experts_per_tok": 8,
+                },
+                "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
+                "mtplx_mtp_quantization": {
+                    "policy": "cyankiwi",
+                    "bits": 4,
+                    "group_size": 32,
+                    "mode": "affine",
+                    "prequantized": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    base = "mtp.layers.0"
+    keys = {
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        f"{base}.input_layernorm.weight",
+        f"{base}.post_attention_layernorm.weight",
+        f"{base}.self_attn.q_proj.weight",
+        f"{base}.self_attn.k_proj.weight",
+        f"{base}.self_attn.v_proj.weight",
+        f"{base}.self_attn.o_proj.weight",
+        f"{base}.self_attn.q_norm.weight",
+        f"{base}.self_attn.k_norm.weight",
+        f"{base}.mlp.gate.weight",
+        f"{base}.mlp.shared_expert.gate_proj.weight",
+        f"{base}.mlp.shared_expert.up_proj.weight",
+        f"{base}.mlp.shared_expert.down_proj.weight",
+        f"{base}.mlp.shared_expert_gate.weight",
+    }
+    for expert_index in range(num_experts):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            prefix = f"{base}.mlp.experts.{expert_index}.{proj}"
+            keys.update({f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"})
+    save_file(
+        {key: np.ones((1,), dtype=np.float32) for key in keys},
+        tmp_path / "mtp.safetensors",
+    )
+    _write_runtime_contract(tmp_path, profile="performance-cold")
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp is not None
+    assert result.mtp.sidecar_format == "prequantized-mlx-affine-qwen-moe-experts"
+    assert result.mtp.tensor_count == 4 + 13 + (num_experts * 3 * 3)
+    assert result.mtp.missing_expected_keys == ()
+    assert result.mtp.extra_keys == ()
+    assert result.passes_primary_gate is True
+
+
+def test_qwen_moe_mtp_sidecar_accepts_stacked_switch_mlp_layout(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "mtp_num_hidden_layers": 1,
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 40,
+                    "vocab_size": 248320,
+                    "num_experts": 256,
+                    "num_experts_per_tok": 8,
+                },
+                "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            key: np.ones((1,), dtype=np.float32)
+            for key in EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS
+        },
+        tmp_path / "mtp.safetensors",
+    )
+    _write_runtime_contract(tmp_path, profile="performance-cold")
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp is not None
+    assert result.mtp.sidecar_format == "bf16-qwen-moe-switch-mlx"
+    assert result.mtp.tensor_count == len(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS)
+    assert result.mtp.missing_expected_keys == ()
+    assert result.mtp.extra_keys == ()
+    assert result.passes_primary_gate is True
+
+
+def test_qwen_moe_mtp_sidecar_accepts_prequantized_stacked_switch_mlp_layout(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "mtp_num_hidden_layers": 1,
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 40,
+                    "vocab_size": 248320,
+                    "num_experts": 256,
+                    "num_experts_per_tok": 8,
+                },
+                "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
+                "mtplx_mtp_quantization": {
+                    "policy": "all",
+                    "bits": 4,
+                    "group_size": 64,
+                    "mode": "affine",
+                    "prequantized": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            key: np.ones((1,), dtype=np.float32)
+            for key in EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS
+        },
+        tmp_path / "mtp.safetensors",
+    )
+    _write_runtime_contract(tmp_path, profile="performance-cold")
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp is not None
+    assert result.mtp.sidecar_format == "prequantized-mlx-affine-qwen-moe-switch-mlx"
+    assert result.mtp.tensor_count == len(
+        EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS
+    )
+    assert result.mtp.missing_expected_keys == ()
+    assert result.mtp.extra_keys == ()
+    assert result.passes_primary_gate is True
+
+
+def test_qwen_moe_mtp_sidecar_accepts_mixed_switch_mlp_prequantization(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "mtp_num_hidden_layers": 1,
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 40,
+                    "vocab_size": 248320,
+                    "num_experts": 256,
+                    "num_experts_per_tok": 8,
+                },
+                "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
+                "mtplx_mtp_quantization": {
+                    "policy": "cyankiwi",
+                    "bits": 4,
+                    "group_size": 32,
+                    "mode": "affine",
+                    "prequantized": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    switch_weight_keys = {
+        "mtp.layers.0.mlp.switch_mlp.down_proj.weight",
+        "mtp.layers.0.mlp.switch_mlp.gate_proj.weight",
+        "mtp.layers.0.mlp.switch_mlp.up_proj.weight",
+    }
+    mixed_keys = set(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS)
+    mixed_keys.update(
+        key.rsplit(".", 1)[0] + suffix
+        for key in switch_weight_keys
+        for suffix in (".scales", ".biases")
+    )
+    save_file(
+        {key: np.ones((1,), dtype=np.float32) for key in mixed_keys},
+        tmp_path / "mtp.safetensors",
+    )
+    _write_runtime_contract(tmp_path, profile="performance-cold")
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp is not None
+    assert result.mtp.sidecar_format == "prequantized-mlx-affine-qwen-moe-switch-mlx"
+    assert result.mtp.tensor_count == len(mixed_keys)
+    assert result.mtp.expected_tensor_count == len(mixed_keys)
+    assert result.mtp.missing_expected_keys == ()
+    assert result.mtp.extra_keys == ()
+    assert result.passes_primary_gate is True
 
 
 def test_qwen_mtp_without_runtime_contract_is_family_runnable(monkeypatch, tmp_path):
@@ -284,6 +617,133 @@ def test_qwen_mtp_without_runtime_contract_is_family_runnable(monkeypatch, tmp_p
     assert result.compatibility["runtime_compatibility"] == "native-family-gated"
 
 
+def test_runtime_contract_public_release_blocker_is_not_verified(monkeypatch, tmp_path):
+    from mtplx import artifacts
+    from mtplx.artifacts import MTPInspection
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "mtp_num_hidden_layers": 1,
+                "hidden_size": 5120,
+                "num_hidden_layers": 64,
+                "vocab_size": 248320,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        artifacts,
+        "inspect_mtp_tensors",
+        lambda *_args, **_kwargs: MTPInspection(
+            mtp_file=str(tmp_path / "mtp.safetensors"),
+            exists=True,
+            tensor_count=15,
+            missing_expected_keys=(),
+        ),
+    )
+    _write_runtime_contract(
+        tmp_path,
+        exactness_baseline={
+            "public_release_blocker": True,
+            "status": "candidate-build-only-benchmark-pending",
+        },
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.passes_primary_gate is False
+    assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
+    assert result.compatibility["can_run"] is False
+    assert result.compatibility["runtime_compatibility"] == "runtime-contract-blocked"
+    assert result.compatibility["unsafe_force_required"] is True
+    assert "public_release_blocker" in result.compatibility["message"]
+
+
+def test_runtime_contract_failed_speed_evidence_is_not_verified(monkeypatch, tmp_path):
+    from mtplx import artifacts
+    from mtplx.artifacts import MTPInspection
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "mtp_num_hidden_layers": 1,
+                "hidden_size": 5120,
+                "num_hidden_layers": 64,
+                "vocab_size": 248320,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        artifacts,
+        "inspect_mtp_tensors",
+        lambda *_args, **_kwargs: MTPInspection(
+            mtp_file=str(tmp_path / "mtp.safetensors"),
+            exists=True,
+            tensor_count=15,
+            missing_expected_keys=(),
+        ),
+    )
+    _write_runtime_contract(
+        tmp_path,
+        speed_evidence={
+            "depth": 0,
+            "verdict": "no_mtp_depth_beat_ar",
+            "failure_reasons": ["no_mtp_depth_beat_ar"],
+        },
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.passes_primary_gate is False
+    assert result.compatibility["runtime_compatibility"] == "runtime-contract-blocked"
+    assert "no_mtp_depth_beat_ar" in result.compatibility["message"]
+
+
+def test_runtime_contract_pending_status_prefix_is_not_verified(monkeypatch, tmp_path):
+    from mtplx import artifacts
+    from mtplx.artifacts import MTPInspection
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "mtp_num_hidden_layers": 1,
+                "hidden_size": 5120,
+                "num_hidden_layers": 64,
+                "vocab_size": 248320,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        artifacts,
+        "inspect_mtp_tensors",
+        lambda *_args, **_kwargs: MTPInspection(
+            mtp_file=str(tmp_path / "mtp.safetensors"),
+            exists=True,
+            tensor_count=15,
+            missing_expected_keys=(),
+        ),
+    )
+    _write_runtime_contract(
+        tmp_path,
+        exactness_baseline={"status": "pending-cyankiwi-35b-moe-benchmark"},
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.passes_primary_gate is False
+    assert result.compatibility["runtime_compatibility"] == "runtime-contract-blocked"
+    assert "pending-cyankiwi-35b-moe-benchmark" in result.compatibility["message"]
+
+
 def test_qwen_embedded_mtp_index_without_runtime_contract_is_family_runnable(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -321,6 +781,113 @@ def test_qwen_embedded_mtp_index_without_runtime_contract_is_family_runnable(tmp
     assert result.compatibility["can_run"] is True
 
 
+def test_qwen_moe_numbered_body_layout_is_not_marked_runnable(monkeypatch, tmp_path):
+    from mtplx import artifacts
+    from mtplx.artifacts import MTPInspection
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "mtp_num_hidden_layers": 1,
+                    "num_experts": 256,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {},
+                "weight_map": {
+                    (
+                        "language_model.model.layers.0.mlp.experts.0."
+                        "down_proj.weight"
+                    ): "model-00001-of-00001.safetensors",
+                    (
+                        "language_model.model.layers.0.mlp.gate.weight"
+                    ): "model-00001-of-00001.safetensors",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        artifacts,
+        "inspect_mtp_tensors",
+        lambda *_args, **_kwargs: MTPInspection(
+            mtp_file=str(tmp_path / "mtp.safetensors"),
+            exists=True,
+            tensor_count=15,
+            expected_tensor_count=15,
+        ),
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.passes_primary_gate is False
+    assert result.compatibility["can_run"] is False
+    assert result.compatibility["runtime_compatibility"] == "invalid-base-tensor-layout"
+    assert "switch_mlp" in result.compatibility["message"]
+
+
+def test_qwen_moe_switch_body_layout_remains_family_runnable(monkeypatch, tmp_path):
+    from mtplx import artifacts
+    from mtplx.artifacts import MTPInspection
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "mtp_num_hidden_layers": 1,
+                    "num_experts": 256,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {},
+                "weight_map": {
+                    (
+                        "language_model.model.layers.0.mlp.switch_mlp."
+                        "down_proj.weight"
+                    ): "model-00001-of-00001.safetensors",
+                    (
+                        "language_model.model.layers.0.mlp.gate.weight"
+                    ): "model-00001-of-00001.safetensors",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        artifacts,
+        "inspect_mtp_tensors",
+        lambda *_args, **_kwargs: MTPInspection(
+            mtp_file=str(tmp_path / "mtp.safetensors"),
+            exists=True,
+            tensor_count=15,
+            expected_tensor_count=15,
+        ),
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.passes_primary_gate is True
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["can_run"] is True
+
+
 def test_qwen3_next_architecture_without_mtp_sidecar_is_unverified(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -346,6 +913,7 @@ def test_architecture_catalog_tracks_main_mtp_families():
     assert "glm4-moe-mtp" in ids
     assert "minimax-m2-mtp" in ids
     assert "gemma-mtp" in ids
+    assert "gemma4-assistant-mtp" in ids
 
 
 def test_deepseek_mtp_without_runtime_contract_needs_contract(tmp_path):
@@ -885,6 +1453,104 @@ def test_gemma4_with_mtp_marker_is_recognized_backend_pending(tmp_path):
     assert result.compatibility["mtp_supported"] == "recognized"
 
 
+def _write_gemma4_pair_bundle(path):
+    target = path / "target"
+    assistant = path / "assistant"
+    target.mkdir()
+    assistant.mkdir()
+    (path / "mtplx_pair.json").write_text(
+        json.dumps(
+            {
+                "variant": "optimized-speed",
+                "layout": {"target": "target", "assistant": "assistant"},
+                "target": {"repo": "google/gemma-4-31B-it", "quantization": "q4/g64"},
+                "assistant": {
+                    "repo": "google/gemma-4-31B-it-assistant",
+                    "quantization": "q6/g64",
+                },
+                "benchmark": {
+                    "temperature": 1.0,
+                    "top_p": 0.95,
+                    "top_k": 64,
+                    "best_block_size": 6,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "gemma4",
+                "architectures": ["Gemma4ForConditionalGeneration"],
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 5376,
+                    "num_hidden_layers": 60,
+                    "hidden_size_per_layer_input": 0,
+                    "enable_moe_block": False,
+                    "vocab_size": 262144,
+                },
+                "quantization_config": {"bits": 4, "group_size": 64},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target / "generation_config.json").write_text(
+        json.dumps({"temperature": 1.0, "top_p": 0.95, "top_k": 64}),
+        encoding="utf-8",
+    )
+    (assistant / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "gemma4_assistant",
+                "architectures": ["Gemma4AssistantForCausalLM"],
+                "backbone_hidden_size": 5376,
+                "use_ordered_embeddings": False,
+                "text_config": {
+                    "hidden_size": 1024,
+                    "num_hidden_layers": 4,
+                    "num_kv_shared_layers": 4,
+                    "layer_types": [
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_gemma4_pair_bundle_inspects_as_assistant_runtime(tmp_path):
+    bundle = _write_gemma4_pair_bundle(tmp_path)
+
+    result = inspect_model(bundle)
+
+    assert result.model_type == "gemma4_pair"
+    assert result.architecture == "Gemma4AssistantPair"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["recommended_backend"] == "gemma4_assistant"
+    assert result.compatibility["runtime_compatibility"] == "assistant-pair-native"
+    assert result.recommended_sampler == {"temperature": 1.0, "top_p": 0.95, "top_k": 64}
+    assert result.gemma4_pair["target_model"].endswith("/target")
+    assert result.gemma4_pair["assistant_model"].endswith("/assistant")
+
+
+def test_gemma4_pair_subfolder_reports_bundle_required(tmp_path):
+    bundle = _write_gemma4_pair_bundle(tmp_path)
+
+    result = inspect_model(bundle / "target")
+
+    assert result.compatibility["arch_id"] == "gemma4-assistant-mtp"
+    assert result.compatibility["can_run"] is False
+    assert result.compatibility["runtime_compatibility"] == "incomplete-assistant-pair"
+    assert "bundle root" in result.compatibility["message"]
+
+
 @pytest.mark.parametrize(
     ("architecture", "model_type", "expected_arch_id"),
     [
@@ -941,6 +1607,7 @@ def test_big_mtp_architecture_markers_are_recognized_backend_pending(
             "glm4-moe-lite-mtp",
             "mimo-mtp",
             "nemotron-h-mtp",
+            "step3p5-mtp",
         }
         else "recognized-backend-pending"
     )

@@ -6,14 +6,32 @@ import inspect
 import json
 import logging
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from .artifacts import expected_mtp_file, is_mtp_key, normalize_mtp_key, text_config
-from .constants import EXPECTED_ALL_PREQUANTIZED_MTP_KEYS, EXPECTED_PREQUANTIZED_MTP_KEYS
+from .constants import (
+    EXPECTED_ALL_PREQUANTIZED_MTP_KEYS,
+    EXPECTED_PREQUANTIZED_MTP_KEYS,
+    EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS,
+    EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS,
+)
+from .expert_layout import num_experts_from_config, stack_numbered_experts
 
 logger = logging.getLogger(__name__)
+
+_MTP_QUANT_POLICY_ALIASES = {
+    "prequantized-int4": "cyankiwi",
+}
+
+
+def _canonical_mtp_quant_policy(policy: str | None) -> str | None:
+    if policy is None:
+        return None
+    normalized = str(policy).strip()
+    return _MTP_QUANT_POLICY_ALIASES.get(normalized, normalized)
+
 
 _RMSNORM_SUFFIXES = (
     "input_layernorm.weight",
@@ -28,42 +46,203 @@ _RMSNORM_SUFFIXES = (
 
 @dataclass(frozen=True)
 class MTPContract:
+    base_hidden_variant: str = "post_norm"
     hidden_variant: str = "post_norm"
     concat_order: str = "embedding_hidden"
+    mtp_position_mode: str = "cache"
     mtp_quant_bits: int | None = None
     mtp_quant_group_size: int = 64
     mtp_quant_mode: str = "affine"
     mtp_quant_policy: str | None = None
     mtp_prequantized: bool = False
+    mtp_prequantized_modules: tuple[str, ...] = ()
+    mtp_prequantized_module_specs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def validate(self) -> None:
-        if self.hidden_variant not in {"pre_norm", "post_norm"}:
-            raise ValueError("hidden_variant must be 'pre_norm' or 'post_norm'")
+        if self.base_hidden_variant not in {"pre_norm", "post_norm"}:
+            raise ValueError("base_hidden_variant must be 'pre_norm' or 'post_norm'")
+        if not _valid_mtp_hidden_variant(self.hidden_variant):
+            raise ValueError(
+                "hidden_variant must be 'fc', 'pre_norm', 'post_norm', "
+                "'embedding', 'prev', or mix:<left>:<right>:<alpha>"
+            )
         if self.concat_order not in {"embedding_hidden", "hidden_embedding"}:
             raise ValueError("concat_order must be 'embedding_hidden' or 'hidden_embedding'")
+        if self.mtp_position_mode not in {"cache", "local", "absolute"}:
+            raise ValueError("mtp_position_mode must be 'cache', 'local', or 'absolute'")
         if self.mtp_quant_bits is not None and self.mtp_quant_bits <= 0:
             raise ValueError("mtp_quant_bits must be positive when set")
         if self.mtp_quant_group_size <= 0:
             raise ValueError("mtp_quant_group_size must be positive")
-        if self.mtp_quant_policy not in {None, "all", "cyankiwi"}:
-            raise ValueError("mtp_quant_policy must be None, 'all', or 'cyankiwi'")
+        if _canonical_mtp_quant_policy(self.mtp_quant_policy) not in {None, "all", "cyankiwi"}:
+            raise ValueError("mtp_quant_policy must be None, 'all', 'cyankiwi', or 'prequantized-int4'")
+        for module, spec in self.mtp_prequantized_module_specs.items():
+            bits = spec.get("bits")
+            group_size = spec.get("group_size")
+            if bits is None or int(bits) <= 0:
+                raise ValueError(f"prequantized module {module} has invalid bits")
+            if group_size is None or int(group_size) <= 0:
+                raise ValueError(f"prequantized module {module} has invalid group_size")
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "base_hidden_variant": self.base_hidden_variant,
+            "hidden_variant": self.hidden_variant,
+            "concat_order": self.concat_order,
+            "mtp_position_mode": self.mtp_position_mode,
+        }
+        if self.mtp_quant_bits is not None:
+            out["mtp_quant_bits"] = int(self.mtp_quant_bits)
+        out["mtp_quant_group_size"] = int(self.mtp_quant_group_size)
+        out["mtp_quant_mode"] = self.mtp_quant_mode
+        if self.mtp_quant_policy is not None:
+            out["mtp_quant_policy"] = self.mtp_quant_policy
+        if self.mtp_prequantized:
+            out["mtp_prequantized"] = True
+        if self.mtp_prequantized_modules:
+            out["mtp_prequantized_modules"] = list(self.mtp_prequantized_modules)
+        if self.mtp_prequantized_module_specs:
+            out["mtp_prequantized_module_specs"] = {
+                str(module): {
+                    "bits": int(spec["bits"]),
+                    "group_size": int(spec["group_size"]),
+                    "mode": str(spec.get("mode") or self.mtp_quant_mode),
+                }
+                for module, spec in sorted(self.mtp_prequantized_module_specs.items())
+            }
+        return out
 
     def with_config_defaults(self, config: dict[str, Any]) -> "MTPContract":
         mtp_quant = config.get("mtplx_mtp_quantization")
+        contract_data = config.get("mtplx_mtp_contract")
+        contract = self.with_metadata(contract_data, preserve_explicit=True)
         if not isinstance(mtp_quant, dict) or not mtp_quant:
-            return self
+            return contract
+        prequantized = bool(mtp_quant.get("prequantized"))
         updates: dict[str, Any] = {}
-        if self.mtp_quant_bits is None and mtp_quant.get("bits") is not None:
+        if (prequantized or contract.mtp_quant_bits is None) and mtp_quant.get("bits") is not None:
             updates["mtp_quant_bits"] = int(mtp_quant["bits"])
-        if self.mtp_quant_group_size == 64 and mtp_quant.get("group_size") is not None:
+        if (
+            prequantized or contract.mtp_quant_group_size == 64
+        ) and mtp_quant.get("group_size") is not None:
             updates["mtp_quant_group_size"] = int(mtp_quant["group_size"])
-        if self.mtp_quant_mode == "affine" and mtp_quant.get("mode") is not None:
+        if (prequantized or contract.mtp_quant_mode == "affine") and mtp_quant.get("mode") is not None:
             updates["mtp_quant_mode"] = str(mtp_quant["mode"])
-        if self.mtp_quant_policy is None and mtp_quant.get("policy") is not None:
+        if (prequantized or contract.mtp_quant_policy is None) and mtp_quant.get("policy") is not None:
             updates["mtp_quant_policy"] = str(mtp_quant["policy"])
-        if not self.mtp_prequantized and mtp_quant.get("prequantized") is not None:
+        if not contract.mtp_prequantized and mtp_quant.get("prequantized") is not None:
             updates["mtp_prequantized"] = bool(mtp_quant["prequantized"])
-        return replace(self, **updates) if updates else self
+        return replace(contract, **updates) if updates else contract
+
+    def with_metadata(
+        self,
+        metadata: dict[str, Any] | None,
+        *,
+        preserve_explicit: bool = True,
+    ) -> "MTPContract":
+        if not isinstance(metadata, dict):
+            return self
+        defaults = MTPContract()
+        field_map = {
+            "base_hidden_variant": "base_hidden_variant",
+            "hidden_variant": "hidden_variant",
+            "mtp_hidden_variant": "hidden_variant",
+            "concat_order": "concat_order",
+            "mtp_position_mode": "mtp_position_mode",
+            "position_mode": "mtp_position_mode",
+            "mtp_quant_bits": "mtp_quant_bits",
+            "mtp_quant_group_size": "mtp_quant_group_size",
+            "mtp_quant_mode": "mtp_quant_mode",
+            "mtp_quant_policy": "mtp_quant_policy",
+            "mtp_prequantized": "mtp_prequantized",
+        }
+        updates: dict[str, Any] = {}
+        for source_key, field_name in field_map.items():
+            if source_key not in metadata:
+                continue
+            if preserve_explicit and getattr(self, field_name) != getattr(defaults, field_name):
+                continue
+            value = metadata[source_key]
+            if field_name in {"mtp_quant_bits", "mtp_quant_group_size"} and value is not None:
+                value = int(value)
+            elif field_name == "mtp_prequantized":
+                value = bool(value)
+            elif value is not None:
+                value = str(value)
+            updates[field_name] = value
+        modules = metadata.get("mtp_prequantized_modules")
+        if (
+            isinstance(modules, list | tuple)
+            and (not preserve_explicit or not self.mtp_prequantized_modules)
+        ):
+            updates["mtp_prequantized_modules"] = tuple(str(item) for item in modules)
+        module_specs = _normalize_prequantized_module_specs(
+            metadata.get("mtp_prequantized_module_specs")
+        )
+        if module_specs and (
+            not preserve_explicit or not self.mtp_prequantized_module_specs
+        ):
+            updates["mtp_prequantized_module_specs"] = module_specs
+        updated = replace(self, **updates) if updates else self
+        updated.validate()
+        return updated
+
+    def with_runtime_metadata(
+        self,
+        metadata: dict[str, Any] | None,
+        *,
+        preserve_explicit: bool = True,
+    ) -> "MTPContract":
+        if not isinstance(metadata, dict):
+            return self
+        contract_data = metadata.get("mtp_contract")
+        if isinstance(contract_data, dict):
+            return self.with_metadata(contract_data, preserve_explicit=preserve_explicit)
+        return self.with_metadata(metadata, preserve_explicit=preserve_explicit)
+
+
+def _valid_mtp_hidden_variant(value: str) -> bool:
+    if value in {"fc", "pre_norm", "post_norm", "embedding", "prev"}:
+        return True
+    if not value.startswith("mix:"):
+        return False
+    parts = value.split(":")
+    if len(parts) != 4:
+        return False
+    sources = {"fc", "pre_norm", "post_norm", "embedding", "prev"}
+    if parts[1] not in sources or parts[2] not in sources:
+        return False
+    try:
+        alpha = float(parts[3].replace("p", "."))
+    except ValueError:
+        return False
+    return 0.0 <= alpha <= 1.0
+
+
+def _normalize_prequantized_module_specs(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for module, raw_spec in value.items():
+        if not isinstance(raw_spec, dict):
+            continue
+        bits = raw_spec.get("bits")
+        group_size = raw_spec.get("group_size")
+        if bits is None or group_size is None:
+            continue
+        try:
+            bit_value = int(bits)
+            group_value = int(group_size)
+        except (TypeError, ValueError):
+            continue
+        if bit_value <= 0 or group_value <= 0:
+            continue
+        normalized[str(module)] = {
+            "bits": bit_value,
+            "group_size": group_value,
+            "mode": str(raw_spec.get("mode") or "affine"),
+        }
+    return normalized
 
 
 def _num_mtp_layers(config: dict[str, Any]) -> int:
@@ -83,10 +262,31 @@ def _text_model(model: Any) -> Any:
 def _quantize_mtp_module(mtp: Any, contract: MTPContract) -> None:
     import mlx.nn as nn
 
-    if contract.mtp_quant_bits is None:
+    module_specs = contract.mtp_prequantized_module_specs
+    if contract.mtp_quant_bits is None and not module_specs:
         return
 
-    policy = contract.mtp_quant_policy or "all"
+    if contract.mtp_prequantized and contract.mtp_prequantized_modules:
+        modules = set(contract.mtp_prequantized_modules)
+
+        def prequantized_predicate(path: str, module: Any):
+            if path in modules and hasattr(module, "to_quantized"):
+                spec = module_specs.get(path, {})
+                bits = spec.get("bits", contract.mtp_quant_bits)
+                group_size = spec.get("group_size", contract.mtp_quant_group_size)
+                if bits is None:
+                    return False
+                return {
+                    "group_size": int(group_size),
+                    "bits": int(bits),
+                    "mode": str(spec.get("mode") or contract.mtp_quant_mode),
+                }
+            return False
+
+        nn.quantize(mtp, class_predicate=prequantized_predicate)
+        return
+
+    policy = _canonical_mtp_quant_policy(contract.mtp_quant_policy) or "all"
     if policy == "all":
         nn.quantize(
             mtp,
@@ -113,6 +313,197 @@ def _quantize_mtp_module(mtp: Any, contract: MTPContract) -> None:
     nn.quantize(mtp, class_predicate=predicate)
 
 
+def _stack_mtp_moe_experts(
+    weights: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Stack numbered MTP experts into mlx-lm's switch_mlp layout."""
+    num_experts = num_experts_from_config(config)
+    if num_experts <= 0:
+        return weights
+    return stack_numbered_experts(weights, num_experts=num_experts, strict=False)
+
+
+def _prequantized_module_prefixes(weights: dict[str, Any]) -> tuple[str, ...]:
+    modules: set[str] = set()
+    for key in weights:
+        if not key.endswith(".scales"):
+            continue
+        prefix = key.removesuffix(".scales")
+        if f"{prefix}.weight" in weights and f"{prefix}.biases" in weights:
+            modules.add(prefix)
+    return tuple(sorted(modules))
+
+
+def _mtp_norms_are_delta_encoded(config: dict[str, Any]) -> bool:
+    mtp_quant = config.get("mtplx_mtp_quantization")
+    values = [
+        config.get("mtplx_mtp_norm_encoding"),
+        config.get("mtp_norm_encoding"),
+    ]
+    if isinstance(mtp_quant, dict):
+        values.extend(
+            [
+                mtp_quant.get("norm_encoding"),
+                mtp_quant.get("norm_weight_encoding"),
+            ]
+        )
+    return any(
+        str(value).strip().lower() in {"delta", "delta_plus_one", "mlx_delta"}
+        for value in values
+        if value is not None
+    )
+
+
+def _restore_delta_encoded_mtp_norms(
+    weights: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    if not _mtp_norms_are_delta_encoded(config):
+        return weights
+    restored = dict(weights)
+    for key, value in list(restored.items()):
+        if value.ndim == 1 and any(key.endswith(suffix) for suffix in _RMSNORM_SUFFIXES):
+            restored[key] = value + 1.0
+    return restored
+
+
+def _infer_prequantized_group_size(weights: dict[str, Any], bits: int | None) -> int | None:
+    if bits is None or bits <= 0:
+        return None
+    values_per_word = max(1, 32 // int(bits))
+    inferred: set[int] = set()
+    for key, weight in weights.items():
+        if not key.endswith(".weight"):
+            continue
+        prefix = key.removesuffix(".weight")
+        scales = weights.get(f"{prefix}.scales")
+        biases = weights.get(f"{prefix}.biases")
+        if scales is None or biases is None:
+            continue
+        weight_shape = getattr(weight, "shape", ())
+        scales_shape = getattr(scales, "shape", ())
+        biases_shape = getattr(biases, "shape", ())
+        if not weight_shape or not scales_shape or scales_shape != biases_shape:
+            continue
+        packed_cols = int(weight_shape[-1])
+        scale_groups = int(scales_shape[-1])
+        if packed_cols <= 0 or scale_groups <= 0:
+            continue
+        expanded_cols = packed_cols * values_per_word
+        if expanded_cols % scale_groups == 0:
+            inferred.add(expanded_cols // scale_groups)
+    if len(inferred) == 1:
+        return inferred.pop()
+    return None
+
+
+def _contract_with_prequantized_tensor_geometry(
+    contract: MTPContract,
+    weights: dict[str, Any],
+) -> MTPContract:
+    if not contract.mtp_prequantized:
+        return contract
+    inferred_group_size = _infer_prequantized_group_size(weights, contract.mtp_quant_bits)
+    if inferred_group_size is None or inferred_group_size == contract.mtp_quant_group_size:
+        return contract
+    return replace(contract, mtp_quant_group_size=inferred_group_size)
+
+
+def _contract_with_prequantized_module_specs(
+    contract: MTPContract,
+    weights: dict[str, Any],
+    config: dict[str, Any],
+) -> MTPContract:
+    if not contract.mtp_prequantized:
+        return contract
+    modules = _prequantized_module_prefixes(weights)
+    if not modules:
+        return contract
+    module_specs = {
+        module: spec
+        for module in modules
+        if (
+            spec := _config_mtp_module_quant_spec(
+                config,
+                module,
+                fallback_mode=contract.mtp_quant_mode,
+            )
+        )
+    }
+    updates: dict[str, Any] = {"mtp_prequantized_modules": modules}
+    if module_specs:
+        updates["mtp_prequantized_module_specs"] = module_specs
+    return replace(contract, **updates)
+
+
+def _config_mtp_module_quant_spec(
+    config: dict[str, Any],
+    module: str,
+    *,
+    fallback_mode: str,
+) -> dict[str, Any] | None:
+    candidates = (
+        module,
+        f"mtp.{module}",
+        f"model.mtp.{module}",
+        f"language_model.mtp.{module}",
+        f"language_model.model.mtp.{module}",
+    )
+    for source in _quant_config_sources(config):
+        containers = [source]
+        nested = source.get("modules")
+        if isinstance(nested, dict):
+            containers.append(nested)
+        for container in containers:
+            for key in candidates:
+                raw = container.get(key)
+                spec = _module_quant_spec_from_mapping(raw, fallback_mode=fallback_mode)
+                if spec:
+                    return spec
+    return None
+
+
+def _quant_config_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
+    tcfg = text_config(config)
+    sources: list[dict[str, Any]] = []
+    for owner in (config, tcfg):
+        for key in (
+            "mtplx_mtp_quantization",
+            "quantization",
+            "quantization_config",
+        ):
+            value = owner.get(key)
+            if isinstance(value, dict):
+                sources.append(value)
+    return sources
+
+
+def _module_quant_spec_from_mapping(
+    raw: Any,
+    *,
+    fallback_mode: str,
+) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    bits = raw.get("bits")
+    group_size = raw.get("group_size")
+    if bits is None or group_size is None:
+        return None
+    try:
+        bit_value = int(bits)
+        group_value = int(group_size)
+    except (TypeError, ValueError):
+        return None
+    if bit_value <= 0 or group_value <= 0:
+        return None
+    return {
+        "bits": bit_value,
+        "group_size": group_value,
+        "mode": str(raw.get("mode") or fallback_mode),
+    }
+
+
 def _finalize_mtp_weights(
     raw_mtp: dict[str, Any],
     config: dict[str, Any],
@@ -132,12 +523,10 @@ def _finalize_mtp_weights(
     group_size = int(quant_config.get("group_size", 64)) if quant_config else 64
 
     if prequantized:
-        weights = dict(raw_mtp)
-        for key, value in list(weights.items()):
-            if value.ndim == 1 and any(key.endswith(suffix) for suffix in _RMSNORM_SUFFIXES):
-                if float(value.mean().item()) < 0.5:
-                    weights[key] = value + 1.0
-        return weights
+        return _stack_mtp_moe_experts(
+            _restore_delta_encoded_mtp_norms(dict(raw_mtp), config),
+            config,
+        )
 
     weights: dict[str, Any] = {}
     processed: set[str] = set()
@@ -161,11 +550,7 @@ def _finalize_mtp_weights(
             weights[key] = raw_mtp[key]
             processed.add(key)
 
-    for key, value in list(weights.items()):
-        if value.ndim == 1 and any(key.endswith(suffix) for suffix in _RMSNORM_SUFFIXES):
-            if float(value.mean().item()) < 0.5:
-                weights[key] = value + 1.0
-    return weights
+    return _stack_mtp_moe_experts(_restore_delta_encoded_mtp_norms(weights, config), config)
 
 
 def _strip_mtp_namespace(key: str) -> str:
@@ -182,6 +567,10 @@ def _mtp_contract_for_weight_keys(
         return contract
     if normalized == set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS):
         policy = "all"
+    elif normalized == set(EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS):
+        policy = "all"
+    elif normalized == set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS):
+        policy = "cyankiwi"
     elif normalized == set(EXPECTED_PREQUANTIZED_MTP_KEYS):
         policy = "cyankiwi"
     else:
@@ -350,6 +739,13 @@ def inject_mtp_support(
         if not mtp_weights:
             logger.warning("[MTP inject] MTP weights not found: %s", mtp_file)
             return False
+    if contract.mtp_prequantized:
+        contract = _contract_with_prequantized_tensor_geometry(contract, mtp_weights)
+        contract = _contract_with_prequantized_module_specs(
+            contract,
+            mtp_weights,
+            config,
+        )
 
     tcfg = text_config(config)
     text_model = _text_model(model)
@@ -622,6 +1018,7 @@ def inject_mtp_support(
             next_token_ids,
             mtp_cache=None,
             concat_order=None,
+            mtp_hidden_variant: str | None = None,
             position_offset: int | None = None,
         ):
             _logits, hidden = self._mtp_core(
@@ -629,7 +1026,8 @@ def inject_mtp_support(
                 next_token_ids,
                 mtp_cache=mtp_cache,
                 concat_order=concat_order,
-                mtp_hidden_variant="post_norm",
+                mtp_hidden_variant=mtp_hidden_variant
+                or getattr(self, "_mtplx_hidden_variant", "post_norm"),
                 position_offset=position_offset,
                 emit_logits=False,
             )

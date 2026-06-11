@@ -33,13 +33,21 @@ class SparseDistribution:
             raise ValueError("SparseDistribution token_ids/probs length mismatch")
         if token_ids.shape[0] == 0:
             raise ValueError("SparseDistribution cannot be empty")
-        if np.any(probs < 0):
+        if np.any(np.isfinite(probs) & (probs < 0)):
             raise ValueError("SparseDistribution probabilities must be non-negative")
-        total = probs.sum()
+        sanitized = np.where(np.isfinite(probs) & (probs > 0), probs, 0.0)
+        total = sanitized.sum()
         if not np.isfinite(total) or total <= 0:
-            raise ValueError("SparseDistribution probabilities must have positive mass")
+            valid_ids = token_ids[
+                (token_ids >= 0) & (token_ids < int(self.vocab_size))
+            ]
+            if valid_ids.shape[0] == 0:
+                raise ValueError("SparseDistribution probabilities must have positive mass")
+            token_ids = np.array([int(valid_ids[0])], dtype=np.int64)
+            sanitized = np.array([1.0], dtype=np.float64)
+            total = 1.0
         object.__setattr__(self, "token_ids", token_ids)
-        object.__setattr__(self, "probs", probs / total)
+        object.__setattr__(self, "probs", sanitized / total)
 
     @classmethod
     def one_hot(cls, token_id: int, vocab_size: int) -> "SparseDistribution":
@@ -156,29 +164,33 @@ def residual_distribution(target_p: Distribution, draft_q: Distribution) -> Dist
                 [max(target_p.probability(int(token)) - draft_q.probability(int(token)), 0.0) for token in token_ids],
                 dtype=np.float64,
             )
+            residual = np.where(np.isfinite(residual) & (residual > 0), residual, 0.0)
             keep = residual > 0
             total = residual[keep].sum()
-            if total <= 0:
+            if not np.isfinite(total) or total <= 0:
                 return target_p
             return SparseDistribution(token_ids[keep], residual[keep] / total, _vocab_size(target_p))
 
         dense_target = _as_dense(target_p)
         dense_draft = _as_dense(draft_q)
         residual = np.maximum(dense_target - dense_draft, 0.0)
+        residual = np.where(np.isfinite(residual) & (residual > 0), residual, 0.0)
         total = residual.sum()
-        if total <= 0:
-            residual = dense_target.copy()
+        if not np.isfinite(total) or total <= 0:
+            residual = np.where(np.isfinite(dense_target) & (dense_target > 0), dense_target, 0.0)
             total = residual.sum()
-        if total <= 0:
+        if not np.isfinite(total) or total <= 0:
             raise ValueError("Cannot build residual distribution from empty target")
         return residual / total
 
     residual = np.maximum(np.asarray(target_p) - np.asarray(draft_q), 0.0)
+    residual = np.where(np.isfinite(residual) & (residual > 0), residual, 0.0)
     total = residual.sum()
-    if total <= 0:
-        residual = np.asarray(target_p, dtype=np.float64).copy()
+    if not np.isfinite(total) or total <= 0:
+        dense_target = np.asarray(target_p, dtype=np.float64)
+        residual = np.where(np.isfinite(dense_target) & (dense_target > 0), dense_target, 0.0)
         total = residual.sum()
-    if total <= 0:
+    if not np.isfinite(total) or total <= 0:
         raise ValueError("Cannot build residual distribution from empty target")
     return residual / total
 

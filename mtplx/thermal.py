@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from functools import lru_cache
@@ -79,6 +80,7 @@ def _version(path: str) -> dict[str, Any]:
 
 MTPLX_THERMALFORGE_DIR = os.path.expanduser("~/.mtplx/bin")
 MTPLX_THERMALFORGE_PATH = os.path.join(MTPLX_THERMALFORGE_DIR, "thermalforge")
+BUNDLED_THERMALFORGE_ENV = "MTPLX_BUNDLED_THERMALFORGE"
 
 
 def _find_thermalforge() -> str | None:
@@ -95,6 +97,16 @@ def _find_thermalforge() -> str | None:
     if os.path.isfile(MTPLX_THERMALFORGE_PATH) and os.access(MTPLX_THERMALFORGE_PATH, os.X_OK):
         return MTPLX_THERMALFORGE_PATH
     return shutil.which("thermalforge")
+
+
+def _bundled_thermalforge_path() -> str | None:
+    path = os.environ.get(BUNDLED_THERMALFORGE_ENV, "").strip()
+    if not path:
+        return None
+    expanded = os.path.abspath(os.path.expanduser(path))
+    if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+        return expanded
+    return None
 
 
 @lru_cache(maxsize=1)
@@ -638,6 +650,100 @@ def open_thermalforge_app() -> dict[str, Any]:
 
 SUDOERS_FILE = "/etc/sudoers.d/mtplx-thermalforge"
 
+_PRIVILEGED_SUDOERS_SCRIPT = r"""
+set -eu
+sudoers_file="$1"
+user_name="$2"
+binary_path="$3"
+
+case "$sudoers_file" in
+  /etc/sudoers.d/*) ;;
+  *) echo "refusing to write outside /etc/sudoers.d" >&2; exit 64 ;;
+esac
+
+case "$binary_path" in
+  /*) ;;
+  *) echo "thermalforge path must be absolute" >&2; exit 64 ;;
+esac
+
+if [ ! -x "$binary_path" ]; then
+  echo "thermalforge binary is not executable: $binary_path" >&2
+  exit 65
+fi
+
+tmp_file="${sudoers_file}.tmp.$$"
+trap 'rm -f "$tmp_file"' EXIT
+
+umask 077
+printf '%s ALL=(root) NOPASSWD: %s\n' "$user_name" "$binary_path" > "$tmp_file"
+chown root:wheel "$tmp_file"
+chmod 440 "$tmp_file"
+/usr/sbin/visudo -c -f "$tmp_file" >/dev/null
+mv "$tmp_file" "$sudoers_file"
+trap - EXIT
+"""
+
+
+def _install_sudoers_rule_with_security(
+    *,
+    user: str,
+    binary_path: str,
+) -> dict[str, Any]:
+    security = shutil.which("security")
+    if security is None and os.path.exists("/usr/bin/security"):
+        security = "/usr/bin/security"
+    if security is None:
+        return {
+            "ok": False,
+            "step": "security_execute_with_privileges",
+            "message": "macOS security tool was not found for GUI admin authorization.",
+        }
+
+    command = [
+        security,
+        "execute-with-privileges",
+        "/bin/sh",
+        "-c",
+        _PRIVILEGED_SUDOERS_SCRIPT,
+        "sh",
+        SUDOERS_FILE,
+        user,
+        binary_path,
+    ]
+    try:
+        proc = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=300.0,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "step": "security_execute_with_privileges",
+            "command": [security, "execute-with-privileges", "/bin/sh", "-c", "..."],
+            "message": f"Admin authorization failed: {type(exc).__name__}: {exc}",
+        }
+
+    stderr = (proc.stderr or "").strip()
+    stdout = (proc.stdout or "").strip()
+    detail = stderr or stdout
+    return {
+        "ok": proc.returncode == 0,
+        "step": "security_execute_with_privileges",
+        "command": [security, "execute-with-privileges", "/bin/sh", "-c", "..."],
+        "returncode": proc.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "message": (
+            "Passwordless sudoers rule installed with macOS admin authorization."
+            if proc.returncode == 0
+            else f"macOS admin authorization failed: {detail or f'exit {proc.returncode}'}"
+        ),
+    }
+
 
 def install_passwordless_sudoers_rule(
     *,
@@ -663,9 +769,9 @@ def install_passwordless_sudoers_rule(
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or "_unknown"
     rule = f"{user} ALL=(root) NOPASSWD: {binary_path}\n"
 
-    # `sudo tee` is the standard idiom for writing a privileged file
-    # interactively without spawning a root shell. We feed the rule via
-    # stdin to avoid quoting hell.
+    # `sudo tee` keeps terminal installs simple. In the GUI app there is no
+    # terminal for sudo to read from, so we fall back to macOS's admin
+    # authorization prompt below.
     write_proc = subprocess.run(
         ["sudo", "tee", SUDOERS_FILE],
         input=rule,
@@ -674,13 +780,37 @@ def install_passwordless_sudoers_rule(
         capture_output=True,
     )
     if write_proc.returncode != 0:
+        security_result = _install_sudoers_rule_with_security(
+            user=user,
+            binary_path=binary_path,
+        )
+        if security_result.get("ok"):
+            probe = _run_probe(["sudo", "-n", binary_path, "status"], timeout_s=5.0)
+            return {
+                "ok": probe.get("ok", False),
+                "step": "verify_passwordless",
+                "method": "security_execute_with_privileges",
+                "binary_path": binary_path,
+                "message": (
+                    "Passwordless sudo for thermalforge is configured."
+                    if probe.get("ok")
+                    else (
+                        "Admin authorization installed the sudoers rule, but "
+                        "`sudo -n thermalforge status` still failed: "
+                        + (probe.get("stderr") or "").strip()
+                    )
+                ),
+                "steps": [security_result, {**probe, "step": "verify"}],
+            }
         return {
             "ok": False,
             "step": "sudo_tee",
             "message": (
                 f"Could not write {SUDOERS_FILE}. sudo said: "
-                f"{(write_proc.stderr or '').strip()}"
+                f"{(write_proc.stderr or '').strip()}. "
+                f"{security_result.get('message', '')}"
             ),
+            "steps": [security_result],
         }
 
     chmod_result = runner(["sudo", "chmod", "440", SUDOERS_FILE])
@@ -1034,6 +1164,145 @@ class MaxSession:
             self.stop()
 
 
+class SmartFanController:
+    """Request-scoped max-fan lease for Smart fan mode.
+
+    Smart is intentionally lighter than ``MaxSession``: it commands max before
+    visible generation starts, but it does not wait for actual RPM verification
+    because that would delay prefill. It reference-counts overlapping requests
+    and restores Apple auto only after the last visible request finishes.
+    """
+
+    def __init__(self, *, log: Any = None, restore_delay_s: float = 0.2) -> None:
+        self.log = log
+        self.restore_delay_s = max(0.0, float(restore_delay_s))
+        self._lock = threading.RLock()
+        self._active_requests: set[str] = set()
+        self._cleanup: Any | None = None
+        self._generation = 0
+        self._commanded_max = False
+        self._last_transition_at: float | None = None
+        self._last_result: dict[str, Any] | None = None
+        self._last_error: str | None = None
+        self._restore_thread: threading.Thread | None = None
+
+    def _emit(self, line: str) -> None:
+        if self.log is not None:
+            try:
+                self.log(line)
+            except Exception:
+                pass
+
+    def begin_request(self, request_id: str) -> dict[str, Any]:
+        request_key = str(request_id or "request")
+        with self._lock:
+            if request_key in self._active_requests:
+                return self.status()
+            self._active_requests.add(request_key)
+            self._generation += 1
+            if len(self._active_requests) > 1 and self._commanded_max:
+                return self.status()
+            try:
+                check_and_recover_stale_max()
+            except Exception as exc:
+                self._last_error = f"stale_recovery:{type(exc).__name__}: {exc}"
+            if self._cleanup is None:
+                self._cleanup = install_max_lifecycle_hooks()
+            try:
+                result = set_thermal_profile("performance")
+                self._last_result = result
+                self._last_transition_at = time.time()
+                self._commanded_max = bool(result.get("ok"))
+                if self._commanded_max:
+                    self._last_error = None
+                else:
+                    self._last_error = str(result.get("message") or "max command failed")
+                    self._emit(f"[smart-fan] max command failed: {self._last_error}")
+            except Exception as exc:
+                self._commanded_max = False
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                self._last_result = {"ok": False, "error": self._last_error}
+                self._emit(f"[smart-fan] max command raised: {self._last_error}")
+            return self.status()
+
+    def end_request(self, request_id: str, *, wait_for_restore: bool = False) -> dict[str, Any]:
+        request_key = str(request_id or "request")
+        with self._lock:
+            self._active_requests.discard(request_key)
+            self._generation += 1
+            generation = self._generation
+            if self._active_requests:
+                return self.status()
+            if not self._commanded_max and self._cleanup is None:
+                return self.status()
+        if wait_for_restore:
+            self._restore_if_still_idle(generation)
+        else:
+            self._schedule_restore(generation)
+        return self.status()
+
+    def _schedule_restore(self, generation: int) -> None:
+        with self._lock:
+            self._restore_thread = threading.Thread(
+                target=self._restore_if_still_idle,
+                args=(generation,),
+                name="mtplx-smart-fan-restore",
+                daemon=True,
+            )
+            self._restore_thread.start()
+
+    def _restore_if_still_idle(self, generation: int) -> None:
+        if self.restore_delay_s > 0:
+            time.sleep(self.restore_delay_s)
+        with self._lock:
+            if self._active_requests or generation != self._generation:
+                return
+            cleanup = self._cleanup
+            self._cleanup = None
+            try:
+                if cleanup is not None:
+                    result = cleanup()
+                else:
+                    result = restore_thermal_profile_verified(log=self._emit)
+                    if result.get("ok"):
+                        _clear_max_marker()
+                self._last_result = result
+                self._last_transition_at = time.time()
+                if result.get("ok"):
+                    self._commanded_max = False
+                    self._last_error = None
+                else:
+                    self._last_error = str(result.get("message") or "restore failed")
+                    self._emit(f"[smart-fan] restore warning: {self._last_error}")
+            except Exception as exc:
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                self._last_result = {"ok": False, "error": self._last_error}
+                self._emit(f"[smart-fan] restore raised: {self._last_error}")
+
+    def restore_now(self, *, wait: bool = True) -> dict[str, Any]:
+        with self._lock:
+            self._active_requests.clear()
+            self._generation += 1
+            generation = self._generation
+        if wait:
+            self._restore_if_still_idle(generation)
+        else:
+            self._schedule_restore(generation)
+        return self.status()
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "active": bool(self._active_requests),
+                "active_count": len(self._active_requests),
+                "active_requests": sorted(self._active_requests),
+                "commanded_max": bool(self._commanded_max),
+                "last_transition_at": self._last_transition_at,
+                "last_error": self._last_error,
+                "last_result": self._last_result,
+            }
+
+
 def set_thermal_profile(profile: str, *, dry_run: bool = False) -> dict[str, Any]:
     if profile not in PROFILE_LABELS:
         raise ValueError(f"unknown thermal profile: {profile}")
@@ -1176,7 +1445,8 @@ def install_thermal_control(
     """Auto-install ThermalForge.
 
     ``method`` selects the install path:
-      ``"auto"``    — build from source into ``~/.mtplx/bin`` (default).
+      ``"auto"``    — use the app-bundled helper when present, otherwise
+                      build from source into ``~/.mtplx/bin`` (default).
       ``"source"``  — git clone + ./setup.sh (uses Xcode CLI tools).
       ``"homebrew"`` — brew install ProducerGuy/tap/thermalforge + sudo daemon.
 
@@ -1193,7 +1463,9 @@ def install_thermal_control(
     if method != "auto":
         raise ValueError(f"unknown install method: {method}")
 
-    # ``auto`` no longer falls through to Homebrew. The upstream
+    # ``auto`` no longer falls through to Homebrew. The macOS app passes an
+    # already-built helper through MTPLX_BUNDLED_THERMALFORGE; CLI installs
+    # still build from source if that resource is absent. The upstream
     # ``ProducerGuy/tap/thermalforge`` formula has been observed to fail
     # mid-build (missing ``Scripts/generate-icon.swift`` in the formula's
     # source archive, May 2026) AND, when it does succeed, installs into
@@ -1205,6 +1477,130 @@ def install_thermal_control(
 # Backwards-compatible alias for the old ``mtplx max --install`` wiring and
 # any external imports.
 install_thermal_control_homebrew = install_thermal_control
+
+
+def _finish_private_thermalforge_install(
+    *,
+    method: str,
+    steps: list[dict[str, Any]],
+    install_label: str,
+    failure_label: str,
+    streaming: bool,
+) -> dict[str, Any]:
+    detect_thermal_control.cache_clear()
+    detection = detect_thermal_control()
+
+    # Sudoers rule scoped exactly to OUR binary path. Any external user of
+    # ``thermalforge`` (the upstream installer, a manual /usr/local/bin copy)
+    # gets no extra privilege from this.
+    sudoers_result = install_passwordless_sudoers_rule(
+        binary_path=MTPLX_THERMALFORGE_PATH, streaming=streaming
+    )
+    sudoers_result["step"] = "passwordless_sudoers"
+    steps.append(sudoers_result)
+    if not sudoers_result.get("ok"):
+        return {
+            "ok": False,
+            "method": method,
+            "message": (
+                f"{install_label} at {MTPLX_THERMALFORGE_PATH}, but "
+                "passwordless sudo could not be configured. Re-run "
+                "`mtplx max --grant-sudo` after fixing the cause: "
+                f"{sudoers_result.get('message')}"
+            ),
+            "steps": steps,
+            "detection": detection,
+        }
+
+    # Final live verification: ramp fans, confirm the daemon accepted the
+    # command, then ALWAYS restore — even if verification reports failure —
+    # so we never leave the user's machine with fans blasting because of a
+    # bad install path.
+    verify = set_thermal_profile_verified("performance", settle_seconds=1.0)
+    try:
+        set_thermal_profile("silent")
+    except Exception:
+        pass  # restore is best-effort; never let it mask the real result
+    steps.append(
+        {"step": "live_fan_test", **{k: v for k, v in verify.items() if k != "raw"}}
+    )
+
+    if not verify.get("ok"):
+        return {
+            "ok": False,
+            "method": method,
+            "message": (
+                f"{failure_label}, but the live fan-ramp test did not "
+                f"register at the daemon. Reason: {verify.get('message')}. "
+                f"Action: {verify.get('actionable', '')}"
+            ),
+            "steps": steps,
+            "detection": detection,
+        }
+
+    return {
+        "ok": True,
+        "method": method,
+        "binary": MTPLX_THERMALFORGE_PATH,
+        "message": (
+            f"ThermalForge installed at {MTPLX_THERMALFORGE_PATH} and "
+            "verified live (fans ramped and restored). MAX mode is ready."
+        ),
+        "steps": steps,
+        "detection": detection,
+    }
+
+
+def _copy_thermalforge_to_private_bin(
+    source_path: str,
+    *,
+    steps: list[dict[str, Any]],
+    step: str,
+) -> dict[str, Any] | None:
+    os.makedirs(MTPLX_THERMALFORGE_DIR, exist_ok=True)
+    try:
+        shutil.copy2(source_path, MTPLX_THERMALFORGE_PATH)
+        os.chmod(MTPLX_THERMALFORGE_PATH, 0o755)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "step": step,
+            "message": f"Could not copy thermalforge to {MTPLX_THERMALFORGE_PATH}: {exc}",
+            "steps": steps,
+            "detection": detect_thermal_control(),
+        }
+    steps.append(
+        {
+            "step": step,
+            "ok": True,
+            "src": source_path,
+            "dst": MTPLX_THERMALFORGE_PATH,
+        }
+    )
+    return None
+
+
+def _install_from_bundled(
+    bundled_binary: str,
+    *,
+    streaming: bool,
+) -> dict[str, Any]:
+    steps: list[dict[str, Any]] = []
+    failure = _copy_thermalforge_to_private_bin(
+        bundled_binary,
+        steps=steps,
+        step="copy_bundled_to_mtplx_bin",
+    )
+    if failure is not None:
+        failure["method"] = "bundled"
+        return failure
+    return _finish_private_thermalforge_install(
+        method="bundled",
+        steps=steps,
+        install_label="ThermalForge copied from the MTPLX app bundle",
+        failure_label="ThermalForge is copied from the MTPLX app bundle and sudoers is configured",
+        streaming=streaming,
+    )
 
 
 def _install_from_source(
@@ -1231,6 +1627,10 @@ def _install_from_source(
 
     runner = _run_streaming if streaming else _run_probe
     steps: list[dict[str, Any]] = []
+
+    bundled = _bundled_thermalforge_path()
+    if bundled is not None:
+        return _install_from_bundled(bundled, streaming=streaming)
 
     git = shutil.which("git")
     if git is None:
@@ -1325,90 +1725,22 @@ def _install_from_source(
             "detection": detect_thermal_control(),
         }
 
-    os.makedirs(MTPLX_THERMALFORGE_DIR, exist_ok=True)
-    try:
-        shutil.copy2(built_binary, MTPLX_THERMALFORGE_PATH)
-        os.chmod(MTPLX_THERMALFORGE_PATH, 0o755)
-    except OSError as exc:
-        return {
-            "ok": False,
-            "step": "copy_to_mtplx_bin",
-            "message": f"Could not copy thermalforge to {MTPLX_THERMALFORGE_PATH}: {exc}",
-            "steps": steps,
-            "detection": detect_thermal_control(),
-        }
-    steps.append(
-        {
-            "step": "copy_to_mtplx_bin",
-            "ok": True,
-            "src": built_binary,
-            "dst": MTPLX_THERMALFORGE_PATH,
-        }
+    failure = _copy_thermalforge_to_private_bin(
+        built_binary,
+        steps=steps,
+        step="copy_to_mtplx_bin",
     )
+    if failure is not None:
+        failure["method"] = "source"
+        return failure
 
-    detect_thermal_control.cache_clear()
-    detection = detect_thermal_control()
-
-    # Sudoers rule scoped exactly to OUR binary path. Any external user of
-    # ``thermalforge`` (the upstream installer, a manual /usr/local/bin
-    # copy) gets no extra privilege from this.
-    sudoers_result = install_passwordless_sudoers_rule(
-        binary_path=MTPLX_THERMALFORGE_PATH, streaming=streaming
+    return _finish_private_thermalforge_install(
+        method="source",
+        steps=steps,
+        install_label="ThermalForge built and copied",
+        failure_label="ThermalForge is built and sudoers is configured",
+        streaming=streaming,
     )
-    sudoers_result["step"] = "passwordless_sudoers"
-    steps.append(sudoers_result)
-    if not sudoers_result.get("ok"):
-        return {
-            "ok": False,
-            "method": "source",
-            "message": (
-                "ThermalForge built and copied to "
-                f"{MTPLX_THERMALFORGE_PATH}, but passwordless sudo could "
-                "not be configured. Re-run `mtplx max --grant-sudo` after "
-                f"fixing the cause: {sudoers_result.get('message')}"
-            ),
-            "steps": steps,
-            "detection": detection,
-        }
-
-    # Final live verification: ramp fans, confirm the daemon accepted the
-    # command, then ALWAYS restore — even if verification reports failure
-    # — so we never leave the user's machine with fans blasting because of
-    # a buggy install path.
-    verify = set_thermal_profile_verified("performance", settle_seconds=1.0)
-    try:
-        set_thermal_profile("silent")
-    except Exception:
-        pass  # restore is best-effort; never let it mask the real result
-    steps.append(
-        {"step": "live_fan_test", **{k: v for k, v in verify.items() if k != "raw"}}
-    )
-
-    if not verify.get("ok"):
-        return {
-            "ok": False,
-            "method": "source",
-            "message": (
-                "ThermalForge is built and sudoers is configured, but the "
-                "live fan-ramp test did not register at the daemon. "
-                f"Reason: {verify.get('message')}. "
-                f"Action: {verify.get('actionable', '')}"
-            ),
-            "steps": steps,
-            "detection": detection,
-        }
-
-    return {
-        "ok": True,
-        "method": "source",
-        "binary": MTPLX_THERMALFORGE_PATH,
-        "message": (
-            f"ThermalForge installed at {MTPLX_THERMALFORGE_PATH} and "
-            "verified live (fans ramped and restored). MAX mode is ready."
-        ),
-        "steps": steps,
-        "detection": detection,
-    }
 
 
 def _install_from_homebrew(

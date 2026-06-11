@@ -107,6 +107,18 @@ def classify_apple_silicon_generation(
     return "unknown"
 
 
+def total_memory_gib() -> float:
+    """Total unified memory in GiB; 0.0 when it cannot be determined."""
+
+    if platform.system() != "Darwin":
+        return 0.0
+    raw = _run_text("sysctl", "-n", "hw.memsize")
+    try:
+        return int(raw) / 1_073_741_824.0
+    except ValueError:
+        return 0.0
+
+
 def detect_apple_silicon() -> dict[str, Any]:
     """Return the cheap local hardware facts needed for default-model routing."""
 
@@ -130,6 +142,7 @@ def detect_apple_silicon() -> dict[str, Any]:
         "chip": chip,
         "apple_silicon_generation": generation,
         "is_apple_silicon": generation in {"m1", "m2", "m3", "m4", "m5"},
+        "memory_gib": total_memory_gib(),
     }
 
 

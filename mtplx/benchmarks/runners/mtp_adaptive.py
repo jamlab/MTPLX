@@ -41,6 +41,8 @@ def run_mtp_adaptive(
     ev_margin_scale: float = 2.0,
     ev_confidence_weight: float = 0.35,
     ev_min_extra_accept_probability: float = 0.18,
+    ev_warmup_full_depth_cycles: int = 4,
+    ev_exploration_interval: int = 32,
     temperature: float = 0.6,
     top_p: float = 0.95,
     top_k: int = 20,
@@ -52,7 +54,9 @@ def run_mtp_adaptive(
     limit: int | None = None,
     enable_thinking: bool | None = None,
     compare_ar: bool = False,
+    base_hidden_variant: str | None = None,
     mtp_hidden_variant: str = "post_norm",
+    concat_order: str | None = None,
     mtp_cache_policy: str = "persistent",
     mtp_history_policy: str = "cycle",
     verify_strategy: str = "batched",
@@ -60,16 +64,30 @@ def run_mtp_adaptive(
     mtp_quant_bits: int | None = None,
     mtp_quant_group_size: int = 64,
     mtp_quant_mode: str = "affine",
+    mtp_adapter_path: Path | str | None = None,
+    merge_mtp_adapter: bool = False,
 ) -> dict[str, Any]:
+    contract_kwargs: dict[str, Any] = {
+        "mtp_quant_bits": mtp_quant_bits,
+        "mtp_quant_group_size": mtp_quant_group_size,
+        "mtp_quant_mode": mtp_quant_mode,
+    }
+    if base_hidden_variant not in {None, "auto", "contract"}:
+        contract_kwargs["base_hidden_variant"] = str(base_hidden_variant)
+    if mtp_hidden_variant not in {None, "auto", "contract"}:
+        contract_kwargs["hidden_variant"] = str(mtp_hidden_variant)
+    if concat_order not in {None, "auto", "contract"}:
+        contract_kwargs["concat_order"] = str(concat_order)
     rt = load(
         model_path,
         mtp=True,
-        contract=MTPContract(
-            mtp_quant_bits=mtp_quant_bits,
-            mtp_quant_group_size=mtp_quant_group_size,
-            mtp_quant_mode=mtp_quant_mode,
-        ),
+        contract=MTPContract(**contract_kwargs),
+        mtp_adapter=mtp_adapter_path,
+        merge_mtp_adapter=merge_mtp_adapter,
     )
+    resolved_base_hidden_variant = str(rt.contract.base_hidden_variant)
+    resolved_mtp_hidden_variant = str(rt.contract.hidden_variant)
+    resolved_concat_order = str(rt.contract.concat_order)
     prompt_cases = load_prompt_suite(prompt_suite)
     if limit is not None:
         prompt_cases = prompt_cases[:limit]
@@ -130,6 +148,8 @@ def run_mtp_adaptive(
                 margin_scale=ev_margin_scale,
                 confidence_weight=ev_confidence_weight,
                 min_extra_accept_probability=ev_min_extra_accept_probability,
+                warmup_full_depth_cycles=ev_warmup_full_depth_cycles,
+                exploration_interval=ev_exploration_interval,
             )
         elif policy_kind == "streak":
             policy = AdaptiveDepthPolicy(
@@ -226,7 +246,9 @@ def run_mtp_adaptive(
         "enable_thinking": enable_thinking,
         "compare_ar": compare_ar,
         "policy_kind": policy_kind,
-        "mtp_hidden_variant": mtp_hidden_variant,
+        "base_hidden_variant": resolved_base_hidden_variant,
+        "mtp_hidden_variant": resolved_mtp_hidden_variant,
+        "concat_order": resolved_concat_order,
         "mtp_cache_policy": mtp_cache_policy,
         "mtp_history_policy": mtp_history_policy,
         "verify_strategy": verify_strategy,
@@ -234,6 +256,14 @@ def run_mtp_adaptive(
         "mtp_quant_bits": mtp_quant_bits,
         "mtp_quant_group_size": mtp_quant_group_size,
         "mtp_quant_mode": mtp_quant_mode,
+        "mtp_adapter_path": str(mtp_adapter_path) if mtp_adapter_path is not None else None,
+        "mtp_adapter_kind": (
+            rt.mtp_adapter_metadata.get("kind")
+            if rt.mtp_adapter_metadata is not None
+            else None
+        ),
+        "mtp_adapter_merged": bool(rt.mtp_adapter_merge_report),
+        "mtp_adapter_merge_report": rt.mtp_adapter_merge_report,
         "policy": {
             "kind": policy_kind,
             "max_depth": max_depth,
@@ -251,6 +281,8 @@ def run_mtp_adaptive(
             "ev_margin_scale": ev_margin_scale,
             "ev_confidence_weight": ev_confidence_weight,
             "ev_min_extra_accept_probability": ev_min_extra_accept_probability,
+            "ev_warmup_full_depth_cycles": ev_warmup_full_depth_cycles,
+            "ev_exploration_interval": ev_exploration_interval,
         },
         "ar_rows": ar_rows,
         "rows": rows,

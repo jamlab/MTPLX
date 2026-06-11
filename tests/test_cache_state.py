@@ -10,6 +10,8 @@ from mtplx.cache_state import (
     TailOwnedKVCache,
     TensorOffsetVllmMetalPagedKVCache,
     VllmMetalPagedKVCache,
+    _paged_gqa_sdpa_route_decision_from_env,
+    _paged_gqa_sdpa_route_from_env,
     configure_owned_recurrent_state_cache,
     configure_tail_owned_attention_kv_cache,
     detach_array_leaf,
@@ -26,7 +28,9 @@ from mtplx.cache_state import (
     snapshot_cache,
     snapshot_untrimmable_cache,
     tail_owned_attention_kv_stats,
+    trim_verified_window_to_prefix,
 )
+from mtplx.kv_quant import PagedKVQuantConfig
 
 
 class DummyCache:
@@ -44,6 +48,18 @@ def test_restore_cache_rewinds_mutated_array_state():
     restore_cache(cache, snap)
 
     assert cache[0].meta_state == ("meta", "3")
+    assert cache[0].state[0].tolist() == [1, 2, 3]
+
+
+def test_restore_cache_can_skip_layout_specific_meta_state():
+    cache = [DummyCache()]
+    snap = snapshot_cache(cache)
+    cache[0].state = [mx.array([9])]
+    cache[0].meta_state = ("dense-layout", "1")
+
+    restore_cache(cache, snap, restore_meta_state=False)
+
+    assert cache[0].meta_state == ("dense-layout", "1")
     assert cache[0].state[0].tolist() == [1, 2, 3]
 
 
@@ -79,12 +95,15 @@ def test_snapshot_cache_does_not_alias_later_mlx_array_mutation():
 class TrimmableDummyCache:
     def __init__(self):
         self.trimmed = 0
+        self.offset = 0
 
     def is_trimmable(self):
         return True
 
     def trim(self, n):
         self.trimmed += n
+        self.offset -= n
+        return n
 
     @property
     def state(self):
@@ -112,6 +131,34 @@ def test_rollback_after_verify_trims_kv_and_restores_recurrent_state():
     assert recurrent.meta_state == ("meta", "3")
     assert recurrent.state[0].tolist() == [1, 2, 3]
     assert kv.trimmed == 3
+
+
+def test_trim_verified_window_to_prefix_requires_all_trimmable_snapshot():
+    kv = TrimmableDummyCache()
+    kv.offset = 8
+    snap = snapshot_untrimmable_cache([kv])
+
+    assert trim_verified_window_to_prefix(
+        [kv],
+        snap,
+        verified_tokens=5,
+        keep_tokens=2,
+    )
+    assert kv.offset == 5
+    assert kv.trimmed == 3
+
+    recurrent = DummyCache()
+    kv = TrimmableDummyCache()
+    kv.offset = 8
+    snap = snapshot_untrimmable_cache([recurrent, kv])
+
+    assert not trim_verified_window_to_prefix(
+        [recurrent, kv],
+        snap,
+        verified_tokens=5,
+        keep_tokens=2,
+    )
+    assert kv.offset == 8
 
 
 def test_detach_recurrent_cache_state_replaces_requested_list_leaves():
@@ -797,6 +844,293 @@ def test_configure_vllm_metal_paged_cache_can_enable_turboquant(monkeypatch):
     assert cache[0].turboquant is True
     assert cache[0].turboquant_config.key_quant == "q8_0"
     assert cache[0].turboquant_config.value_quant == "q3_0"
+
+
+def test_configure_vllm_metal_paged_cache_can_enable_plain_q8_kv_quant(monkeypatch):
+    from mlx_lm.models.cache import KVCache
+
+    def fail_if_external_ops_loads():
+        raise AssertionError("plain q8 paged KV must not require TurboQuant ops")
+
+    monkeypatch.setattr("mtplx.cache_state._load_vllm_metal_ops", fail_if_external_ops_loads)
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", "q8")
+    cache = [KVCache()]
+
+    stats = configure_tail_owned_attention_kv_cache(cache)
+
+    assert stats["mode"] == "vllm_metal_paged_kv_q8"
+    assert stats["external_ops_required"] == 0
+    assert stats["kv_quant"] == 1
+    assert stats["kv_quant_mode"] == "q8"
+    assert isinstance(cache[0], VllmMetalPagedKVCache)
+    assert cache[0].kv_quant is True
+    assert cache[0].kv_quant_config.normalized_mode == "q8"
+
+
+def test_vllm_metal_paged_q8_kv_quant_roundtrips_active_state():
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+
+    mx.random.seed(1357)
+    keys = mx.random.normal((1, 2, 7, 16), dtype=mx.float16)
+    values = mx.random.normal((1, 2, 7, 16), dtype=mx.float16)
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=4,
+        kv_quant_config=PagedKVQuantConfig("q8"),
+    )
+
+    cache.update_without_fetch(keys, values)
+    restored_keys, restored_values = cache.state
+    mx.eval(restored_keys, restored_values)
+
+    assert cache.key_cache.dtype == mx.int8
+    assert cache.value_cache.dtype == mx.int8
+    plain_capacity_bytes = 2 * cache.capacity * 2 * 16 * 2
+    quant_capacity_bytes = (
+        cache.key_cache.nbytes
+        + cache.value_cache.nbytes
+        + cache.key_scale_cache.nbytes
+        + cache.value_scale_cache.nbytes
+    )
+    assert quant_capacity_bytes < plain_capacity_bytes
+    assert restored_keys.shape == keys.shape
+    assert restored_values.shape == values.shape
+    key_diff = mx.max(mx.abs(restored_keys.astype(mx.float32) - keys.astype(mx.float32)))
+    value_diff = mx.max(mx.abs(restored_values.astype(mx.float32) - values.astype(mx.float32)))
+    mx.eval(key_diff, value_diff)
+    assert float(key_diff.item()) <= 2e-2
+    assert float(value_diff.item()) <= 2e-2
+    stats = cache.paged_stats()
+    assert stats["mode"] == "vllm_metal_paged_kv_q8"
+    assert stats["kv_quant"] == 1
+    assert stats["kv_quant_mode"] == "q8"
+
+
+def test_vllm_metal_paged_q4_kv_quant_roundtrips_active_state():
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+
+    mx.random.seed(2469)
+    keys = mx.random.normal((1, 2, 7, 16), dtype=mx.float16)
+    values = mx.random.normal((1, 2, 7, 16), dtype=mx.float16)
+    cache = VllmMetalPagedKVCache(
+        block_size=4,
+        num_blocks=4,
+        kv_quant_config=PagedKVQuantConfig("q4"),
+    )
+
+    cache.update_without_fetch(keys, values)
+    restored_keys, restored_values = cache.state
+    mx.eval(restored_keys, restored_values)
+
+    assert cache.key_cache.dtype == mx.uint8
+    assert cache.value_cache.dtype == mx.uint8
+    assert cache.key_cache.shape[-1] == 8
+    plain_capacity_bytes = 2 * cache.capacity * 2 * 16 * 2
+    quant_capacity_bytes = (
+        cache.key_cache.nbytes
+        + cache.value_cache.nbytes
+        + cache.key_scale_cache.nbytes
+        + cache.value_scale_cache.nbytes
+    )
+    assert quant_capacity_bytes < plain_capacity_bytes
+    key_diff = mx.max(mx.abs(restored_keys.astype(mx.float32) - keys.astype(mx.float32)))
+    value_diff = mx.max(mx.abs(restored_values.astype(mx.float32) - values.astype(mx.float32)))
+    mx.eval(key_diff, value_diff)
+    assert float(key_diff.item()) <= 0.25
+    assert float(value_diff.item()) <= 0.25
+
+
+def test_vllm_metal_paged_q8_kv_quant_attention_matches_stock_with_tolerance(monkeypatch):
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    def fail_if_external_ops_loads():
+        raise AssertionError("plain q8 attention must dequant through in-tree MLX SDPA")
+
+    monkeypatch.setattr("mtplx.cache_state._load_vllm_metal_ops", fail_if_external_ops_loads)
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
+    mx.random.seed(97531)
+    q_len = 4
+    kv_len = 128
+    dim = 64
+    queries = 0.25 * mx.random.normal((1, 4, q_len, dim), dtype=mx.float16)
+    keys = 0.25 * mx.random.normal((1, 2, kv_len, dim), dtype=mx.float16)
+    values = 0.25 * mx.random.normal((1, 2, kv_len, dim), dtype=mx.float16)
+    scale = dim**-0.5
+    cache = VllmMetalPagedKVCache(
+        block_size=16,
+        num_blocks=16,
+        kv_quant_config=PagedKVQuantConfig("q8"),
+    )
+    cache.update_without_fetch(keys, values)
+
+    expected = scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=None,
+        scale=scale,
+        mask="causal",
+    )
+    actual = cache.paged_attention(queries, scale=scale, mask="causal")
+    assert actual is not None
+    mx.eval(expected, actual)
+
+    diff = mx.max(mx.abs(expected.astype(mx.float32) - actual.astype(mx.float32)))
+    mx.eval(diff)
+    assert float(diff.item()) <= 3e-2
+    stats = cache.paged_stats()
+    assert stats["mode"] == "vllm_metal_paged_kv_q8"
+    assert stats["kv_quant_attention_calls"] == 1
+    assert stats["kv_quant_dequant_calls"] >= 1
+    assert stats["kv_quant_dequant_tokens"] >= kv_len
+    assert stats["kv_quant_dequant_time_s"] >= 0.0
+
+
+def test_paged_gqa_sdpa_route_env_is_explicit_and_long_context_only(monkeypatch):
+    assert (
+        _paged_gqa_sdpa_route_from_env(
+            q_len=4,
+            offset=100_000,
+            query_heads=48,
+            kv_heads=8,
+        )
+        == ""
+    )
+
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE", "auto")
+    assert (
+        _paged_gqa_sdpa_route_from_env(
+            q_len=4,
+            offset=100_000,
+            query_heads=48,
+            kv_heads=8,
+        )
+        == "async_per_head"
+    )
+    assert (
+        _paged_gqa_sdpa_route_from_env(
+            q_len=1,
+            offset=100_000,
+            query_heads=48,
+            kv_heads=8,
+        )
+        == ""
+    )
+    assert (
+        _paged_gqa_sdpa_route_from_env(
+            q_len=4,
+            offset=16_384,
+            query_heads=48,
+            kv_heads=8,
+        )
+        == ""
+    )
+
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT", "0")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE", "per-head")
+    assert (
+        _paged_gqa_sdpa_route_from_env(
+            q_len=5,
+            offset=16_384,
+            query_heads=48,
+            kv_heads=8,
+        )
+        == "per_head"
+    )
+
+
+def test_paged_gqa_sdpa_route_miss_records_shape_reason(monkeypatch):
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE", "async-per-head")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT", "0")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_Q", "4")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MAX_Q", "5")
+
+    decision = _paged_gqa_sdpa_route_decision_from_env(
+        q_len=17,
+        offset=100_000,
+        query_heads=48,
+        kv_heads=8,
+    )
+    assert decision.route == ""
+    assert decision.reason == "q_len_gt_max"
+
+    cache = VllmMetalPagedKVCache(block_size=16, num_blocks=64)
+    with attention_phase("decode_verify"):
+        cache._record_gqa_route_miss(
+            decision,
+            offset=100_000,
+            q_len=17,
+            query_heads=48,
+            kv_heads=8,
+        )
+
+    stats = cache.paged_stats()
+    assert stats["gqa_sdpa_route_misses_by_phase_reason"] == {
+        "decode_verify:q_len_gt_max": 1
+    }
+    assert stats["gqa_sdpa_route_misses_by_q_len"] == {
+        "decode_verify:q17:q_len_gt_max": 1
+    }
+    assert stats["gqa_sdpa_last_route_miss"] == {
+        "phase": "decode_verify",
+        "reason": "q_len_gt_max",
+        "requested_route": "async_per_head",
+        "offset": 100_000,
+        "q_len": 17,
+        "query_heads": 48,
+        "kv_heads": 8,
+        "min_context": 0,
+        "min_q": 4,
+        "max_q": 5,
+    }
+
+
+def test_vllm_metal_paged_gqa_sdpa_route_matches_stock_attention(monkeypatch):
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE", "per_head")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT", "0")
+
+    mx.random.seed(8642)
+    q_len = 4
+    kv_len = 512
+    dim = 128
+    queries = mx.random.normal((1, 8, q_len, dim), dtype=mx.float16)
+    keys = mx.random.normal((1, 2, kv_len, dim), dtype=mx.float16)
+    values = mx.random.normal((1, 2, kv_len, dim), dtype=mx.float16)
+    scale = dim**-0.5
+    cache = VllmMetalPagedKVCache(block_size=16, num_blocks=64)
+    cache.update_without_fetch(keys, values)
+
+    expected = scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=None,
+        scale=scale,
+        mask="causal",
+    )
+    actual = cache.paged_attention(queries, scale=scale, mask="causal")
+    assert actual is not None
+    mx.eval(expected, actual)
+
+    diff = mx.max(mx.abs(expected.astype(mx.float32) - actual.astype(mx.float32)))
+    mx.eval(diff)
+    assert float(diff.item()) <= 2e-2
+    stats = cache.paged_stats()
+    assert stats["gqa_sdpa_calls"] == 1
+    assert stats["gqa_sdpa_calls_by_route"] == {"per_head": 1}
 
 
 def test_vllm_metal_paged_attention_matches_stock_attention_with_tolerance():

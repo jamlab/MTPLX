@@ -121,6 +121,31 @@ def test_configure_tail_owned_via_env_downgrades_turboquant(
     assert cache[0].turboquant is False
 
 
+def test_configure_tail_owned_via_env_falls_back_to_plain_q8_when_ops_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mlx_lm.models.cache import KVCache
+
+    _force_ops_failure(monkeypatch)
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_TURBOQUANT", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_TURBOQUANT_K_QUANT", "q8_0")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT", "q8_0")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", "q8")
+    cache = [KVCache()]
+
+    stats = configure_tail_owned_attention_kv_cache(cache)
+
+    assert stats["mode"] == "vllm_metal_paged_kv_q8"
+    assert stats["turboquant"] == 0
+    assert stats["kv_quant"] == 1
+    assert stats["kv_quant_mode"] == "q8"
+    assert stats["turboquant_disabled_reason"] == "vllm_metal_ops_unavailable"
+    assert isinstance(cache[0], VllmMetalPagedKVCache)
+    assert cache[0].turboquant is False
+    assert cache[0].kv_quant is True
+
+
 def test_write_tail_falls_back_to_plain_paged_when_ops_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -160,6 +185,60 @@ def test_write_tail_falls_back_to_plain_paged_when_ops_unavailable(
     stats = paged.paged_stats()
     assert stats["mode"] == "vllm_metal_paged"
     assert int(stats["updates"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("value_quant", "expected_packed_dim", "expected_centroids"),
+    [("q4_0", 64, 16), ("q8_0", 128, 256)],
+)
+def test_write_tail_supports_q4_q8_turboquant_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value_quant: str,
+    expected_packed_dim: int,
+    expected_centroids: int,
+) -> None:
+    """q4/q8 V modes are real TurboQuant candidates, not rejected configs."""
+
+    class _StubOps:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int, bool]] = []
+
+        def tq_encode(self, *_args, **_kwargs):
+            (
+                _k_3d,
+                _v_3d,
+                key_cache,
+                value_cache,
+                key_scale,
+                value_scale,
+                key_zero,
+                _slot,
+                _centroids,
+                v_bits,
+                k_bits,
+                k_signed,
+            ) = _args
+            self.calls.append((int(v_bits), int(k_bits), bool(k_signed)))
+            return key_cache, value_cache, key_scale, value_scale, key_zero
+
+    stub = _StubOps()
+    monkeypatch.setattr(cache_state, "_load_vllm_metal_ops", lambda: stub)
+    config = TurboQuantConfig(key_quant="q8_0", value_quant=value_quant)
+    paged = VllmMetalPagedKVCache(
+        block_size=16,
+        num_blocks=4,
+        turboquant_config=config,
+    )
+    keys = mx.zeros((1, 2, 7, 128), dtype=mx.float16)
+    values = mx.zeros((1, 2, 7, 128), dtype=mx.float16)
+
+    paged.update_without_fetch(keys, values)
+
+    assert paged.turboquant is True
+    assert tuple(paged.key_cache.shape) == (4, 16, 2, 128)
+    assert tuple(paged.value_cache.shape) == (4, 16, 2, expected_packed_dim)
+    assert tuple(paged._turboquant_v_centroids.shape) == (expected_centroids,)
+    assert stub.calls == [(config.value_bits, config.key_bits, True)]
 
 
 def test_paged_attention_bails_out_for_turboquant_when_ops_unavailable(

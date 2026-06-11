@@ -140,6 +140,60 @@ class TerminalThinkingTokenizer(ToolAwareTokenizer):
         return _ids(text) if tokenize else text
 
 
+class BoundarySensitiveNoThinkingTokenizer(ToolAwareTokenizer):
+    """Qwen-like tokenizer where splitting inside the empty think scaffold drifts."""
+
+    _EMPTY_THINK = "<think>\n\n</think>\n\n"
+    _OPEN_THINK = "<think>\n"
+    _CLOSE_AFTER_BLANK = "\n</think>\n\n"
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        enable_thinking=False,
+        tools=None,
+        **_kwargs,
+    ):
+        rendered_messages: list[str] = []
+        for message in messages:
+            content = message.get("content") or ""
+            if message["role"] == "assistant" and not enable_thinking:
+                content = self._EMPTY_THINK + content
+            rendered_messages.append(
+                f"<|im_start|>{message['role']}\n{content}<|im_end|>"
+            )
+        text = "\n".join(rendered_messages)
+        if text:
+            text += "\n"
+        if add_generation_prompt:
+            text += "<|im_start|>assistant\n"
+            if not enable_thinking:
+                text += self._EMPTY_THINK
+        return self.encode(text) if tokenize else text
+
+    def encode(self, text, **_kwargs):
+        value = str(text)
+        tokens: list[int] = []
+        idx = 0
+        while idx < len(value):
+            if value.startswith(self._EMPTY_THINK, idx):
+                tokens.append(900_001)
+                idx += len(self._EMPTY_THINK)
+            elif value.startswith(self._OPEN_THINK, idx):
+                tokens.append(900_002)
+                idx += len(self._OPEN_THINK)
+            elif value.startswith(self._CLOSE_AFTER_BLANK, idx):
+                tokens.append(900_003)
+                idx += len(self._CLOSE_AFTER_BLANK)
+            else:
+                tokens.append(ord(value[idx]))
+                idx += 1
+        return tokens
+
+
 class RecordingBank:
     def __init__(self) -> None:
         self.puts: list[dict] = []
@@ -297,6 +351,35 @@ def test_history_ids_use_next_turn_prefix_for_qwen_terminal_thinking_template():
 
     assert next_prompt_ids[: len(history_ids)] == history_ids
     assert next_prompt_ids[: len(terminal_ids)] != terminal_ids
+
+
+def test_history_ids_preserve_qwen_no_thinking_plain_answer_boundary():
+    """Plain Qwen chat must not split inside the empty think scaffold."""
+    state = _postcommit_state(tokenizer=BoundarySensitiveNoThinkingTokenizer())
+    messages = [
+        ChatMessage(role="user", content="Write a tiny Python code block."),
+    ]
+    assistant_content = '```python\nprint("hello")\n```'
+
+    history_ids = _history_ids_for_postcommit(
+        state,
+        messages=messages,
+        assistant_content=assistant_content,
+        assistant_tool_calls=None,
+        thinking_enabled=False,
+    )
+    next_messages = list(messages) + [
+        ChatMessage(role="assistant", content=assistant_content),
+        ChatMessage(role="user", content="Reply OK only."),
+    ]
+    next_prompt_ids = _encode_messages(
+        state.runtime.tokenizer,
+        next_messages,
+        enable_thinking=False,
+    )
+
+    assert history_ids, "history_ids must not be empty"
+    assert next_prompt_ids[: len(history_ids)] == history_ids
 
 
 def test_generation_final_rejects_unreachable_qwen_terminal_thinking_prefix():

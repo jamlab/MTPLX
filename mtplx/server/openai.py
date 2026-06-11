@@ -3,8 +3,9 @@
 
 This is intentionally small: it exists so local UI clients such as Open WebUI
 can exercise the native-MTP runtime without turning MTPLX into a deployment
-server yet. The generation path is serialized because the current cache and
-GraphBank machinery has not been audited for concurrent requests.
+server yet. The default live path preserves the single-user MTP oracle; the
+opt-in concurrent lane batches AR fallback work on the same single MLX owner
+thread so coding-agent bursts do not require parallel model loops.
 """
 
 # ruff: noqa: E402
@@ -13,6 +14,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import builtins
+import errno
+import gc
 import hashlib
 import html
 import json
@@ -20,18 +24,21 @@ import logging
 import os
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 import webbrowser
-from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict, is_dataclass
+from concurrent.futures import Future
+from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
+from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Event, Lock, Thread, Timer
-from typing import Any, Callable
+from threading import Condition, Event, Lock, Thread, Timer
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 
@@ -39,36 +46,129 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
 from mtplx.mtp_patch import MTPContract
+from mtplx.backends.descriptors import (
+    BackendDescriptor,
+    assistant_target_distribution_choices,
+    descriptor_for_backend_id,
+    descriptor_from_runtime,
+    model_controls_for_descriptor,
+    set_draft_control_arg,
+    sync_backend_arg_aliases,
+    target_distribution_mode_from_args,
+)
+from mtplx.backends.registry import load_runtime_contract
+from mtplx.batching import BatchSchedulerConfig, SchedulerMode, SchedulerPreset
+from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
+from mtplx.gemma4_pair import (
+    GEMMA4_BACKEND,
+    gemma4_pair_sampler_defaults,
+    is_gemma4_pair_repo_id,
+    resolve_gemma4_pair_paths,
+)
 from mtplx.model_scheduler import ModelWorkScheduler
 from mtplx.sampling import SamplerConfig
 from mtplx.profiles import (
     DEFAULT_HF_MODEL_ID,
     DEFAULT_PROFILE_NAME,
+    NATIVE_MTP_60_MLX_FORK_COMMIT,
+    NATIVE_MTP_60_MLX_FORK_FRAGMENT,
     PROFILE_CHOICES,
     apply_profile_env,
     get_profile,
     profile_env_status,
+    resolve_long_context_mtp_depth,
+)
+from mtplx.runtime_options import (
+    apply_paged_kv_quantization_env,
+    normalize_paged_kv_quantization,
+    resolve_api_key,
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
+from mtplx.fan_mode import (
+    FAN_MODE_CHOICES,
+    FAN_MODE_DEFAULT,
+    FAN_MODE_MAX,
+    FAN_MODE_SMART,
+    normalize_fan_mode,
+)
+from mtplx.reasoning_codecs import (
+    QWEN_STYLE_REASONING_BLOCK_RE,
+    QWEN_STYLE_REASONING_CLOSE_RE,
+    QWEN_STYLE_REASONING_CONTROL_RE,
+    QWEN_STYLE_REASONING_OPEN_RE,
+    QWEN_STYLE_REASONING_TAG_NAMES,
+    normalize_qwen_thinking_tags,
+    normalize_reasoning_tags as normalize_backend_reasoning_tags,
+    split_reasoning_text,
+    strip_qwen_style_reasoning_control_markup,
+    strip_qwen_style_reasoning_from_content,
+    stream_splitter_for_parser,
+)
+from mtplx.server.dashboard_state import DashboardState, InFlightHandle
+from mtplx.server.omlx_bridge import (
+    ToolCallStreamFilter as OMLXToolCallStreamFilter,
+    extract_thinking as omlx_extract_thinking,
+    extract_tool_calls_with_thinking as omlx_extract_tool_calls_with_thinking,
+    normalize_messages_for_template as omlx_normalize_messages_for_template,
+)
 from mtplx.server_urls import bind_label, is_wildcard_bind, local_url_for_bind
 
 LOGGER = logging.getLogger("mtplx.server.openai")
 
+SCHEDULER_MODE_CHOICES = tuple(mode.value for mode in SchedulerMode)
+BATCHING_PRESET_CHOICES = tuple(preset.value for preset in SchedulerPreset)
+_STDOUT_LOGGING_BROKEN = False
+
+
+def _safe_stdout_print(*values: Any, **kwargs: Any) -> bool:
+    """Write daemon diagnostics without ever poisoning a user stream.
+
+    OpenCode and the native app can own the daemon through pipes. If that pipe
+    is closed or rotated while a streaming request is finalizing, a plain
+    ``print(..., flush=True)`` raises ``BrokenPipeError``. That must never be
+    converted into an OpenAI stream error: logging is observability, not part of
+    the model/protocol contract.
+    """
+
+    global _STDOUT_LOGGING_BROKEN
+    if _STDOUT_LOGGING_BROKEN:
+        return False
+    kwargs.setdefault("flush", True)
+    try:
+        builtins.print(*values, **kwargs)
+        return True
+    except OSError as exc:
+        if exc.errno in {errno.EPIPE, errno.ECONNRESET}:
+            _STDOUT_LOGGING_BROKEN = True
+        return False
+    except Exception:
+        return False
+
 try:
     from mtplx.generation import (
         PostcommitAbort,
+        _default_stop_tokens,
+        _sample_from_logits,
+        _strip_terminal_stop,
         generate_ar,
         generate_mtpk,
+        prefill_chunk_size_override,
         restore_or_prefill_prompt_state,
     )
     from mtplx.native_mlp import native_mlp_stats
@@ -80,7 +180,8 @@ try:
         system_prompt_hash,
     )
     from mtplx.runtime import load
-    from mtplx.session_bank import CacheMissReason
+    from mtplx.session_bank import CacheMissReason, common_prefix_len
+    from mtplx.cache_state import restore_cache, snapshot_cache
 
     _RUNTIME_IMPORT_ERROR: Exception | None = None
 except Exception as exc:
@@ -93,7 +194,14 @@ except Exception as exc:
 
     generate_ar = _missing_runtime
     generate_mtpk = _missing_runtime
+    prefill_chunk_size_override = nullcontext
     restore_or_prefill_prompt_state = _missing_runtime
+    _default_stop_tokens = _missing_runtime
+    _sample_from_logits = _missing_runtime
+    _strip_terminal_stop = _missing_runtime
+    common_prefix_len = _missing_runtime
+    restore_cache = _missing_runtime
+    snapshot_cache = _missing_runtime
     load = _missing_runtime
 
     class PostcommitAbort(RuntimeError):
@@ -131,18 +239,38 @@ except Exception as exc:
 FAST_PATH_ENV = {
     "MTPLX_LAZY_VERIFY_LOGITS": "1",
     "MTPLX_BATCH_TARGET_ARRAYS": "1",
+    "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "1",
     "MTPLX_LAZY_MTP_HISTORY_APPEND": "1",
     "MTPLX_DROP_EVENTS": "1",
     "MTPLX_SKIP_VERIFY_SNAPSHOT": "1",
 }
-EXPECTED_MLX_QMV_FORK_COMMIT = "2377a99f"
-EXPECTED_MLX_QMV_FORK_FRAGMENT = "mlx-mtplx-0.31.2-qmm"
+VERIFY_SNAPSHOT_REQUIRED_STRATEGIES = {"trim_commit", "target_prefix"}
+EXPECTED_MLX_QMV_FORK_COMMIT = NATIVE_MTP_60_MLX_FORK_COMMIT
+EXPECTED_MLX_QMV_FORK_FRAGMENT = NATIVE_MTP_60_MLX_FORK_FRAGMENT
 STATS_FOOTER_MARKER = "\n---\n⚡ **MTPLX TPS:**"
 THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
+CHAT_TEMPLATE_TURN_SENTINEL_RE = re.compile(
+    r"<\|im_start\|>\s*(?:system|user|assistant|tool)?\s*|<\|im_end\|>",
+    re.IGNORECASE,
+)
+CHAT_TEMPLATE_EMPTY_SENTINEL_MARKERS = ("<|third_empty|>",)
+CHAT_TEMPLATE_SENTINEL_MARKERS = (
+    "<|im_start|>",
+    "<|im_end|>",
+    *CHAT_TEMPLATE_EMPTY_SENTINEL_MARKERS,
+)
+CHAT_TEMPLATE_SENTINEL_RE = re.compile(
+    rf"{CHAT_TEMPLATE_TURN_SENTINEL_RE.pattern}|<\|third_empty\|>",
+    re.IGNORECASE,
+)
 STREAM_HEARTBEAT_INTERVAL_S = 10.0
 STREAM_SILENCE_WARN_S = 30.0
 STREAM_SILENCE_WARN_INTERVAL_S = 60.0
+STREAM_HIDDEN_TOOL_GUARD_TOKENS = 2048
+STREAM_HIDDEN_TOOL_GUARD_S = 30.0
+STREAM_TOOL_CALL_FINISH_GRACE_S = 0.05
+TOOL_PROTOCOL_BOUNDARY_GRACE_S = 0.05
 _REASONING_DETAILS_RE = re.compile(
     r"<details\b(?=[^>]*\btype=[\"']reasoning[\"'])[^>]*>.*?</details>",
     re.IGNORECASE | re.DOTALL,
@@ -152,18 +280,166 @@ _REASONING_DETAILS_UNCLOSED_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _REASONING_TAG_RE = re.compile(
-    r"<(think|thinking|reason|reasoning|thought)\b[^>]*>.*?</\1\s*>",
+    r"<(think|thinks|thinking|reason|reasoning|thought|thoughts)\b[^>]*>.*?</\1\s*>",
     re.IGNORECASE | re.DOTALL,
+)
+_REASONING_CONTROL_TAG_RE = re.compile(
+    r"</?\s*(?:think|thinks|thinking|reason|reasoning|thought|thoughts)\b[^>\n]*>",
+    re.IGNORECASE,
 )
 
 
 class _StreamCancelled(RuntimeError):
-    """Raised inside the generation worker after the SSE client disconnects."""
+    """Raised inside the generation worker after a request is cancelled."""
 
 
-def _raise_if_stream_cancelled(cancel_event: Event) -> None:
+class _StopSequenceHit(_StreamCancelled):
+    """Raised by non-stream token monitors when a client stop string matches.
+
+    Subclasses ``_StreamCancelled`` so the generation pipeline unwinds through
+    the exact same battle-tested cancellation path that client disconnects
+    already use; the endpoint handlers catch it first and turn the partial
+    output into a normal ``finish_reason="stop"`` response instead of a 499.
+    """
+
+    def __init__(self, matched_stop: str) -> None:
+        super().__init__(f"stop sequence matched: {matched_stop!r}")
+        self.matched_stop = matched_stop
+
+
+def _normalize_stop_sequences(stop: Any) -> list[str]:
+    """Normalize an OpenAI ``stop`` value into a bounded list of stop strings.
+
+    OpenAI accepts a string or an array of up to 4 strings. Empty entries are
+    dropped and unparseable payloads are ignored rather than rejected, so an
+    exotic client value can degrade to "no stop sequences" but never to a 4xx.
+    """
+    if stop is None:
+        return []
+    if isinstance(stop, str):
+        values: list[Any] = [stop]
+    elif isinstance(stop, (list, tuple)):
+        values = list(stop)
+    else:
+        return []
+    normalized: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        if value not in normalized:
+            normalized.append(value)
+        if len(normalized) >= 4:
+            break
+    return normalized
+
+
+def _trim_text_at_stop_sequences(
+    text: str, stop_sequences: list[str]
+) -> tuple[str, str | None]:
+    """Trim ``text`` at the earliest stop-sequence match.
+
+    Returns the trimmed text and the matched stop string (``None`` when no
+    stop sequence occurs in the text).
+    """
+    if not text or not stop_sequences:
+        return text, None
+    earliest_index = -1
+    matched: str | None = None
+    for stop in stop_sequences:
+        if not stop:
+            continue
+        index = text.find(stop)
+        if index != -1 and (earliest_index == -1 or index < earliest_index):
+            earliest_index = index
+            matched = stop
+    if matched is None:
+        return text, None
+    return text[:earliest_index], matched
+
+
+class _StopSequenceStreamMonitor:
+    """Incremental stop-string detector over a streamed text channel.
+
+    ``feed`` returns the emittable portion of ``text``: everything before a
+    stop match, with a possible partial-match suffix held back so a stop
+    string split across deltas is never partially emitted to the client.
+    Once ``stopped`` flips, ``feed`` returns "" forever; ``flush`` releases
+    any held-back suffix when the stream ends without a match.
+    """
+
+    def __init__(self, stop_sequences: list[str]) -> None:
+        self._stops = [stop for stop in stop_sequences if stop]
+        self._max_hold = max((len(stop) for stop in self._stops), default=1) - 1
+        self._pending = ""
+        self.stopped = False
+        self.matched_stop: str | None = None
+        self.emitted_text = ""
+
+    @property
+    def active(self) -> bool:
+        return bool(self._stops)
+
+    def _emit(self, text: str) -> str:
+        if text:
+            self.emitted_text += text
+        return text
+
+    def feed(self, text: str) -> str:
+        if self.stopped:
+            return ""
+        if not self._stops:
+            return self._emit(text)
+        if not text:
+            return ""
+        self._pending += text
+        earliest_index = -1
+        earliest_stop: str | None = None
+        for stop in self._stops:
+            index = self._pending.find(stop)
+            if index != -1 and (earliest_index == -1 or index < earliest_index):
+                earliest_index = index
+                earliest_stop = stop
+        if earliest_stop is not None:
+            self.stopped = True
+            self.matched_stop = earliest_stop
+            emit = self._pending[:earliest_index]
+            self._pending = ""
+            return self._emit(emit)
+        hold = 0
+        max_hold = min(len(self._pending), self._max_hold)
+        for size in range(max_hold, 0, -1):
+            suffix = self._pending[-size:]
+            if any(stop.startswith(suffix) for stop in self._stops):
+                hold = size
+                break
+        if hold:
+            emit = self._pending[:-hold]
+            self._pending = self._pending[-hold:]
+        else:
+            emit = self._pending
+            self._pending = ""
+        return self._emit(emit)
+
+    def flush(self) -> str:
+        if self.stopped:
+            self._pending = ""
+            return ""
+        emit = self._pending
+        self._pending = ""
+        return self._emit(emit)
+
+
+def _stream_cancelled_queue_item(exc: _StreamCancelled) -> tuple[str, str]:
+    reason = str(exc)
+    exc.__traceback__ = None
+    return ("cancelled", reason)
+
+
+def _raise_if_stream_cancelled(
+    cancel_event: Event, message: str = "stream client disconnected"
+) -> None:
     if cancel_event.is_set():
-        raise _StreamCancelled("stream client disconnected")
+        raise _StreamCancelled(message)
 
 
 def _cancel_stream_generation(
@@ -176,6 +452,27 @@ def _cancel_stream_generation(
         generation_future.cancel()
     except Exception:
         return
+
+
+async def _monitor_request_disconnect(
+    raw_request: Request,
+    cancel_event: Event,
+    *,
+    poll_s: float = 0.25,
+    on_disconnect: Callable[[], None] | None = None,
+) -> bool:
+    while not cancel_event.is_set():
+        try:
+            disconnected = await raw_request.is_disconnected()
+        except Exception:
+            return False
+        if disconnected:
+            if on_disconnect is not None:
+                on_disconnect()
+            cancel_event.set()
+            return True
+        await asyncio.sleep(max(0.01, float(poll_s)))
+    return False
 
 
 def _comma_floats(value: str) -> tuple[float, ...]:
@@ -207,6 +504,28 @@ def _fast_path_env_status() -> dict[str, dict[str, Any]]:
         }
         for key, expected in FAST_PATH_ENV.items()
     }
+
+
+def _server_runtime_env_overrides(
+    args: argparse.Namespace,
+    model_runtime_env_overrides: Mapping[str, str] | None,
+) -> dict[str, str]:
+    overrides = dict(model_runtime_env_overrides or {})
+    verify_strategy = (
+        str(getattr(args, "verify_strategy", "") or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    generation_mode = (
+        str(getattr(args, "generation_mode", "") or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    if generation_mode == "mtp" and verify_strategy in VERIFY_SNAPSHOT_REQUIRED_STRATEGIES:
+        overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+    return overrides
 
 
 def _assert_fast_path_env() -> dict[str, dict[str, Any]]:
@@ -262,19 +581,32 @@ def _mlx_fork_status() -> dict[str, Any]:
             or EXPECTED_MLX_QMV_FORK_FRAGMENT in str(parent)
         ):
             try:
+                # Bounded timeout: if git is slow or hung (lock
+                # contention, zombie pickaxe process holding pack
+                # files, slow disk), do not let the daemon block on
+                # startup forever. The hash is diagnostic; failing
+                # closed with `commit = None` is safe and matches the
+                # `prefill_bench.py` pattern.
                 commit = subprocess.check_output(
                     ["git", "-C", str(parent), "rev-parse", "--short", "HEAD"],
                     text=True,
                     stderr=subprocess.DEVNULL,
+                    timeout=2.0,
                 ).strip()
-            except Exception:
+            except (
+                subprocess.SubprocessError,
+                FileNotFoundError,
+                OSError,
+            ):
                 commit = None
             break
-    ok = EXPECTED_MLX_QMV_FORK_FRAGMENT in str(path) and (
-        commit in {None, EXPECTED_MLX_QMV_FORK_COMMIT}
-    )
+    path_active = EXPECTED_MLX_QMV_FORK_FRAGMENT in str(path)
+    commit_matches = commit in {None, EXPECTED_MLX_QMV_FORK_COMMIT}
+    ok = path_active and commit_matches
     return {
         "ok": ok,
+        "path_active": path_active,
+        "commit_matches": commit_matches,
         "path": str(path),
         "version": version,
         "expected_path_fragment": EXPECTED_MLX_QMV_FORK_FRAGMENT,
@@ -341,12 +673,19 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
     temperature: float | None = None
-    top_p: float | None = None
-    top_k: int | None = None
+    top_p: float | None = Field(
+        default=None, validation_alias=AliasChoices("top_p", "topP")
+    )
+    top_k: int | None = Field(
+        default=None, validation_alias=AliasChoices("top_k", "topK")
+    )
     depth: int | None = None
+    draft_block_size: int | None = None
+    gemma_draft_block_size: int | None = None
     generation_mode: str | None = None
     seed: int | None = None
     enable_thinking: bool | None = None
+    reasoning_effort: str | None = None
     stream: bool = False
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any = None
@@ -358,10 +697,241 @@ class ChatCompletionRequest(BaseModel):
     user: str | None = None
 
 
+@dataclass
+class AgentTranscriptCanonicalization:
+    raw_message_chars: int = 0
+    canonical_message_chars: int = 0
+    assistant_reasoning_history_messages: int = 0
+    assistant_reasoning_history_chars: int = 0
+    assistant_structured_thinking_blocks: int = 0
+    stripped_tool_preamble_messages: int = 0
+    stripped_tool_preamble_chars: int = 0
+    skipped_aborted_assistant_messages: int = 0
+    skipped_orphan_chitchat_assistant_messages: int = 0
+    dropped_simple_chitchat_history_messages: int = 0
+    dropped_simple_chitchat_history_chars: int = 0
+    replaced_simple_chitchat_system_messages: int = 0
+    replaced_simple_chitchat_system_chars: int = 0
+    injected_simple_chitchat_system_chars: int = 0
+    replaced_client_system_messages: int = 0
+    replaced_client_system_chars: int = 0
+    injected_client_system_chars: int = 0
+    skipped_repeated_assistant_messages: int = 0
+    skipped_stalled_agent_preamble_messages: int = 0
+    skipped_stalled_agent_preamble_chars: int = 0
+    collapsed_repeated_user_messages: int = 0
+    collapsed_repeated_user_chars: int = 0
+    dropped_duplicate_user_messages: int = 0
+    dropped_duplicate_user_chars: int = 0
+    merged_consecutive_user_messages: int = 0
+    merged_consecutive_user_chars: int = 0
+    compacted_repeated_timeout_tool_messages: int = 0
+    compacted_tool_result_messages: int = 0
+    compacted_tool_result_chars: int = 0
+    compacted_active_tool_result_messages: int = 0
+    compacted_active_tool_result_chars: int = 0
+    compacted_active_tool_result_read_hints: int = 0
+    compacted_active_read_messages: int = 0
+    compacted_active_read_chars: int = 0
+    compacted_active_read_inspection_messages: int = 0
+    compacted_active_read_inspection_chars: int = 0
+    inspection_read_budget_candidate_messages: int = 0
+    inspection_read_budget_max_lines_per_file: int = 0
+    skipped_verbatim_tool_output_assistant_messages: int = 0
+    skipped_verbatim_tool_output_assistant_chars: int = 0
+    compacted_repeated_read_inspection_messages: int = 0
+    compacted_repeated_read_inspection_chars: int = 0
+
+    def to_metrics(self) -> dict[str, Any]:
+        return {
+            "transcript_raw_message_chars": int(self.raw_message_chars),
+            "transcript_canonical_message_chars": int(self.canonical_message_chars),
+            "transcript_assistant_reasoning_history_messages": int(
+                self.assistant_reasoning_history_messages
+            ),
+            "transcript_assistant_reasoning_history_chars": int(
+                self.assistant_reasoning_history_chars
+            ),
+            "transcript_assistant_structured_thinking_blocks": int(
+                self.assistant_structured_thinking_blocks
+            ),
+            "transcript_canonicalized": bool(
+                self.stripped_tool_preamble_messages
+                or self.skipped_aborted_assistant_messages
+                or self.skipped_orphan_chitchat_assistant_messages
+                or self.dropped_simple_chitchat_history_messages
+                or self.replaced_simple_chitchat_system_messages
+                or self.injected_simple_chitchat_system_chars
+                or self.replaced_client_system_messages
+                or self.injected_client_system_chars
+                or self.skipped_repeated_assistant_messages
+                or self.skipped_stalled_agent_preamble_messages
+                or self.collapsed_repeated_user_messages
+                or self.dropped_duplicate_user_messages
+                or self.merged_consecutive_user_messages
+                or self.compacted_repeated_timeout_tool_messages
+                or self.compacted_tool_result_messages
+                or self.compacted_active_tool_result_messages
+                or self.compacted_active_read_messages
+                or self.compacted_active_read_inspection_messages
+                or self.skipped_verbatim_tool_output_assistant_messages
+                or self.compacted_repeated_read_inspection_messages
+            ),
+            "transcript_stripped_tool_preamble_messages": int(
+                self.stripped_tool_preamble_messages
+            ),
+            "transcript_stripped_tool_preamble_chars": int(
+                self.stripped_tool_preamble_chars
+            ),
+            "transcript_skipped_aborted_assistant_messages": int(
+                self.skipped_aborted_assistant_messages
+            ),
+            "transcript_skipped_orphan_chitchat_assistant_messages": int(
+                self.skipped_orphan_chitchat_assistant_messages
+            ),
+            "transcript_dropped_simple_chitchat_history_messages": int(
+                self.dropped_simple_chitchat_history_messages
+            ),
+            "transcript_dropped_simple_chitchat_history_chars": int(
+                self.dropped_simple_chitchat_history_chars
+            ),
+            "transcript_replaced_simple_chitchat_system_messages": int(
+                self.replaced_simple_chitchat_system_messages
+            ),
+            "transcript_replaced_simple_chitchat_system_chars": int(
+                self.replaced_simple_chitchat_system_chars
+            ),
+            "transcript_injected_simple_chitchat_system_chars": int(
+                self.injected_simple_chitchat_system_chars
+            ),
+            "transcript_replaced_client_system_messages": int(
+                self.replaced_client_system_messages
+            ),
+            "transcript_replaced_client_system_chars": int(
+                self.replaced_client_system_chars
+            ),
+            "transcript_injected_client_system_chars": int(
+                self.injected_client_system_chars
+            ),
+            "transcript_replaced_initial_client_system_messages": int(
+                self.replaced_client_system_messages
+            ),
+            "transcript_replaced_initial_client_system_chars": int(
+                self.replaced_client_system_chars
+            ),
+            "transcript_injected_initial_client_system_chars": int(
+                self.injected_client_system_chars
+            ),
+            "transcript_skipped_repeated_assistant_messages": int(
+                self.skipped_repeated_assistant_messages
+            ),
+            "transcript_skipped_stalled_agent_preamble_messages": int(
+                self.skipped_stalled_agent_preamble_messages
+            ),
+            "transcript_skipped_stalled_agent_preamble_chars": int(
+                self.skipped_stalled_agent_preamble_chars
+            ),
+            "transcript_collapsed_repeated_user_messages": int(
+                self.collapsed_repeated_user_messages
+            ),
+            "transcript_collapsed_repeated_user_chars": int(
+                self.collapsed_repeated_user_chars
+            ),
+            "transcript_dropped_duplicate_user_messages": int(
+                self.dropped_duplicate_user_messages
+            ),
+            "transcript_dropped_duplicate_user_chars": int(
+                self.dropped_duplicate_user_chars
+            ),
+            "transcript_merged_consecutive_user_messages": int(
+                self.merged_consecutive_user_messages
+            ),
+            "transcript_merged_consecutive_user_chars": int(
+                self.merged_consecutive_user_chars
+            ),
+            "transcript_compacted_repeated_timeout_tool_messages": int(
+                self.compacted_repeated_timeout_tool_messages
+            ),
+            "transcript_compacted_tool_result_messages": int(
+                self.compacted_tool_result_messages
+            ),
+            "transcript_compacted_tool_result_chars": int(
+                self.compacted_tool_result_chars
+            ),
+            "transcript_compacted_active_tool_result_messages": int(
+                self.compacted_active_tool_result_messages
+            ),
+            "transcript_compacted_active_tool_result_chars": int(
+                self.compacted_active_tool_result_chars
+            ),
+            "transcript_compacted_active_tool_result_read_hints": int(
+                self.compacted_active_tool_result_read_hints
+            ),
+            "transcript_compacted_active_read_messages": int(
+                self.compacted_active_read_messages
+            ),
+            "transcript_compacted_active_read_chars": int(
+                self.compacted_active_read_chars
+            ),
+            "transcript_compacted_active_read_inspection_messages": int(
+                self.compacted_active_read_inspection_messages
+            ),
+            "transcript_compacted_active_read_inspection_chars": int(
+                self.compacted_active_read_inspection_chars
+            ),
+            "transcript_inspection_read_budget_candidate_messages": int(
+                self.inspection_read_budget_candidate_messages
+            ),
+            "transcript_inspection_read_budget_max_lines_per_file": int(
+                self.inspection_read_budget_max_lines_per_file
+            ),
+            "transcript_skipped_verbatim_tool_output_assistant_messages": int(
+                self.skipped_verbatim_tool_output_assistant_messages
+            ),
+            "transcript_skipped_verbatim_tool_output_assistant_chars": int(
+                self.skipped_verbatim_tool_output_assistant_chars
+            ),
+            "transcript_compacted_repeated_read_inspection_messages": int(
+                self.compacted_repeated_read_inspection_messages
+            ),
+            "transcript_compacted_repeated_read_inspection_chars": int(
+                self.compacted_repeated_read_inspection_chars
+            ),
+        }
+
+
 class MTPLXSettingsUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # ``extra="allow"`` lets the handler return its own structured 400
+    # for restart-required / unknown keys instead of Pydantic's generic
+    # 422 — important so the dashboard can route the error precisely.
+    model_config = ConfigDict(extra="allow")
 
     reasoning: str | None = None
+    generation_mode: str | None = None
+    depth: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    max_response_tokens: int | None = None
+    stream_interval: int | None = None
+    enable_thinking: bool | None = None
+    reasoning_parser: str | None = None
+    reasoning_effort: str | None = None
+    prefill_chunk_tokens: int | None = None
+    draft_temperature: float | None = None
+    draft_top_p: float | None = None
+    draft_top_k: int | None = None
+
+
+class FanModeRequest(BaseModel):
+    """Body for ``POST /v1/mtplx/thermal/fan_mode`` — V1 native app
+    surface around ``mtplx.thermal``. ``mode`` is ``"max"`` (verified
+    ramp), ``"smart"`` (request-scoped boost), or ``"default"``/``"auto"``
+    (Apple-default restore)."""
+
+    mode: str = Field(..., pattern="^(default|smart|max|auto)$")
+    require_actual_ramp: bool = False
+    timeout_s: float | None = Field(default=None, ge=0.0, le=120.0)
 
 
 class CompletionRequest(BaseModel):
@@ -374,8 +944,11 @@ class CompletionRequest(BaseModel):
     top_p: float | None = None
     top_k: int | None = None
     depth: int | None = None
+    draft_block_size: int | None = None
+    gemma_draft_block_size: int | None = None
     generation_mode: str | None = None
     seed: int | None = None
+    stop: Any = None
     stream: bool = False
 
 
@@ -403,12 +976,14 @@ class AnthropicMessagesRequest(BaseModel):
     thinking: Any | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     depth: int | None = None
+    draft_block_size: int | None = None
+    gemma_draft_block_size: int | None = None
     generation_mode: str | None = None
     stream: bool = False
 
 
 def _startup_line(text: str = "") -> None:
-    print(text, flush=True)
+    _safe_stdout_print(text)
 
 
 def _startup_server_url(args: argparse.Namespace) -> str:
@@ -429,8 +1004,71 @@ def _startup_openai_base_url(args: argparse.Namespace) -> str:
     return _startup_server_url(args) + "/v1"
 
 
+def _startup_dashboard_url(args: argparse.Namespace) -> str:
+    return _startup_server_url(args) + "/dashboard/"
+
+
 def _startup_chat_url(args: argparse.Namespace) -> str:
     return _startup_server_url(args) + "/"
+
+
+_BROWSER_AUTH_PATH = "/mtplx/browser-auth"
+_BROWSER_AUTH_QUERY_PARAM = "mtplx_api_key"
+_BROWSER_AUTH_COOKIE = "mtplx_browser_api_key"
+_BROWSER_AUTH_COOKIE_MAX_AGE_SECONDS = 12 * 60 * 60
+
+
+def _safe_browser_auth_next_path(value: Any) -> str:
+    candidate = str(value or "/").strip() or "/"
+    if (
+        not candidate.startswith("/")
+        or candidate.startswith("//")
+        or "\r" in candidate
+        or "\n" in candidate
+    ):
+        return "/"
+    return candidate
+
+
+def _browser_auth_url(
+    server_url: str,
+    api_key: str | None,
+    *,
+    next_path: str = "/",
+) -> str:
+    next_path = _safe_browser_auth_next_path(next_path)
+    server_url = server_url.rstrip("/")
+    if not api_key:
+        return server_url + next_path
+    query = urllib.parse.urlencode(
+        {
+            _BROWSER_AUTH_QUERY_PARAM: api_key,
+            "next": next_path,
+        }
+    )
+    return f"{server_url}{_BROWSER_AUTH_PATH}?{query}"
+
+
+def _startup_browser_chat_url(args: argparse.Namespace) -> str:
+    return _browser_auth_url(
+        _startup_server_url(args),
+        getattr(args, "api_key", None),
+        next_path="/",
+    )
+
+
+def _startup_printable_chat_url(args: argparse.Namespace) -> str:
+    if getattr(args, "api_key", None):
+        return _startup_browser_chat_url(args)
+    return _startup_chat_url(args)
+
+
+def _startup_browser_dashboard_url(args: argparse.Namespace) -> str:
+    return _browser_auth_url(
+        _startup_server_url(args),
+        getattr(args, "api_key", None),
+        next_path="/dashboard/",
+    )
 
 
 def _health_runtime_mode_label(
@@ -455,12 +1093,32 @@ def _health_runtime_mode_label(
     return mode
 
 
+def _backend_descriptor(state: "ServerState") -> BackendDescriptor:
+    descriptor = getattr(state, "backend_descriptor", None)
+    if descriptor is not None:
+        return descriptor
+    return descriptor_from_runtime(
+        getattr(state, "runtime", None),
+        getattr(state, "args", None),
+    )
+
+
+def _reasoning_parser_for_state(state: "ServerState") -> str:
+    parser = str(getattr(state.args, "reasoning_parser", "qwen3") or "qwen3")
+    if parser == "none":
+        return "none"
+    backend = _backend_descriptor(state)
+    if parser != backend.reasoning_codec.parser:
+        return backend.reasoning_codec.parser
+    return parser
+
+
 def _open_browser_later(url: str, *, delay_s: float = 1.0) -> None:
     def open_url() -> None:
         try:
             webbrowser.open(url, new=2, autoraise=True)
         except Exception as exc:
-            print(f"[mtplx] could not open browser: {exc}", flush=True)
+            _safe_stdout_print(f"[mtplx] could not open browser: {exc}")
 
     timer = Timer(delay_s, open_url)
     timer.daemon = True
@@ -507,6 +1165,28 @@ def _open_opencode_later(*, delay_s: float = 1.0) -> None:
             _startup_line("open OpenCode manually and select the MTPLX model.")
 
     timer = Timer(delay_s, open_opencode)
+    timer.daemon = True
+    timer.start()
+
+
+def _open_hermes_later(command: str, *, delay_s: float = 1.0) -> None:
+    def open_hermes() -> None:
+        try:
+            from mtplx.pi import launch_pi_in_terminal
+
+            result = launch_pi_in_terminal(command)
+            if result.get("ok"):
+                _startup_line("Hermes Agent opened in Terminal.")
+            else:
+                _startup_line(
+                    f"warning: could not open Hermes automatically: {result.get('error')}"
+                )
+                _startup_line(f"run manually: {command}")
+        except Exception as exc:
+            _startup_line(f"warning: could not open Hermes automatically: {exc}")
+            _startup_line(f"run manually: {command}")
+
+    timer = Timer(delay_s, open_hermes)
     timer.daemon = True
     timer.start()
 
@@ -734,7 +1414,15 @@ def _apply_metal_memory_caps(
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        try:
+            args.paged_kv_quantization = normalize_paged_kv_quantization(
+                getattr(args, "paged_kv_quantization", "off")
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        apply_paged_kv_quantization_env(args.paged_kv_quantization)
         self.model_id = args.model_id
+        self.started_at_s = time.time()
         self.lock = Lock()
         self.foreground_lock = Lock()
         self.foreground_active = 0
@@ -747,6 +1435,7 @@ class ServerState:
         self.rate_limiter = _RateLimiter(args.rate_limit)
         self.metal_memory_caps = _apply_metal_memory_caps()
         self.profile = get_profile(args.profile)
+        startup_backend = descriptor_for_backend_id(getattr(args, "backend_id", None))
         runtime_label = _health_runtime_mode_label(
             self.profile.name,
             getattr(args, "generation_mode", None),
@@ -759,8 +1448,32 @@ class ServerState:
             self.profile_env_status = profile_env_status(self.profile.name)
             self.fast_path_env_status = _fast_path_env_status()
         else:
-            apply_profile_env(self.profile.name)
-            self.profile_env_status = profile_env_status(self.profile.name)
+            self.model_runtime_env_overrides: dict[str, str] = {}
+            contract, _contract_error = load_runtime_contract(args.model)
+            if contract is not None:
+                self.model_runtime_env_overrides = dict(
+                    contract.runtime_env_overrides or {}
+                )
+            runtime_env_overrides = _server_runtime_env_overrides(
+                args,
+                self.model_runtime_env_overrides,
+            )
+            clear_cache_every = getattr(args, "clear_cache_every", None)
+            if clear_cache_every is not None:
+                if clear_cache_every < 0:
+                    raise ValueError("--clear-cache-every must be >= 0")
+                runtime_env_overrides["MTPLX_CLEAR_CACHE_EVERY"] = str(
+                    clear_cache_every
+                )
+            self.runtime_env_overrides = runtime_env_overrides
+            apply_profile_env(
+                self.profile.name,
+                runtime_env_overrides=self.runtime_env_overrides,
+            )
+            self.profile_env_status = profile_env_status(
+                self.profile.name,
+                runtime_env_overrides=self.runtime_env_overrides,
+            )
             if args.strict_startup_asserts:
                 bad_profile_env = {
                     key: value
@@ -778,6 +1491,7 @@ class ServerState:
         self.mlx_fork_status = _mlx_fork_status()
         if (
             args.strict_mlx_fork_assert
+            and startup_backend.requires_native_mlx_fork
             and self.profile.required_mlx_fork_commit
             and not self.mlx_fork_status.get("ok")
         ):
@@ -799,7 +1513,18 @@ class ServerState:
                 load,
                 args.model,
                 mtp=bool(args.load_mtp),
-                contract=MTPContract(),
+                contract=MTPContract(
+                    mtp_quant_bits=getattr(args, "mtp_quant_bits", None),
+                    mtp_quant_group_size=getattr(args, "mtp_quant_group_size", 64),
+                    mtp_quant_mode=getattr(args, "mtp_quant_mode", "affine"),
+                ),
+                mtp_adapter=getattr(args, "mtp_adapter", None),
+                merge_mtp_adapter=bool(getattr(args, "merge_mtp_adapter", False)),
+                gemma4_draft_block_size=getattr(args, "draft_block_size", None),
+                gemma4_target_distribution_mode=target_distribution_mode_from_args(
+                    args,
+                    startup_backend,
+                ),
                 batch_key="startup.load",
             ).result()
         except BaseException as exc:
@@ -813,9 +1538,16 @@ class ServerState:
             load_heartbeat.set()
         self.load_time_s = time.perf_counter() - started
         _startup_line(f"[5/6] Model loaded in {self.load_time_s:.1f}s")
-        _startup_line("[5/6] Installing native-MTP draft head")
-        self.draft_lm_head = (
-            self.model_scheduler.submit_foreground(
+        self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
+        args.backend_id = self.backend_descriptor.backend_id
+        if self.backend_descriptor.uses_draft_lm_head:
+            _startup_line("[5/6] Installing native-MTP draft head")
+        else:
+            _startup_line(
+                f"[5/6] {self.backend_descriptor.display_name} drafter is active"
+            )
+        if self.backend_descriptor.uses_draft_lm_head and self.runtime.mtp_enabled:
+            self.draft_lm_head = self.model_scheduler.submit_foreground(
                 _install_draft_lm_head,
                 self.runtime,
                 bits=args.draft_lm_head_bits,
@@ -823,17 +1555,46 @@ class ServerState:
                 mode=args.draft_lm_head_mode,
                 batch_key="startup.draft_head",
             ).result()
-            if self.runtime.mtp_enabled
-            else {"installed": False, "reason": "mtp_disabled"}
+        elif self.runtime.mtp_enabled:
+            self.draft_lm_head = {
+                "installed": False,
+                "reason": f"{self.backend_descriptor.backend_id}_external_assistant",
+            }
+        else:
+            self.draft_lm_head = {"installed": False, "reason": "mtp_disabled"}
+        if self.backend_descriptor.uses_draft_lm_head and self.runtime.mtp_enabled:
+            self.draft_head_identity = (
+                self.model_scheduler.submit_foreground(
+                    _draft_head_identity,
+                    self.runtime,
+                    batch_key="startup.draft_head_identity",
+                ).result()
+            )
+        elif self.backend_descriptor.uses_external_assistant and self.runtime.mtp_enabled:
+            runtime_config = getattr(self.runtime, "config", None)
+            assistant_path = getattr(runtime_config, "assistant_model_path", None)
+            draft_block_size = getattr(runtime_config, "draft_block_size", None)
+            target_mode = getattr(runtime_config, "target_distribution_mode", None)
+            self.draft_head_identity = (
+                f"{self.backend_descriptor.backend_id}:"
+                f"{assistant_path}:block={draft_block_size}:target={target_mode}"
+            )
+        else:
+            self.draft_head_identity = None
+        self.chat_template_profile = _normalize_chat_template_profile(
+            getattr(args, "chat_template_profile", None)
         )
-        self.draft_head_identity = (
-            self.model_scheduler.submit_foreground(
-                _draft_head_identity,
-                self.runtime,
-                batch_key="startup.draft_head_identity",
-            ).result()
-            if self.runtime.mtp_enabled
-            else None
+        self.chat_template_report = self.model_scheduler.submit_foreground(
+            _apply_chat_template_profile,
+            self.runtime.tokenizer,
+            args,
+            batch_key="startup.chat_template_profile",
+        ).result()
+        if self.chat_template_report.get("profile") == _CHAT_TEMPLATE_PROFILE_CUSTOM:
+            self.chat_template_profile = _CHAT_TEMPLATE_PROFILE_CUSTOM
+        _startup_line(
+            "[5/6] Chat template profile: "
+            + str(self.chat_template_report.get("profile") or self.chat_template_profile)
         )
         self.template_hash = (
             self.model_scheduler.submit_foreground(
@@ -853,13 +1614,19 @@ class ServerState:
             if args.draft_temperature is not None
             else None
         )
+        self.model_context_window_max = _resolve_context_window(
+            self.runtime.tokenizer,
+            args.model,
+        )
+        requested_context_window = int(getattr(args, "context_window", None) or 0)
         self.context_window = (
-            int(args.context_window)
-            if int(args.context_window) > 0
-            else _resolve_context_window(self.runtime.tokenizer, args.model)
+            max(4_096, min(int(self.model_context_window_max), requested_context_window))
+            if requested_context_window > 0
+            else int(self.model_context_window_max)
         )
         _startup_line(f"[5/6] Context window: {self.context_window} tokens")
-        self.sessions = EngineSessionManager()
+        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
+        self.sessions = EngineSessionManager(cold_tier=self.session_bank_cold_tier)
         self.last_metrics: list[dict[str, Any]] = []
         self.tool_parse_counters = {key: 0 for key in _TOOL_PARSE_COUNTER_KEYS}
         # Activity timestamps used by the parent-process thermal watchdog to
@@ -867,7 +1634,25 @@ class ServerState:
         self.last_request_started_at: float = 0.0
         self.last_request_at: float = 0.0
         self.requests_completed: int = 0
+        self.requests_cancelled: int = 0
         self.main_system_prompt_hash: str | None = None
+        self.fan_mode = normalize_fan_mode(
+            getattr(args, "fan_mode", None)
+            or os.environ.get("MTPLX_FAN_MODE")
+            or FAN_MODE_DEFAULT
+        )
+        self.args.fan_mode = self.fan_mode
+        from mtplx.thermal import SmartFanController
+
+        self.smart_fans = SmartFanController(
+            log=lambda line: LOGGER.info("%s", line)
+        )
+        # Dashboard primitives: pub/sub bus, in-flight registry, 5-min rolling
+        # TPS window, lifetime counters, prefill history. Created before
+        # warmup so the optional warmup metrics can flow through the same
+        # surface as user requests.
+        self.dashboard = DashboardState()
+        self.ar_batch_service = _BatchedARGenerationService(self)
         self.warmup_status = _run_startup_warmup(self)
 
     def begin_foreground(self) -> None:
@@ -902,6 +1687,837 @@ def _submit_foreground_model_work(
     if executor is None:
         raise RuntimeError("state has no model work executor")
     return executor.submit(fn, *args, **kwargs)
+
+
+def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
+    mode = str(getattr(args, "ssd_session_cache", "off") or "off").strip().lower()
+    if mode == "off":
+        return None
+    from mtplx.cache_bank import (
+        DEFAULT_COLD_TIER_DIR,
+        DEFAULT_COLD_TIER_MAX_BYTES,
+        DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS,
+        SessionBankColdTier,
+        parse_size_bytes,
+    )
+
+    cache_dir = Path(
+        str(getattr(args, "ssd_session_cache_dir", "") or DEFAULT_COLD_TIER_DIR)
+    ).expanduser()
+    max_bytes = parse_size_bytes(
+        getattr(args, "ssd_session_cache_max_size", None),
+        DEFAULT_COLD_TIER_MAX_BYTES,
+    )
+    min_prefix_tokens = int(
+        getattr(
+            args,
+            "ssd_session_cache_min_prefix_tokens",
+            DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS,
+        )
+        or DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS
+    )
+    return SessionBankColdTier(
+        base_dir=cache_dir,
+        mode=mode,
+        max_bytes=max_bytes,
+        min_prefix_tokens=min_prefix_tokens,
+    )
+
+
+class _BatchedARJob:
+    """One OpenAI request admitted into the live AR batch lane."""
+
+    def __init__(
+        self,
+        *,
+        request_id: str,
+        prompt_ids: list[int],
+        max_tokens: int,
+        sampler: SamplerConfig,
+        seed: int,
+        stop_token_ids: set[int],
+        token_callback: Callable[[list[int]], None] | None,
+        prefill_callback: Callable[[dict[str, Any]], None] | None,
+        request_observability: dict[str, Any] | None,
+        mtp_disabled_reason: str | None,
+        generation_limits: dict[str, Any],
+        cancel_event: Event | None = None,
+        session_id: str | None = None,
+        session_bank: Any | None = None,
+        session_restore_mode: str = "cold",
+        session_template_hash: str | None = None,
+        session_draft_head_identity: str | None = None,
+        session_policy_fingerprint: str | None = None,
+    ) -> None:
+        self.request_id = request_id
+        self.prompt_ids = [int(token) for token in prompt_ids]
+        self.max_tokens = max(1, int(max_tokens))
+        self.sampler = sampler
+        self.seed = int(seed)
+        self.stop_token_ids = {int(token) for token in stop_token_ids}
+        self.token_callback = token_callback
+        self.prefill_callback = prefill_callback
+        self.request_observability = dict(request_observability or {})
+        self.mtp_disabled_reason = mtp_disabled_reason
+        self.generation_limits = dict(generation_limits)
+        self.cancel_event = cancel_event
+        self.session_id = session_id
+        self.session_bank = session_bank
+        self.session_restore_mode = session_restore_mode
+        self.session_template_hash = session_template_hash
+        self.session_draft_head_identity = session_draft_head_identity
+        self.session_policy_fingerprint = session_policy_fingerprint
+        self.future: Future = Future()
+        self.tokens: list[int] = []
+        self.token_times: list[float] = []
+        self.created_s = time.perf_counter()
+        self.admitted_s: float | None = None
+        self.prefill_started_s: float | None = None
+        self.prefill_done_s: float | None = None
+        self.completed_s: float | None = None
+        self.uid: int | None = None
+        self.max_batch_size_observed = 1
+        self.insert_prompt_ids = list(self.prompt_ids)
+        self.insert_all_tokens: list[int] = []
+        self.insert_cache: list[Any] | None = None
+        self.cached_tokens = 0
+        self.cache_miss_reason: str | None = self.request_observability.get(
+            "cache_miss_reason"
+        )
+        self.session_cache_hit = False
+        self.effective_restore_mode = session_restore_mode
+        self.cache_source = "none"
+        self.ssd_cache_hit = False
+        self.ssd_cached_tokens = 0
+        self.ssd_restore_s = 0.0
+        self.ssd_suffix_tokens = 0
+        self.shared_prefix_tokens = 0
+        self.shared_prefix_prefill_s = 0.0
+        self.shared_prefix_snapshot_s = 0.0
+        self.prompt_prepare_s = 0.0
+
+    def cancel_requested(self) -> bool:
+        return bool(self.cancel_event is not None and self.cancel_event.is_set())
+
+    def emit_prefill(self, payload: dict[str, Any]) -> None:
+        if self.prefill_callback is None:
+            return
+        try:
+            self.prefill_callback(payload)
+        except Exception:
+            pass
+
+    def emit_token(self, token: int) -> None:
+        token = int(token)
+        self.tokens.append(token)
+        if token not in self.stop_token_ids and self.token_callback is not None:
+            self.token_callback([token])
+        self.token_times.append(time.perf_counter())
+
+
+class _BatchedARGenerationService:
+    """Live AR continuous-batching pump owned by ``ModelWorkScheduler``.
+
+    FastAPI/request worker threads enqueue jobs here. The service schedules one
+    foreground pump on the existing model owner thread, then uses mlx-lm's
+    ``BatchGenerator`` for the AR lane. That gives MTPLX a real V1 concurrent
+    path without running multiple generation loops or moving native MTP off the
+    solo oracle.
+    """
+
+    def __init__(self, state: "ServerState") -> None:
+        self.state = state
+        self._condition = Condition()
+        self._pending: list[_BatchedARJob] = []
+        self._active: dict[int, _BatchedARJob] = {}
+        self._pump_scheduled = False
+        self._last_batch_size = 0
+        self._last_error: str | None = None
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._condition:
+            return {
+                "pending": len(self._pending),
+                "active": len(self._active),
+                "pump_scheduled": bool(self._pump_scheduled),
+                "last_batch_size": int(self._last_batch_size),
+                "last_error": self._last_error,
+            }
+
+    def submit(self, job: _BatchedARJob) -> Future:
+        with self._condition:
+            self._pending.append(job)
+            if not self._pump_scheduled:
+                self._pump_scheduled = True
+                _submit_foreground_model_work(
+                    self.state,
+                    self._pump,
+                    batch_key="ar_batch.pump",
+                )
+            self._condition.notify_all()
+        return job.future
+
+    def _make_sampler(self, job: _BatchedARJob) -> Callable[[Any], Any]:
+        import mlx.core as mx
+
+        if float(job.sampler.temperature) <= 0:
+            return lambda logprobs: mx.argmax(logprobs, axis=-1)
+        rng = np.random.default_rng(job.seed)
+
+        def sample_one(logprobs: Any) -> Any:
+            token, _distribution = _sample_from_logits(logprobs[0], job.sampler, rng)
+            return mx.array([int(token)])
+
+        return sample_one
+
+    def _stop_sequences(self) -> list[list[int]]:
+        stop_token_ids = _default_stop_tokens(self.state.runtime.tokenizer)
+        return [[int(token)] for token in sorted(stop_token_ids)]
+
+    def _wait_for_initial_cohort(self, config_dict: dict[str, Any]) -> None:
+        max_batch = max(1, int(config_dict["decode_batch_max"]))
+        if max_batch <= 1:
+            return
+        max_active = max(1, int(config_dict["max_active_requests"]))
+        target_batch = max(1, min(max_batch, max_active))
+        wait_s = self._initial_cohort_wait_s(config_dict)
+        if wait_s <= 0.0:
+            return
+        deadline = time.perf_counter() + wait_s
+        with self._condition:
+            while not self._active:
+                pending_count = sum(
+                    1 for job in self._pending if not job.cancel_requested()
+                )
+                if pending_count <= 0 or pending_count >= target_batch:
+                    return
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    return
+                self._condition.wait(timeout=min(remaining, 0.001))
+
+    def _cancelled_error(self, job: _BatchedARJob) -> _StreamCancelled:
+        return _StreamCancelled(f"request {job.request_id} cancelled")
+
+    @staticmethod
+    def _shared_prefix_min_tokens() -> int:
+        raw = os.environ.get("MTPLX_AR_BATCH_SHARED_PREFILL_MIN_TOKENS")
+        if raw is None or raw == "":
+            return 512
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 512
+
+    @staticmethod
+    def _long_burst_prompt_tokens() -> int:
+        raw = os.environ.get("MTPLX_AR_BATCH_LONG_BURST_PROMPT_TOKENS")
+        if raw is None or raw == "":
+            return 4096
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 4096
+
+    @staticmethod
+    def _long_burst_wait_ms() -> float:
+        raw = os.environ.get("MTPLX_AR_BATCH_LONG_BURST_WAIT_MS")
+        if raw is None or raw == "":
+            return 1000.0
+        try:
+            return max(0.0, min(5000.0, float(raw)))
+        except ValueError:
+            return 1000.0
+
+    def _initial_cohort_wait_s(self, config_dict: dict[str, Any]) -> float:
+        wait_ms = max(0.0, float(config_dict["batch_wait_ms"]))
+        with self._condition:
+            pending = [job for job in self._pending if not job.cancel_requested()]
+        if len(pending) >= 2:
+            max_prompt_tokens = max(len(job.prompt_ids) for job in pending)
+            if max_prompt_tokens >= self._long_burst_prompt_tokens():
+                wait_ms = max(wait_ms, self._long_burst_wait_ms())
+        return wait_ms / 1000.0
+
+    @staticmethod
+    def _common_prefix_for_jobs(jobs: list[_BatchedARJob]) -> int:
+        if len(jobs) < 2:
+            return 0
+        prefix = list(jobs[0].prompt_ids)
+        for job in jobs[1:]:
+            prefix = prefix[: common_prefix_len(prefix, job.prompt_ids)]
+            if not prefix:
+                return 0
+        # BatchGenerator expects at least one prompt token after any restored
+        # cache. If prompts are identical, share up to the token before the
+        # generation start token.
+        max_prefix = min(max(0, len(job.prompt_ids) - 1) for job in jobs)
+        return min(len(prefix), max_prefix)
+
+    def _prepare_session_bank_restore(self, job: _BatchedARJob) -> bool:
+        if job.session_bank is None or len(job.prompt_ids) < 2:
+            return False
+        started = time.perf_counter()
+        try:
+            restored = job.session_bank.restore(
+                self.state.runtime,
+                job.prompt_ids,
+                mode=_session_bank_restore_mode(job.session_restore_mode),
+                session_id=job.session_id,
+                template_hash=job.session_template_hash,
+                policy_fingerprint=job.session_policy_fingerprint,
+            )
+        except Exception as exc:
+            job.cache_miss_reason = f"ar_batch_restore_error:{type(exc).__name__}"
+            return False
+        finally:
+            job.prompt_prepare_s += time.perf_counter() - started
+        if restored is None:
+            job.cache_miss_reason = getattr(
+                job.session_bank,
+                "last_miss_reason",
+                job.cache_miss_reason,
+            )
+            return False
+        if not self._cache_supports_batch_history_merge(restored.cache):
+            # mlx-lm BatchGenerator requires history caches to expose merge().
+            # MTPLX's sustained paged KV cache is exact for the serial MTP path
+            # but not mergeable in BatchGenerator yet, so AR batching must treat
+            # this as a miss and prefill from prompt tokens rather than crash.
+            job.cache_miss_reason = "ar_batch_nonmergeable_history_cache"
+            job.request_observability["ar_batch_cache_restore_skipped"] = (
+                "nonmergeable_history_cache"
+            )
+            return False
+        prefix_len = int(restored.entry.prefix_len)
+        if prefix_len <= 0 or prefix_len >= len(job.prompt_ids):
+            # A full-prefix cache does not expose the pre-last-token state that
+            # mlx-lm BatchGenerator needs to start generation. Shared-prefix
+            # preparation below can still help identical concurrent prompts by
+            # prefilling prompt[:-1] once for the cohort.
+            job.cache_miss_reason = "ar_batch_full_prefix_not_insertable"
+            return False
+        job.insert_cache = restored.cache
+        job.insert_all_tokens = list(restored.entry.token_ids)
+        job.insert_prompt_ids = list(job.prompt_ids[prefix_len:])
+        job.cached_tokens = prefix_len
+        job.session_cache_hit = True
+        job.cache_miss_reason = None
+        job.effective_restore_mode = str(restored.restore_mode)
+        job.cache_source = str(getattr(restored, "cache_source", "ram") or "ram")
+        job.ssd_cache_hit = bool(getattr(restored, "ssd_cache_hit", False))
+        job.ssd_cached_tokens = int(getattr(restored, "ssd_cached_tokens", 0) or 0)
+        job.ssd_restore_s = float(getattr(restored, "ssd_restore_s", 0.0) or 0.0)
+        job.ssd_suffix_tokens = max(0, len(job.prompt_ids) - prefix_len)
+        job.request_observability["cache_source"] = job.cache_source
+        job.request_observability["ssd_cache_hit"] = job.ssd_cache_hit
+        job.request_observability["ssd_cached_tokens"] = job.ssd_cached_tokens
+        job.request_observability["ssd_restore_s"] = job.ssd_restore_s
+        job.request_observability["ssd_suffix_tokens"] = job.ssd_suffix_tokens
+        return True
+
+    def _prepare_shared_prefix(self, jobs: list[_BatchedARJob]) -> None:
+        candidates = [
+            job
+            for job in jobs
+            if job.insert_cache is None
+            and not job.cancel_requested()
+            and len(job.prompt_ids) >= 2
+        ]
+        if len(candidates) < 2:
+            return
+        prefix_len = self._common_prefix_for_jobs(candidates)
+        if prefix_len < self._shared_prefix_min_tokens():
+            return
+        prefix_tokens = list(candidates[0].prompt_ids[:prefix_len])
+        if not prefix_tokens:
+            return
+        cache = self.state.runtime.make_cache()
+        if not self._cache_supports_batch_history_merge(cache):
+            for job in candidates:
+                job.request_observability["ar_batch_shared_prefix_skipped"] = (
+                    "nonmergeable_history_cache"
+                )
+            return
+        prepare_started = time.perf_counter()
+        try:
+            import mlx.core as mx
+
+            prefill_started = time.perf_counter()
+            with attention_phase("ar_batch_shared_prefill"):
+                logits = self.state.runtime.forward_ar(
+                    mx.array([prefix_tokens]),
+                    cache=cache,
+                    return_hidden=False,
+                )
+            mx.eval(logits, [entry.state for entry in cache])
+            prefill_s = time.perf_counter() - prefill_started
+            snapshot_started = time.perf_counter()
+            snapshot = snapshot_cache(cache)
+            mx.eval(snapshot.states, snapshot.meta_states)
+            snapshot_s = time.perf_counter() - snapshot_started
+        except Exception as exc:
+            for job in candidates:
+                job.request_observability["ar_batch_shared_prefix_error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+            return
+        bank_stored = False
+        bank_error: str | None = None
+        bank_owner = next(
+            (job for job in candidates if job.session_bank is not None),
+            None,
+        )
+        if bank_owner is not None:
+            try:
+                put_snapshot = getattr(bank_owner.session_bank, "put_snapshot", None)
+                if callable(put_snapshot):
+                    entry = put_snapshot(
+                        runtime=self.state.runtime,
+                        token_ids=prefix_tokens,
+                        cache_snapshot=snapshot,
+                        logits=None,
+                        hidden=None,
+                        session_id=(
+                            "ar_batch_shared:"
+                            + hash_text(f"{prefix_len}:{prefix_tokens[:64]}")
+                        ),
+                        template_hash=bank_owner.session_template_hash,
+                        policy_fingerprint=bank_owner.session_policy_fingerprint,
+                        snapshot_epoch=prefix_len,
+                    )
+                    bank_stored = entry is not None
+            except Exception as exc:
+                bank_error = f"{type(exc).__name__}: {exc}"
+        for index, job in enumerate(candidates):
+            if index == 0:
+                job.insert_cache = cache
+            else:
+                cloned_cache = self.state.runtime.make_cache()
+                restore_cache(cloned_cache, snapshot)
+                job.insert_cache = cloned_cache
+            job.insert_all_tokens = list(prefix_tokens)
+            job.insert_prompt_ids = list(job.prompt_ids[prefix_len:])
+            job.cached_tokens = prefix_len
+            job.session_cache_hit = True
+            job.cache_miss_reason = None
+            job.effective_restore_mode = "ar_batch_shared_prefix"
+            job.cache_source = "ram"
+            job.ssd_cache_hit = False
+            job.ssd_cached_tokens = 0
+            job.ssd_restore_s = 0.0
+            job.ssd_suffix_tokens = 0
+            job.shared_prefix_tokens = prefix_len
+            job.shared_prefix_prefill_s = prefill_s
+            job.shared_prefix_snapshot_s = snapshot_s
+            job.prompt_prepare_s += time.perf_counter() - prepare_started
+            job.request_observability["ar_batch_shared_prefix_tokens"] = prefix_len
+            job.request_observability["ar_batch_shared_prefix_prefill_s"] = prefill_s
+            job.request_observability["ar_batch_shared_prefix_snapshot_s"] = snapshot_s
+            job.request_observability["ar_batch_shared_prefix_bank_stored"] = (
+                bank_stored
+            )
+            job.request_observability["cache_source"] = job.cache_source
+            job.request_observability["ssd_cache_hit"] = False
+            job.request_observability["ssd_cached_tokens"] = 0
+            job.request_observability["ssd_restore_s"] = 0.0
+            job.request_observability["ssd_suffix_tokens"] = 0
+            if bank_error is not None:
+                job.request_observability["ar_batch_shared_prefix_bank_error"] = (
+                    bank_error
+                )
+
+    def _prepare_prompt_inputs(self, jobs: list[_BatchedARJob]) -> None:
+        for job in jobs:
+            self._prepare_session_bank_restore(job)
+        self._prepare_shared_prefix(jobs)
+
+    @staticmethod
+    def _cache_supports_batch_history_merge(cache: list[Any] | None) -> bool:
+        if cache is None:
+            return True
+        return all(hasattr(entry, "merge") for entry in cache)
+
+    def _split_unmergeable_history_batch(
+        self, jobs: list[_BatchedARJob]
+    ) -> tuple[list[_BatchedARJob], list[_BatchedARJob]]:
+        for job in jobs:
+            if job.insert_cache is not None and not self._cache_supports_batch_history_merge(
+                job.insert_cache
+            ):
+                job.insert_cache = None
+                job.insert_all_tokens = []
+                job.insert_prompt_ids = list(job.prompt_ids)
+                job.cached_tokens = 0
+                job.session_cache_hit = False
+                job.cache_source = "none"
+                job.ssd_cache_hit = False
+                job.ssd_cached_tokens = 0
+                job.ssd_restore_s = 0.0
+                job.ssd_suffix_tokens = 0
+                job.effective_restore_mode = "cold"
+                job.cache_miss_reason = "ar_batch_nonmergeable_history_cache"
+                job.request_observability["ar_batch_cache_restore_skipped"] = (
+                    "nonmergeable_history_cache"
+                )
+                job.request_observability["ar_batch_bypass_reason"] = (
+                    "nonmergeable_history_cache"
+                )
+        return jobs, []
+
+    def _admit_pending(self, generator: Any, config_dict: dict[str, Any]) -> None:
+        with self._condition:
+            max_active = max(1, int(config_dict["max_active_requests"]))
+            capacity = max(0, max_active - len(self._active))
+            if capacity <= 0:
+                pending = []
+            else:
+                pending = self._pending[:capacity]
+                del self._pending[:capacity]
+        if not pending:
+            return
+        now = time.perf_counter()
+        cancelled = [job for job in pending if job.cancel_requested()]
+        pending = [job for job in pending if not job.cancel_requested()]
+        for job in cancelled:
+            if not job.future.done():
+                job.future.set_exception(self._cancelled_error(job))
+        pending = [job for job in pending if not job.future.cancelled()]
+        if not pending:
+            return
+        self._prepare_prompt_inputs(pending)
+        pending, requeued = self._split_unmergeable_history_batch(pending)
+        if requeued:
+            with self._condition:
+                self._pending = [*requeued, *self._pending]
+                self._condition.notify_all()
+        for job in pending:
+            job.admitted_s = now
+            job.prefill_started_s = now
+            job.emit_prefill(
+                {
+                    "phase": "started",
+                    "tokens_total": int(len(job.prompt_ids)),
+                    "started_s": now,
+                    "scheduler_lane": "ar_batch",
+                    "request_id": job.request_id,
+                }
+            )
+        uids = generator.insert(
+            [job.insert_prompt_ids for job in pending],
+            max_tokens=[job.max_tokens for job in pending],
+            caches=[job.insert_cache for job in pending],
+            all_tokens=[job.insert_all_tokens for job in pending],
+            samplers=[self._make_sampler(job) for job in pending],
+        )
+        with self._condition:
+            for uid, job in zip(uids, pending):
+                job.uid = int(uid)
+                self._active[int(uid)] = job
+            self._condition.notify_all()
+
+    def _complete_job(self, job: _BatchedARJob, *, finish_reason: str) -> None:
+        if job.future.done():
+            return
+        completed = time.perf_counter()
+        job.completed_s = completed
+        elapsed_s = max(0.0, completed - job.created_s)
+        prompt_eval_time_s = (
+            max(0.0, (job.prefill_done_s or completed) - (job.prefill_started_s or job.created_s))
+            if job.prefill_started_s is not None
+            else 0.0
+        )
+        completion_tokens = len(job.tokens)
+        decode_elapsed_s = max(0.0, elapsed_s - prompt_eval_time_s)
+        decode_tok_s = (
+            completion_tokens / decode_elapsed_s if decode_elapsed_s > 0 else 0.0
+        )
+        stripped_tokens = _strip_terminal_stop(job.tokens, job.stop_token_ids)
+        text = self.state.runtime.tokenizer.decode(stripped_tokens)
+        stats: dict[str, Any] = {
+            "mode": "ar",
+            "generation_mode": "ar",
+            "generated_tokens": int(completion_tokens),
+            "elapsed_s": float(elapsed_s),
+            "tok_s": float(decode_tok_s),
+            "decode_elapsed_s": float(decode_elapsed_s),
+            "decode_tok_s": float(decode_tok_s),
+            "end_to_end_tok_s": (
+                float(completion_tokens) / elapsed_s if elapsed_s > 0 else 0.0
+            ),
+            "target_forward_time_s": float(prompt_eval_time_s + decode_elapsed_s),
+            "prompt_eval_time_s": float(prompt_eval_time_s),
+            "prompt_tps": (
+                len(job.prompt_ids) / prompt_eval_time_s
+                if prompt_eval_time_s > 0 and job.prompt_ids
+                else 0.0
+            ),
+            "prompt_target_prefill_time_s": float(prompt_eval_time_s),
+            "prompt_target_prefill_tok_s": (
+                max(0, len(job.prompt_ids) - int(job.cached_tokens)) / prompt_eval_time_s
+                if prompt_eval_time_s > 0 and job.prompt_ids
+                else 0.0
+            ),
+            "verify_calls": 0,
+            "verify_time_s": 0.0,
+            "accepted_by_depth": [],
+            "drafted_by_depth": [],
+            "draft_time_s": 0.0,
+            "mtp_depth": 0,
+            "requested_mtp_depth": 0,
+            "speculative_depth": 0,
+            "requested_speculative_depth": 0,
+            "cached_tokens": int(job.cached_tokens),
+            "new_prefill_tokens": max(0, len(job.prompt_ids) - int(job.cached_tokens)),
+            "session_cache_hit": bool(job.session_cache_hit),
+            "cache_source": job.cache_source,
+            "ssd_cache_hit": bool(job.ssd_cache_hit),
+            "ssd_cached_tokens": int(job.ssd_cached_tokens),
+            "ssd_restore_s": float(job.ssd_restore_s),
+            "ssd_suffix_tokens": int(job.ssd_suffix_tokens),
+            "cache_miss_reason": job.cache_miss_reason,
+            "session_restore_mode": job.effective_restore_mode,
+            "ar_batch_shared_prefix_tokens": int(job.shared_prefix_tokens),
+            "ar_batch_shared_prefix_prefill_s": float(job.shared_prefix_prefill_s),
+            "ar_batch_shared_prefix_snapshot_s": float(job.shared_prefix_snapshot_s),
+            "ar_batch_prompt_prepare_s": float(job.prompt_prepare_s),
+            "scheduler_lane": "ar_batch",
+            "scheduler_mode": str(getattr(self.state.args, "scheduler_mode", "")),
+            "batching_preset": str(getattr(self.state.args, "batching_preset", "")),
+            "scheduler_policy": _scheduler_policy_label(
+                _scheduler_config_from_args(self.state.args)
+            ),
+            "request_id": job.request_id,
+            "client_label": job.request_observability.get("request_client_label")
+            or job.request_observability.get("request_client_hint")
+            or "openai",
+            "ar_batch_max_observed": int(job.max_batch_size_observed),
+            "active_batch_size": int(job.max_batch_size_observed),
+            "mtp_disabled_reason": job.mtp_disabled_reason,
+            "queue_wait_s": max(
+                0.0, (job.admitted_s or job.created_s) - job.created_s
+            ),
+            "request_started_s": float(job.created_s),
+            "server_seed": int(job.seed),
+        }
+        stats.update(job.request_observability)
+        stats.update(
+            {
+                "cached_tokens": int(job.cached_tokens),
+                "new_prefill_tokens": max(
+                    0, len(job.prompt_ids) - int(job.cached_tokens)
+                ),
+                "session_cache_hit": bool(job.session_cache_hit),
+                "cache_source": job.cache_source,
+                "ssd_cache_hit": bool(job.ssd_cache_hit),
+                "ssd_cached_tokens": int(job.ssd_cached_tokens),
+                "ssd_restore_s": float(job.ssd_restore_s),
+                "ssd_suffix_tokens": int(job.ssd_suffix_tokens),
+                "cache_miss_reason": (
+                    None if job.session_cache_hit else job.cache_miss_reason
+                ),
+                "session_restore_mode": job.effective_restore_mode,
+                "ar_batch_shared_prefix_tokens": int(job.shared_prefix_tokens),
+                "ar_batch_shared_prefix_prefill_s": float(
+                    job.shared_prefix_prefill_s
+                ),
+                "ar_batch_shared_prefix_snapshot_s": float(
+                    job.shared_prefix_snapshot_s
+                ),
+                "ar_batch_prompt_prepare_s": float(job.prompt_prepare_s),
+            }
+        )
+        job.future.set_result(
+            {
+                "text": text,
+                "tokens": list(job.tokens),
+                "stats": stats,
+                "prompt_tokens": len(job.prompt_ids),
+                "completion_tokens": completion_tokens,
+                "elapsed_s": elapsed_s,
+                "tok_s": decode_tok_s,
+                "end_to_end_tok_s": (
+                    completion_tokens / elapsed_s if elapsed_s > 0 else 0.0
+                ),
+                "_final_state": None,
+                "_token_times": list(job.token_times),
+                "_generation_limits": dict(job.generation_limits),
+                "finish_reason": finish_reason,
+            }
+        )
+
+    def _fail_all(self, exc: BaseException) -> None:
+        with self._condition:
+            pending = list(self._pending)
+            active = list(self._active.values())
+            self._pending.clear()
+            self._active.clear()
+            self._last_error = f"{type(exc).__name__}: {exc}"
+        for job in [*pending, *active]:
+            if not job.future.done():
+                job.future.set_exception(exc)
+
+    def _pump(self) -> None:
+        import mlx.core as mx
+        from mlx_lm.generate import BatchGenerator
+
+        config = _scheduler_config_from_args(self.state.args)
+        config_dict = config.to_dict()
+        generator_max_tokens = int(
+            getattr(self.state.args, "max_response_tokens", None)
+            or getattr(self.state, "context_window", 0)
+            or 1
+        )
+        generator = BatchGenerator(
+            self.state.runtime.model,
+            max_tokens=max(1, generator_max_tokens),
+            stop_tokens=self._stop_sequences(),
+            completion_batch_size=max(1, int(config_dict["decode_batch_max"])),
+            prefill_batch_size=max(1, min(2, int(config_dict["decode_batch_max"]))),
+            prefill_step_size=max(1, int(config_dict["prefill_chunk_tokens"])),
+        )
+        idle_deadline_s: float | None = None
+        try:
+            while True:
+                self._wait_for_initial_cohort(config_dict)
+                self._admit_pending(generator, config_dict)
+                with self._condition:
+                    active_count = len(self._active)
+                    pending_count = len(self._pending)
+                if active_count == 0 and pending_count == 0:
+                    if idle_deadline_s is None:
+                        idle_deadline_s = time.perf_counter() + (
+                            max(0.0, float(config_dict["batch_wait_ms"])) / 1000.0
+                        )
+                    if time.perf_counter() >= idle_deadline_s:
+                        return
+                    time.sleep(0.001)
+                    continue
+                idle_deadline_s = None
+                self._remove_cancelled_active(generator)
+                prompt_responses, generation_responses = generator.next()
+                for response in prompt_responses:
+                    with self._condition:
+                        job = self._active.get(int(response.uid))
+                    if job is None:
+                        continue
+                    if bool(getattr(response, "end_of_prompt", False)):
+                        done_s = time.perf_counter()
+                        job.prefill_done_s = done_s
+                        elapsed = max(
+                            0.0,
+                            done_s - (job.prefill_started_s or job.created_s),
+                        )
+                        new_prefill_tokens = max(
+                            0,
+                            int(len(job.prompt_ids)) - int(job.cached_tokens),
+                        )
+                        prefill_tok_s = (
+                            new_prefill_tokens / elapsed
+                            if elapsed > 0 and job.prompt_ids
+                            else None
+                        )
+                        job.emit_prefill(
+                            {
+                                "phase": "completed",
+                                "tokens_total": int(len(job.prompt_ids)),
+                                "new_prefill_tokens": new_prefill_tokens,
+                                "cached_tokens": int(job.cached_tokens),
+                                "elapsed_s": elapsed,
+                                "prompt_eval_time_s": elapsed,
+                                "prefill_tok_s": prefill_tok_s,
+                                "prefill_compute_tok_s": prefill_tok_s,
+                                "prefill_wall_tok_s": prefill_tok_s,
+                                "cache_hit": bool(job.session_cache_hit),
+                                "scheduler_lane": "ar_batch",
+                                "request_id": job.request_id,
+                            }
+                        )
+                batch_size = len(generation_responses)
+                if batch_size:
+                    with self._condition:
+                        self._last_batch_size = int(batch_size)
+                    scheduler = getattr(self.state, "model_scheduler", None)
+                    if scheduler is not None and hasattr(
+                        scheduler, "record_batch_step"
+                    ):
+                        scheduler.record_batch_step(
+                            size=batch_size,
+                            batch_key="ar_batch.decode",
+                        )
+                for response in generation_responses:
+                    uid = int(response.uid)
+                    with self._condition:
+                        job = self._active.get(uid)
+                        active_size = max(1, len(self._active))
+                    if job is None:
+                        continue
+                    if job.cancel_requested():
+                        with self._condition:
+                            self._active.pop(uid, None)
+                        try:
+                            generator.remove([uid])
+                        except BaseException:
+                            pass
+                        if not job.future.done():
+                            job.future.set_exception(self._cancelled_error(job))
+                        continue
+                    job.max_batch_size_observed = max(
+                        job.max_batch_size_observed,
+                        active_size,
+                        batch_size,
+                    )
+                    try:
+                        job.emit_token(int(response.token))
+                    except BaseException as exc:
+                        with self._condition:
+                            self._active.pop(uid, None)
+                        if not job.future.done():
+                            job.future.set_exception(exc)
+                        continue
+                    finish_reason = getattr(response, "finish_reason", None)
+                    if finish_reason is not None:
+                        with self._condition:
+                            self._active.pop(uid, None)
+                        self._complete_job(job, finish_reason=str(finish_reason))
+                mx.eval([])
+        except BaseException as exc:
+            self._fail_all(exc)
+            raise
+        finally:
+            try:
+                generator.close()
+            except BaseException:
+                pass
+            with self._condition:
+                self._pump_scheduled = False
+                if self._pending:
+                    self._pump_scheduled = True
+                    _submit_foreground_model_work(
+                        self.state,
+                        self._pump,
+                        batch_key="ar_batch.pump",
+                    )
+                self._condition.notify_all()
+
+    def _remove_cancelled_active(self, generator: Any) -> None:
+        with self._condition:
+            cancelled = [
+                (uid, job)
+                for uid, job in list(self._active.items())
+                if job.cancel_requested()
+            ]
+            for uid, _job in cancelled:
+                self._active.pop(uid, None)
+        if not cancelled:
+            return
+        try:
+            generator.remove([uid for uid, _job in cancelled])
+        except BaseException:
+            pass
+        for _uid, job in cancelled:
+            if not job.future.done():
+                job.future.set_exception(self._cancelled_error(job))
 
 
 def _submit_idle_postcommit_model_work(
@@ -947,7 +2563,7 @@ def validate_server_security_args(args: argparse.Namespace) -> None:
     if not _is_localhost_bind(getattr(args, "host", None)) and not getattr(
         args, "api_key", None
     ):
-        raise SystemExit("--api-key is required when --host is not localhost")
+        raise SystemExit("--api-key or --api-key-file is required when --host is not localhost")
     if int(getattr(args, "stream_interval", 1)) < 1:
         raise SystemExit("--stream-interval must be >= 1")
     if int(getattr(args, "rate_limit", 0)) < 0:
@@ -962,13 +2578,33 @@ def _request_api_key(request: Request) -> str | None:
     if scheme.lower() == "bearer" and token:
         return token
     api_key = request.headers.get("x-api-key")
-    return api_key or None
+    if api_key:
+        return api_key
+    cookies = getattr(request, "cookies", {}) or {}
+    cookie_key = cookies.get(_BROWSER_AUTH_COOKIE)
+    return cookie_key or None
+
+
+def _request_browser_auth_query_key(request: Request) -> str | None:
+    query_params = getattr(request, "query_params", {}) or {}
+    return query_params.get(_BROWSER_AUTH_QUERY_PARAM) or None
 
 
 def _request_is_authorized(request: Request, configured_api_key: str | None) -> bool:
     if not configured_api_key:
         return True
     candidate = _request_api_key(request)
+    return bool(candidate and secrets.compare_digest(candidate, configured_api_key))
+
+
+def _request_is_browser_auth_bootstrap(
+    request: Request, configured_api_key: str | None
+) -> bool:
+    if not configured_api_key:
+        return True
+    if request.url.path != _BROWSER_AUTH_PATH:
+        return False
+    candidate = _request_browser_auth_query_key(request)
     return bool(candidate and secrets.compare_digest(candidate, configured_api_key))
 
 
@@ -1340,6 +2976,8 @@ def _anthropic_to_chat_request(
         metadata=request.metadata,
         enable_thinking=enable_thinking,
         depth=request.depth,
+        draft_block_size=request.draft_block_size,
+        gemma_draft_block_size=request.gemma_draft_block_size,
         generation_mode=request.generation_mode,
         stream=False,
     )
@@ -1381,14 +3019,28 @@ def _anthropic_stop_reason(
     finish_reason: Any,
     *,
     has_tool_calls: bool,
+    matched_stop: str | None = None,
 ) -> str:
     if has_tool_calls or finish_reason == "tool_calls":
         return "tool_use"
     if finish_reason == "length":
         return "max_tokens"
+    if matched_stop:
+        # A client stop_sequences match must surface as stop_sequence per
+        # the Anthropic wire contract, not as a natural end_turn (QA-117).
+        return "stop_sequence"
     if finish_reason == "stop":
         return "end_turn"
     return "end_turn"
+
+
+def _matched_stop_sequence(openai_payload: dict[str, Any]) -> str | None:
+    stats = openai_payload.get("mtplx_stats")
+    if isinstance(stats, dict):
+        matched = stats.get("stop_sequence_matched")
+        if isinstance(matched, str) and matched:
+            return matched
+    return None
 
 
 def _anthropic_payload_from_openai(openai_payload: dict[str, Any]) -> dict[str, Any]:
@@ -1418,9 +3070,11 @@ def _anthropic_payload_from_openai(openai_payload: dict[str, Any]) -> dict[str, 
         content = [{"type": "text", "text": ""}]
     usage = openai_payload.get("usage") or {}
     finish_reason = choice.get("finish_reason") or "stop"
+    matched_stop = _matched_stop_sequence(openai_payload)
     stop_reason = _anthropic_stop_reason(
         finish_reason,
         has_tool_calls=any(block.get("type") == "tool_use" for block in content),
+        matched_stop=matched_stop,
     )
     return {
         "id": "msg_" + uuid.uuid4().hex,
@@ -1429,7 +3083,7 @@ def _anthropic_payload_from_openai(openai_payload: dict[str, Any]) -> dict[str, 
         "model": openai_payload.get("model"),
         "content": content,
         "stop_reason": stop_reason,
-        "stop_sequence": None,
+        "stop_sequence": matched_stop,
         "usage": {
             "input_tokens": int(usage.get("prompt_tokens") or 0),
             "output_tokens": int(usage.get("completion_tokens") or 0),
@@ -1685,6 +3339,9 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
                     stop_reason = _anthropic_stop_reason(
                         finish_reason,
                         has_tool_calls=opened_tool_block,
+                        matched_stop=_matched_stop_sequence(
+                            {"mtplx_stats": mtplx_stats}
+                        ),
                     )
     finally:
         if hasattr(body_iterator, "aclose"):
@@ -1707,7 +3364,10 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
         yield stop_content_block(empty_index)
     delta_payload: dict[str, Any] = {
         "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "delta": {
+            "stop_reason": stop_reason,
+            "stop_sequence": _matched_stop_sequence({"mtplx_stats": mtplx_stats}),
+        },
         "usage": {"output_tokens": usage["output_tokens"]},
     }
     if mtplx_stats is not None:
@@ -1783,6 +3443,10 @@ _TOOL_PARAMETER_BLOCK_RE = re.compile(
     r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
     re.IGNORECASE | re.DOTALL,
 )
+_TOOL_PARAMETER_TYPE_WRAPPER_RE = re.compile(
+    r"^\s*<([A-Za-z_][\w.-]*)>\s*(.*?)\s*</\1>\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 _INVOKE_TOOL_BLOCK_RE = re.compile(
     r'^\s*<invoke\s+name="([^"]+)">\s*(.*?)\s*</invoke>\s*$',
     re.IGNORECASE | re.DOTALL,
@@ -1801,6 +3465,73 @@ _NAMESPACED_TOOL_CALL_START_RE = re.compile(
     re.IGNORECASE,
 )
 _MTPLX_TOOL_CONTRACT_SENTINEL = "MTPLX tool contract:"
+_MTPLX_NO_TOOL_CONTRACT_SENTINEL = "MTPLX direct reply turn:"
+_MTPLX_SIMPLE_CHAT_SYSTEM_PROMPT = (
+    "You are MTPLX. Answer the latest user message directly and naturally."
+)
+_MTPLX_STEP_LANGUAGE_POLICY_SENTINEL = "MTPLX Step language policy:"
+_MTPLX_STEP_LANGUAGE_POLICY = (
+    f"{_MTPLX_STEP_LANGUAGE_POLICY_SENTINEL} Use English by default. If the "
+    "latest user message is clearly written in another natural language, reply "
+    "in that language; otherwise reply in English. Short greetings such as hi, "
+    "hey, hello, yo, and how are you are English. Never answer in Chinese for "
+    "English or ambiguous input."
+)
+_MTPLX_READ_ONLY_FORCE_ANSWER_SENTINEL = "MTPLX read-only answer turn:"
+_MTPLX_READ_ONLY_FORCE_ANSWER_USER_SENTINEL = (
+    "MTPLX read-only final answer instruction:"
+)
+_MTPLX_READ_ONLY_FORCE_ANSWER_STREAM_MARKER = "<mtplx_final_answer>"
+_MTPLX_READ_ONLY_FORCE_ANSWER_STREAM_MARKER_RE = re.compile(
+    r"<\s*/?\s*mtplx_final_answer\s*/?\s*>",
+    re.IGNORECASE,
+)
+_MTPLX_PI_CONVERGENCE_SENTINEL = "MTPLX Pi convergence turn:"
+_MTPLX_PI_CONVERGENCE_USER_SENTINEL = "MTPLX Pi convergence instruction:"
+_MTPLX_CODING_AGENT_TAIL_SENTINEL = "MTPLX coding-agent tool protocol reminder:"
+_MTPLX_TOOL_RESULT_CONTINUATION_SENTINEL = "MTPLX tool-result continuation:"
+_MTPLX_TOOL_RESULT_CONTINUATION_BLOCK_RE = re.compile(
+    r"\s*<\s*mtplx_tool_result_continuation\s*>.*?</\s*mtplx_tool_result_continuation\s*>\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+_MTPLX_TOOL_RESULT_CONTINUATION_TAG_RE = re.compile(
+    r"</?\s*mtplx_tool_result_continuation\s*>\s*",
+    re.IGNORECASE,
+)
+_OPENAI_BRIDGE_POLICY_VERSION = (
+    "omlx_style:preserve_history:parse_at_completion:tool_digest:v4"
+)
+_MTPLX_TOOL_CONTRACT_POLICY_VERSION = (
+    "soft_schema_contract:native_xml:targeted_reads:post_tool_continue:agent_tail:v11"
+)
+_MTPLX_NO_TOOL_CONTRACT_POLICY_VERSION = "no_tool_direct_reply:v1"
+_MTPLX_OPENCODE_AGENT_CONTRACT_PROFILE = "opencode_agent"
+_MTPLX_READ_ONLY_FORCE_ANSWER_POLICY_VERSION = "read_only_force_answer:v1"
+_MTPLX_PI_CONVERGENCE_POLICY_VERSION = "pi_convergence:v1"
+_NATIVE_TOOL_PROMPT_POLICY_VERSION = "native_template_tools:agent_tail:v7"
+_COMPACT_TOOL_PROMPT_POLICY_VERSION = "compact_tool_contract:schema_free:v1"
+_TOOL_PROMPT_MODE_HYBRID = "hybrid"
+_TOOL_PROMPT_MODE_NATIVE = "native"
+_TOOL_PROMPT_MODE_COMPACT = "compact"
+_TOOL_PROMPT_MODES = {
+    _TOOL_PROMPT_MODE_HYBRID,
+    _TOOL_PROMPT_MODE_NATIVE,
+    _TOOL_PROMPT_MODE_COMPACT,
+}
+_TOOL_CONTRACT_AGENT_CLIENT_HINTS = ("opencode", "pi", "hermes")
+_TOOL_PROMPT_MODE_REQUEST_HEADERS = (
+    "x-mtplx-tool-prompt-mode",
+    "X-MTPLX-Tool-Prompt-Mode",
+)
+_CHAT_TEMPLATE_PROFILE_LOCAL = "local_qwen36"
+_CHAT_TEMPLATE_PROFILE_FROGGERIC = "froggeric_v19"
+_CHAT_TEMPLATE_PROFILE_CUSTOM = "custom"
+_CHAT_TEMPLATE_PROFILE_TOKENIZER = "tokenizer"
+_CHAT_TEMPLATE_PROFILES = {
+    _CHAT_TEMPLATE_PROFILE_LOCAL,
+    _CHAT_TEMPLATE_PROFILE_FROGGERIC,
+    _CHAT_TEMPLATE_PROFILE_TOKENIZER,
+}
 _TOOL_PARSE_COUNTER_KEYS = (
     "tool_parse_success",
     "tool_parse_fallback",
@@ -1819,6 +3550,129 @@ def _tool_protocol_error(message: str) -> HTTPException:
     return HTTPException(status_code=422, detail=f"malformed tool_call: {message}")
 
 
+def _normalize_tool_prompt_mode(value: Any, *, default: str = _TOOL_PROMPT_MODE_HYBRID) -> str:
+    mode = str(value or default).strip().lower()
+    if mode not in _TOOL_PROMPT_MODES:
+        allowed = ", ".join(sorted(_TOOL_PROMPT_MODES))
+        raise ValueError(f"tool_prompt_mode must be one of: {allowed}")
+    return mode
+
+
+def _tool_prompt_mode_from_args(args: argparse.Namespace) -> str:
+    return _normalize_tool_prompt_mode(
+        getattr(args, "tool_prompt_mode", None),
+        default=os.environ.get("MTPLX_TOOL_PROMPT_MODE", _TOOL_PROMPT_MODE_HYBRID),
+    )
+
+
+def _tool_contract_active_for_mode(
+    *,
+    tools_active: bool,
+    tool_prompt_mode: str,
+) -> bool:
+    return bool(
+        tools_active
+        and tool_prompt_mode in {_TOOL_PROMPT_MODE_HYBRID, _TOOL_PROMPT_MODE_COMPACT}
+    )
+
+
+def _template_tools_for_prompt_mode(
+    tools: list[dict[str, Any]] | None,
+    *,
+    tool_prompt_mode: str,
+) -> list[dict[str, Any]] | None:
+    if not tools:
+        return None
+    if _normalize_tool_prompt_mode(tool_prompt_mode) == _TOOL_PROMPT_MODE_COMPACT:
+        return None
+    return tools
+
+
+def _tool_prompt_policy_version(*, tools_active: bool, tool_prompt_mode: str) -> str:
+    return _tool_prompt_policy_version_for_request(
+        tools_active=tools_active,
+        tool_prompt_mode=tool_prompt_mode,
+        no_tools_contract_active=False,
+    )
+
+
+def _tool_prompt_policy_version_for_request(
+    *,
+    tools_active: bool,
+    tool_prompt_mode: str,
+    no_tools_contract_active: bool,
+    read_only_force_answer_contract_active: bool = False,
+    pi_convergence_contract_active: bool = False,
+) -> str:
+    if read_only_force_answer_contract_active and not tools_active:
+        return _MTPLX_READ_ONLY_FORCE_ANSWER_POLICY_VERSION
+    if no_tools_contract_active and not tools_active:
+        return _MTPLX_NO_TOOL_CONTRACT_POLICY_VERSION
+    if not tools_active:
+        return "none"
+    if tool_prompt_mode == _TOOL_PROMPT_MODE_NATIVE:
+        base = _NATIVE_TOOL_PROMPT_POLICY_VERSION
+    elif tool_prompt_mode == _TOOL_PROMPT_MODE_COMPACT:
+        base = _COMPACT_TOOL_PROMPT_POLICY_VERSION
+    else:
+        base = _MTPLX_TOOL_CONTRACT_POLICY_VERSION
+    if pi_convergence_contract_active:
+        return f"{base}+{_MTPLX_PI_CONVERGENCE_POLICY_VERSION}"
+    return base
+
+
+def _normalize_chat_template_profile(value: Any) -> str:
+    profile = str(value or _CHAT_TEMPLATE_PROFILE_LOCAL).strip().lower()
+    if profile not in _CHAT_TEMPLATE_PROFILES:
+        allowed = ", ".join(sorted(_CHAT_TEMPLATE_PROFILES))
+        raise ValueError(f"chat_template_profile must be one of: {allowed}")
+    return profile
+
+
+def _chat_template_profile_path(profile: str) -> Path | None:
+    if profile == _CHAT_TEMPLATE_PROFILE_FROGGERIC:
+        return ROOT / "templates" / "qwen36_froggeric_v19" / "chat_template.jinja"
+    return None
+
+
+def _apply_chat_template_profile(
+    tokenizer: Any,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    explicit_path = str(getattr(args, "chat_template_path", "") or "").strip()
+    requested_profile = _normalize_chat_template_profile(
+        getattr(args, "chat_template_profile", None)
+    )
+    if explicit_path:
+        profile = _CHAT_TEMPLATE_PROFILE_CUSTOM
+        path = Path(explicit_path).expanduser()
+    else:
+        profile = requested_profile
+        path = _chat_template_profile_path(profile)
+
+    report: dict[str, Any] = {
+        "profile": profile,
+        "source": "tokenizer",
+        "path": None,
+        "applied": False,
+    }
+    if path is None:
+        return report
+    if not path.exists():
+        raise RuntimeError(f"chat template profile file is missing: {path}")
+    template = path.read_text(encoding="utf-8")
+    setattr(tokenizer, "chat_template", template)
+    report.update(
+        {
+            "source": "file",
+            "path": str(path),
+            "applied": True,
+            "sha256": hashlib.sha256(template.encode("utf-8")).hexdigest(),
+        }
+    )
+    return report
+
+
 def _tool_protocol_reason(exc: BaseException) -> str:
     detail = getattr(exc, "detail", None)
     text = str(detail if detail is not None else exc)
@@ -1835,6 +3689,189 @@ def _tool_parse_counter_key(reason: str) -> str:
     if "unclosed" in lowered:
         return "unclosed_tool_call"
     return "malformed_tool_call"
+
+
+def _visible_malformed_tool_content(text: str, tokenizer: Any | None) -> str:
+    """Preserve visible prose around malformed tool markup, but never the markup."""
+
+    if not text:
+        return ""
+    tool_filter = OMLXToolCallStreamFilter(tokenizer)
+    filtered = tool_filter.feed(text) + tool_filter.finish()
+    visible = _strip_orphan_tool_control_markup(filtered).strip()
+    if visible and not re.search(r"[A-Za-z0-9]", visible):
+        return ""
+    return visible
+
+
+_ORPHAN_TOOL_EXEC_BLOCK_RE = re.compile(
+    r"<\s*toolExec\b[^>]*>.*?</\s*toolExec\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_ORPHAN_TOOL_CONTROL_TAG_RE = re.compile(
+    r"</?\s*(?:tool_call|toolExec|function|parameter|invoke|result|value|type|func)\b[^>\n]*>"
+    r"|</<result>",
+    re.IGNORECASE,
+)
+_ORPHAN_TOOL_CONTROL_BARE_NAMES = (
+    "tool_call",
+    "toolExec",
+    "function",
+    "parameter",
+    "invoke",
+    "result",
+    "value",
+    "type",
+    "func",
+)
+_ORPHAN_TOOL_CONTROL_BARE_TAG_RE = re.compile(
+    r"(^|[\r\n])[ \t]*/?(?:"
+    + "|".join(re.escape(name) for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES)
+    + r")\b(?:[ \t]*=[^>\r\n]*)?>[ \t]*",
+    re.IGNORECASE,
+)
+_ORPHAN_TOOL_CONTROL_INITIAL_TAG_RE = re.compile(
+    r"^\s*</?\s*(?:"
+    + "|".join(re.escape(name) for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES)
+    + r")\b[^>\n]*>",
+    re.IGNORECASE,
+)
+_ORPHAN_TOOL_CONTROL_INITIAL_BARE_RE = re.compile(
+    r"^\s*/?(?:"
+    + "|".join(re.escape(name) for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES)
+    + r")\b(?:[ \t]*=[^>\r\n]*)?>",
+    re.IGNORECASE,
+)
+
+
+def _strip_orphan_tool_control_markup(text: str) -> str:
+    if not text:
+        return text
+    text = _ORPHAN_TOOL_CONTROL_BARE_TAG_RE.sub(lambda match: match.group(1), text)
+    if "<" in text:
+        text = _ORPHAN_TOOL_EXEC_BLOCK_RE.sub("", text)
+        text = _MTPLX_TOOL_RESULT_CONTINUATION_BLOCK_RE.sub("", text)
+        text = _MTPLX_TOOL_RESULT_CONTINUATION_TAG_RE.sub("", text)
+        text = _ORPHAN_TOOL_CONTROL_TAG_RE.sub("", text)
+        text = _REASONING_CONTROL_TAG_RE.sub("", text)
+    return text
+
+
+def _has_orphan_tool_control_marker(text: str) -> bool:
+    if not text:
+        return False
+    return bool(
+        _ORPHAN_TOOL_CONTROL_TAG_RE.search(text)
+        or _ORPHAN_TOOL_CONTROL_BARE_TAG_RE.search(text)
+    )
+
+
+def _looks_like_tool_control_payload_only(text: str) -> bool:
+    if not _has_orphan_tool_control_marker(text):
+        return False
+    visible = _strip_orphan_tool_control_markup(
+        text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
+    ).strip()
+    if not visible:
+        return True
+    if not re.search(r"[A-Za-z]", visible):
+        return True
+    if "\n" not in visible and not re.search(r"\s", visible) and len(visible) <= 160:
+        return True
+    return False
+
+
+def _tool_fed_degenerate_completion_reason(text: str) -> str | None:
+    cleaned = _strip_mtplx_internal_continuation_markers(
+        _strip_generated_chat_template_sentinels(str(text or ""))
+    )
+    if not cleaned.strip():
+        return "empty_tool_fed_completion"
+    if _looks_like_tool_control_payload_only(cleaned):
+        return "orphan_tool_control_markup"
+    return None
+
+
+def _initial_orphan_tool_control_state(text: str) -> str:
+    """Classify the beginning of streamed text for dangling tool-control residue."""
+
+    if not text:
+        return "hold"
+    stripped = text.lstrip()
+    if not stripped:
+        return "hold"
+    if (
+        _ORPHAN_TOOL_CONTROL_INITIAL_TAG_RE.match(stripped)
+        or _ORPHAN_TOOL_CONTROL_INITIAL_BARE_RE.match(stripped)
+    ):
+        return "orphan"
+    lowered = stripped.lower()
+    partial_markers = [
+        f"</{name.lower()}>"
+        for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES
+    ] + [
+        f"<{name.lower()}"
+        for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES
+    ]
+    if lowered.startswith("<"):
+        if any(marker.startswith(lowered) for marker in partial_markers):
+            return "hold"
+        return "normal"
+    first_line = lowered.splitlines()[0]
+    for name in (name.lower() for name in _ORPHAN_TOOL_CONTROL_BARE_NAMES):
+        if name.startswith(first_line):
+            return "hold"
+        if first_line.startswith(name):
+            rest = first_line[len(name) :]
+            if not rest or rest.isspace():
+                return "hold"
+            rest = rest.lstrip()
+            if rest.startswith("=") and ">" not in rest:
+                return "hold"
+    return "normal"
+
+
+class _InitialOrphanToolControlStreamGuard:
+    """Hold an initial dangling tool fragment until it is safe to emit or drop."""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._mode = "undecided"
+        self.suppressed = False
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        if self._mode == "pass":
+            return text
+        self._buffer += text
+        if self._mode == "orphan":
+            self.suppressed = True
+            return ""
+        state = _initial_orphan_tool_control_state(self._buffer)
+        if state == "hold":
+            return ""
+        if state == "orphan":
+            self._mode = "orphan"
+            self.suppressed = True
+            return ""
+        self._mode = "pass"
+        emitted = self._buffer
+        self._buffer = ""
+        return emitted
+
+    def finish(self) -> str:
+        if not self._buffer:
+            return ""
+        buffered = self._buffer
+        self._buffer = ""
+        if self._mode == "orphan":
+            self.suppressed = True
+            if _looks_like_tool_control_payload_only(buffered):
+                return ""
+            return _strip_orphan_tool_control_markup(buffered)
+        self._mode = "pass"
+        return buffered
 
 
 def _tool_parse_counters_for(state: Any) -> dict[str, int] | None:
@@ -1877,7 +3914,7 @@ def _record_tool_parse_event(
     } or _server_console_enabled(state):
         return
     try:
-        print(
+        _safe_stdout_print(
             json.dumps(
                 {
                     "event": "mtplx_tool_parse_fallback",
@@ -1887,8 +3924,7 @@ def _record_tool_parse_event(
                     "kind": event,
                 },
                 ensure_ascii=False,
-            ),
-            flush=True,
+            )
         )
     except BaseException:
         pass
@@ -1917,15 +3953,20 @@ def _openai_error_content(
     code: str | None = None,
     param: str | None = None,
     error_type: str | None = None,
+    detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "error": {
-            "message": message,
-            "type": error_type or _openai_error_type(status_code),
-            "code": code or str(status_code),
-            "param": param,
-        }
+    error: dict[str, Any] = {
+        "message": message,
+        "type": error_type or _openai_error_type(status_code),
+        "code": code or str(status_code),
+        "param": param,
     }
+    # Structured HTTPException details (restart_required,
+    # unknown_settings, ...) ride along additively so clients can
+    # render them without parsing a repr out of `message`.
+    if detail is not None:
+        error["detail"] = detail
+    return {"error": error}
 
 
 def _tool_spec_name(tool: dict[str, Any]) -> str | None:
@@ -1942,6 +3983,36 @@ def _tool_spec_name(tool: dict[str, Any]) -> str | None:
 
 def _tool_names(tools: list[dict[str, Any]] | None) -> list[str]:
     return [name for tool in (tools or []) if (name := _tool_spec_name(tool))]
+
+
+def _canonical_tool_name_for_model_output(
+    name: str,
+    tools: list[dict[str, Any]],
+) -> str | None:
+    raw = str(name or "").strip()
+    if not raw:
+        return None
+    known = _tool_names(tools)
+    if raw in known:
+        return raw
+    casefolded = {tool_name.casefold(): tool_name for tool_name in known}
+    if canonical := casefolded.get(raw.casefold()):
+        return canonical
+
+    # Qwen sometimes turns OpenCode's `bash` tool into a natural-language
+    # "Shell" label after the user asks for shell/terminal work. Keep this
+    # mapping narrow so unknown tool names still fail loudly.
+    alias_targets = {
+        "shell": ("bash",),
+        "terminal": ("bash",),
+        "sh": ("bash",),
+        "run_shell": ("bash",),
+        "run_command": ("bash",),
+    }
+    for candidate in alias_targets.get(raw.casefold(), ()):
+        if candidate in known:
+            return candidate
+    return None
 
 
 def _tool_json_schema(tool: dict[str, Any]) -> dict[str, Any]:
@@ -2103,64 +4174,749 @@ def _tool_signature(tool: dict[str, Any]) -> str | None:
     return f"{name}({', '.join(parts)})"
 
 
-def _tool_call_example(tools: list[dict[str, Any]]) -> tuple[str, str]:
+def _tool_example_value(schema: Any) -> str:
+    schema_types = _schema_type_names(schema)
+    if "array" in schema_types:
+        return "[]"
+    if "object" in schema_types:
+        return "{}"
+    if "boolean" in schema_types:
+        return "true"
+    if "integer" in schema_types:
+        return "0"
+    if "number" in schema_types:
+        return "0"
+    if "string" in schema_types:
+        return "ARGUMENT_VALUE"
+    return "ARGUMENT_VALUE"
+
+
+def _tool_call_example(tools: list[dict[str, Any]]) -> str:
     if not tools:
-        return "tool_name", "{}"
+        return (
+            "<tool_call>\n"
+            "<function=tool_name>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
     tool = tools[0]
     name = _tool_spec_name(tool) or "tool_name"
     schema = _tool_json_schema(tool)
     properties = schema.get("properties")
     required = schema.get("required")
-    args: dict[str, str] = {}
+    params: list[str] = []
     if isinstance(properties, dict):
         required_names = (
             [str(item) for item in required] if isinstance(required, list) else []
         )
         for prop in (required_names or list(properties))[:3]:
             if prop in properties:
-                label = _schema_type_label(properties.get(prop))
-                args[prop] = f"<{label}>"
-    return name, json.dumps(args, separators=(",", ":"))
+                params.extend(
+                    [
+                        f"<parameter={prop}>",
+                        _tool_example_value(properties.get(prop)),
+                        "</parameter>",
+                    ]
+                )
+    params_text = "\n".join(params)
+    body = f"<function={name}>"
+    if params_text:
+        body = f"{body}\n{params_text}\n</function>"
+    else:
+        body = f"{body}\n</function>"
+    return f"<tool_call>\n{body}\n</tool_call>"
 
 
-def _mtplx_tool_contract_text(tools: list[dict[str, Any]]) -> str:
+def _forced_tool_choice_name(tool_choice: Any) -> str | None:
+    if not isinstance(tool_choice, dict):
+        return None
+    value = tool_choice.get("type") or tool_choice.get("mode")
+    if not isinstance(value, str) or value.strip().lower() != "function":
+        return None
+    function = tool_choice.get("function")
+    if not isinstance(function, dict):
+        return None
+    name = str(function.get("name") or "").strip()
+    return name or None
+
+
+def _tool_choice_policy_signature(tool_choice: Any) -> str:
+    if tool_choice is None:
+        return "auto"
+    if isinstance(tool_choice, str):
+        return tool_choice.strip().lower() or "auto"
+    if isinstance(tool_choice, dict):
+        value = tool_choice.get("type") or tool_choice.get("mode")
+        kind = str(value or "dict").strip().lower() or "dict"
+        forced_name = _forced_tool_choice_name(tool_choice)
+        return f"{kind}:{forced_name}" if forced_name else kind
+    return type(tool_choice).__name__
+
+
+def _forced_tool_contract_clause(tool_choice: Any) -> str:
+    forced_name = _forced_tool_choice_name(tool_choice)
+    if forced_name:
+        return (
+            f" This request requires the `{forced_name}` tool call; reason "
+            "internally if needed, then emit that tool call instead of a "
+            "normal text answer."
+        )
+    if _tool_choice_forces_tools(tool_choice):
+        return (
+            " This request requires one declared tool call; reason internally "
+            "if needed, then emit the tool call instead of a normal text answer."
+        )
+    return ""
+
+
+def _mtplx_tool_contract_text(
+    tools: list[dict[str, Any]],
+    *,
+    tool_choice: Any = None,
+) -> str:
     signatures = [signature for tool in tools if (signature := _tool_signature(tool))]
     allowed = "; ".join(signatures) if signatures else "(none)"
-    example_name, example_args = _tool_call_example(tools)
+    example = _tool_call_example(tools)
     if len(allowed) > 1200:
         allowed = allowed[:1197].rstrip() + "..."
+    forced_clause = _forced_tool_contract_clause(tool_choice)
     return (
         f"{_MTPLX_TOOL_CONTRACT_SENTINEL} declared tools and schemas: {allowed}. "
         "Call only these exact tool names and exact argument keys/case. "
         "Include every required key shown in the signature. "
-        f'Emit one tool call as <tool_call>{{"name":"{example_name}","arguments":{example_args}}}</tool_call>. '
+        "For large files, search first and use the smallest read range/limit/offset "
+        "the declared read tool supports. "
+        "Emit tool calls using the Qwen native XML format shown by the chat template, "
+        f"for example: {example}. Do not put a JSON object inside <tool_call>. "
+        "Do not put full file contents, code blocks, patches, or implementation "
+        "output in reasoning/thinking. When creating or editing files, emit the "
+        "declared write/edit tool call with the file content as tool arguments. "
         "Never invent Agent/task/Explore or any undeclared tool. "
         "If no declared tool applies, answer normally."
+        f"{forced_clause}"
     )
+
+
+def _mtplx_no_tool_contract_text() -> str:
+    return (
+        f"{_MTPLX_NO_TOOL_CONTRACT_SENTINEL} tools are unavailable for this "
+        "turn. Start with the final user-facing answer to the latest user "
+        "message. For greetings, answer with one short friendly sentence. No "
+        "markdown lists, analysis, examples, commands, searches, file actions, "
+        "tool names, or protocol tags. Do not emit <tool_call>, <toolExec>, "
+        "<invoke>, <function>, or <parameter>."
+    )
+
+
+def _with_mtplx_no_tool_contract(
+    messages: list[ChatMessage],
+) -> list[ChatMessage]:
+    contract = _mtplx_no_tool_contract_text()
+    if not messages:
+        return [ChatMessage(role="system", content=contract)]
+    updated = list(messages)
+    first = updated[0]
+    if str(first.role).lower() == "system":
+        content = str(first.content or "")
+        if _MTPLX_NO_TOOL_CONTRACT_SENTINEL not in content:
+            updated[0] = _copy_chat_message(
+                first,
+                content=(f"{content.rstrip()}\n\n{contract}" if content else contract),
+            )
+        return updated
+    return [ChatMessage(role="system", content=contract), *updated]
+
+
+def _mtplx_read_only_force_answer_contract_text() -> str:
+    return (
+        f"{_MTPLX_READ_ONLY_FORCE_ANSWER_SENTINEL} tools are intentionally "
+        "closed for this read-only inspection because enough project evidence "
+        "has already been gathered. Answer the latest user request now from "
+        "the prior tool results and conversation evidence. Do not emit tool "
+        "calls, tool names, protocol tags, filePath/startLine/endingLine "
+        "markup, or promises such as 'let me read', 'let me check', or "
+        "'I'll inspect'. Do not request more context. If a detail is uncertain, "
+        "name the uncertainty briefly and still give the best supported "
+        "answer. If the user requested a fixed number of findings or changes, "
+        "return exactly that number of items and any requested marker; do not "
+        "add evidence inventory, planning preambles, recap tables, duplicate "
+        "summaries, or extra sections unless the user asked for them. Markdown "
+        "lists are allowed when they are the clearest way to satisfy the "
+        "requested answer."
+    )
+
+
+def _mtplx_read_only_force_answer_user_instruction_text() -> str:
+    return (
+        f"{_MTPLX_READ_ONLY_FORCE_ANSWER_USER_SENTINEL} This read-only "
+        "inspection is now closed to more tools. The only valid next assistant "
+        "turn is the final user-facing answer. Do not write planning text that "
+        "requests more inspection. Do not emit raw tool markup such as "
+        "glob> path>, grep> path>, read> filePath>, filePath>, startingLine>, "
+        "endingLine>, <tool_call>, <function>, or <parameter>. Return the "
+        "requested final answer from the evidence already gathered, with the "
+        "requested number of items and marker. Begin the assistant content "
+        f"with the exact internal marker {_MTPLX_READ_ONLY_FORCE_ANSWER_STREAM_MARKER} "
+        "and then the answer itself; MTPLX removes that marker before the user "
+        "sees it. Do not include an evidence inventory, checklist, or "
+        "rehearsal before the final answer."
+    )
+
+
+def _with_mtplx_read_only_force_answer_contract(
+    messages: list[ChatMessage],
+) -> list[ChatMessage]:
+    contract = _mtplx_read_only_force_answer_contract_text()
+    user_instruction = _mtplx_read_only_force_answer_user_instruction_text()
+    final_instruction = f"{contract}\n\n{user_instruction}"
+    if not messages:
+        return [ChatMessage(role="user", content=final_instruction)]
+    updated = list(messages)
+    if not any(
+        _MTPLX_READ_ONLY_FORCE_ANSWER_USER_SENTINEL in str(message.content or "")
+        for message in updated
+    ):
+        updated.append(ChatMessage(role="user", content=final_instruction))
+    return updated
+
+
+def _pi_convergence_after_tools() -> int:
+    return max(0, _env_int("MTPLX_PI_CONVERGENCE_AFTER_TOOLS", 14))
+
+
+def _request_should_add_pi_convergence_contract(
+    messages: list[ChatMessage],
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+    tools_active: bool,
+) -> bool:
+    if not tools_active:
+        return False
+    client_hint = str(_request_client_hint_from_headers(headers, metadata) or "").lower()
+    if "pi" not in client_hint:
+        return False
+    limit = _pi_convergence_after_tools()
+    if limit <= 0:
+        return False
+    return _tool_result_message_count(messages) >= limit
+
+
+def _mtplx_pi_convergence_contract_text() -> str:
+    return (
+        f"{_MTPLX_PI_CONVERGENCE_SENTINEL} this Pi coding task has enough "
+        "tool evidence. The next assistant turn must converge: either emit "
+        "one edit/write tool call for the safest useful change, emit one bash "
+        "tool call that verifies the chosen change, or give the final answer "
+        "if no safe edit is warranted. Do not call grep, find, ls, cat, wc, "
+        "or broad inspection-only bash commands. A single targeted read or "
+        "sed/head/tail range is allowed only when an edit failed or a compiler "
+        "line number is needed to construct exact edit text; after that, edit "
+        "or verify immediately. Do not say 'let me read', 'let me check', or "
+        "promise more inspection. If a detail is uncertain, name the "
+        "uncertainty briefly and still choose the best supported next step "
+        "from the evidence already gathered."
+    )
+
+
+def _mtplx_pi_convergence_user_instruction_text() -> str:
+    return (
+        f"{_MTPLX_PI_CONVERGENCE_USER_SENTINEL} Stop gathering more project "
+        "context now. Use the evidence already gathered to edit, verify, or "
+        "finish. The next response must not be another broad read/grep/find/ls "
+        "or inspection-only shell command; only one narrow line-range refresh "
+        "is allowed when it is necessary to make the edit apply."
+    )
+
+
+def _with_mtplx_pi_convergence_contract(
+    messages: list[ChatMessage],
+) -> list[ChatMessage]:
+    contract = _mtplx_pi_convergence_contract_text()
+    user_instruction = _mtplx_pi_convergence_user_instruction_text()
+    if not messages:
+        return [
+            ChatMessage(role="system", content=contract),
+            ChatMessage(role="user", content=user_instruction),
+        ]
+    updated = list(messages)
+    first = updated[0]
+    if str(first.role).lower() == "system":
+        content = str(first.content or "")
+        if _MTPLX_PI_CONVERGENCE_SENTINEL not in content:
+            updated[0] = _copy_chat_message(
+                first,
+                content=(f"{content.rstrip()}\n\n{contract}" if content else contract),
+            )
+    else:
+        updated = [ChatMessage(role="system", content=contract), *updated]
+    if not any(
+        _MTPLX_PI_CONVERGENCE_USER_SENTINEL in str(message.content or "")
+        for message in updated
+    ):
+        updated.append(ChatMessage(role="user", content=user_instruction))
+    return updated
+
+
+def _mtplx_coding_agent_tail_contract_text(tools: list[dict[str, Any]]) -> str | None:
+    if not _anonymous_coding_agent_tool_request(_tool_names(tools)):
+        return None
+    return (
+        f"{_MTPLX_CODING_AGENT_TAIL_SENTINEL} the user request immediately "
+        "above is the active coding task. If the next step requires inspecting "
+        "files, running commands, editing code, continuing work, or checking "
+        "project status, emit one declared <tool_call> now. Do not end the "
+        "turn with a promise such as 'let me check', 'let me fix this', or "
+        "'I'll run it' unless the same assistant turn also includes the tool "
+        "call. Do not draft full files, code blocks, or patches in reasoning; "
+        "put implementation payloads in the declared tool call arguments. "
+        "For review, evaluation, summarize, or inspect-only tasks, use targeted "
+        "tool calls and then answer once the current evidence covers the entry "
+        "points, relevant definitions, or representative line ranges; do not "
+        "reconstruct full files by walking adjacent read offsets only for "
+        "completeness. For recommendation tasks, choose the best supported "
+        "recommendation and answer once you have enough evidence; do not keep "
+        "reading extra alternatives only to increase confidence. If the user "
+        "asks for one of several files or options, pick the most relevant one "
+        "and stop after that one unless the user explicitly asks to compare all "
+        "of them. When the user asks for a fixed number of findings or changes, "
+        "return that number of items and any requested marker; do not add recap "
+        "tables, duplicate summaries, or extra sections unless the user asked "
+        "for them. "
+        "A user message of 'continue' means continue the active coding "
+        "task, not answer conversationally. Return text only when it contains "
+        "concrete results and no tool is needed."
+    )
+
+
+def _should_add_mtplx_coding_agent_tail_contract(
+    normalized: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]],
+) -> bool:
+    if not _anonymous_coding_agent_tool_request(_tool_names(tools)):
+        return False
+    last_user = _last_user_text(normalized)
+    if _is_simple_chitchat_text(last_user):
+        return False
+    return True
+
+
+def _mtplx_tool_result_continuation_hint_text() -> str:
+    return (
+        "Continue the active coding task using the tool result immediately "
+        "above. This instruction is not part of the tool output and must not "
+        "be quoted or discussed. If the original user request explicitly lists "
+        "required commands, files, checks, or says to use tools in a specific "
+        "order, emit the next required tool call until those concrete "
+        "requirements are complete. For read-only inspection, review, audit, "
+        "or recommendation tasks, answer as soon as the current evidence can "
+        "support a concrete result; do not read adjacent ranges, whole files, "
+        "or extra candidate files only to increase confidence. If the user "
+        "asks for one of several files or options, choose the most relevant "
+        "one and answer after inspecting it unless the request explicitly asks "
+        "to compare all of them. When the user asks for a fixed number of "
+        "findings or changes, return that number of items and any requested "
+        "marker; skip recap tables and duplicate summaries unless the user "
+        "asked for them. Otherwise answer now in normal assistant "
+        "text. Do not answer with a bare checklist number, partial label, "
+        "placeholder, promise to continue later, or empty response."
+    )
+
+
+def _strip_mtplx_internal_continuation_markers(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = _MTPLX_TOOL_RESULT_CONTINUATION_BLOCK_RE.sub("", text)
+    cleaned = _MTPLX_TOOL_RESULT_CONTINUATION_TAG_RE.sub("", cleaned)
+    read_only_force_answer_phrases = (
+        _MTPLX_READ_ONLY_FORCE_ANSWER_SENTINEL,
+        _MTPLX_READ_ONLY_FORCE_ANSWER_USER_SENTINEL,
+        _MTPLX_PI_CONVERGENCE_SENTINEL,
+        _MTPLX_PI_CONVERGENCE_USER_SENTINEL,
+        "This read-only inspection is now closed to more tools",
+        "The only valid next assistant turn is the final user-facing answer",
+        "Do not write planning text that requests more inspection",
+        "Return the requested final answer from the evidence already gathered",
+        "Stop gathering more project context now",
+        "The next response must not be another read/grep/find/ls",
+    )
+    if any(phrase in cleaned for phrase in read_only_force_answer_phrases):
+        cleaned = "\n".join(
+            line
+            for line in cleaned.splitlines()
+            if not any(phrase in line for phrase in read_only_force_answer_phrases)
+        )
+    if _MTPLX_TOOL_RESULT_CONTINUATION_SENTINEL not in cleaned:
+        return cleaned
+    kept: list[str] = []
+    skip_phrases = (
+        _MTPLX_TOOL_RESULT_CONTINUATION_SENTINEL,
+        "Internal MTPLX continuation note",
+        "Internal instruction for the next assistant turn",
+        "Do not quote this note",
+        "not part of any tool output",
+        "not part of the tool output",
+        "Use that result as the newest evidence",
+        "Treat the immediately preceding tool result",
+        "For read-only inspection",
+        "A truncated file read is enough",
+        "Use another declared tool call only when",
+        "If the user's latest request explicitly lists",
+        "Otherwise answer now",
+        "likely wrong, not merely less complete",
+        "Do not restate the task",
+        "placeholder, promise to continue later",
+    )
+    for line in cleaned.splitlines():
+        if any(phrase in line for phrase in skip_phrases):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _looks_like_stalled_agent_tool_promise(content: str) -> bool:
+    cleaned = _strip_mtplx_internal_continuation_markers(content).strip()
+    if not cleaned:
+        return False
+    if _looks_like_stalled_agent_preamble(cleaned):
+        return True
+    paragraphs = [part.strip() for part in re.split(r"\n{2,}", cleaned) if part.strip()]
+    tail = paragraphs[-1] if paragraphs else cleaned[-500:]
+    tail = tail.strip()
+    if len(tail) > 700:
+        tail = tail[-700:]
+    promise_re = re.compile(
+        r"(?:^|[.!?\n]\s*)"
+        r"(?:actually,\s*)?"
+        r"(?:(?:now\s+)?let\s+me|i\s+need\s+to|i\s+should|i(?:'ll| will))\s+"
+        r"(?:also\s+)?"
+        r"(?:read|check|verify|run|inspect|look\s+at|open|fix|edit|update|write)"
+        r"\b.{0,220}[.!?:]?$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    if promise_re.search(tail):
+        return True
+    return bool(
+        re.search(
+            r"\b(let me|i need to|i should|i(?:'ll| will))\b.{0,160}\b"
+            r"(read|check|verify|run|inspect|look at|open)\b.{0,120}$",
+            tail,
+            re.IGNORECASE | re.DOTALL,
+        )
+    )
+
+
+_TOOLISH_FORCE_ANSWER_MARKUP_RE = re.compile(
+    r"(<\s*(?:tool_call|toolExec|invoke|function|parameter)\b"
+    r"|</\s*(?:tool_call|toolExec|invoke|function|parameter)\s*>"
+    r"|\b(?:filePath|file_path|startingLine|startLine|endingLine|endLine|limit|offset)\s*>"
+    r"|\b(?:filePath|file_path|startingLine|startLine|endingLine|endLine)\s*[:=]\s*)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_read_only_force_answer_failure(content: str) -> bool:
+    cleaned = _strip_mtplx_internal_continuation_markers(content).strip()
+    if not cleaned:
+        return False
+    if _TOOLISH_FORCE_ANSWER_MARKUP_RE.search(cleaned):
+        return True
+    return _looks_like_stalled_agent_tool_promise(cleaned)
+
+
+_READ_ONLY_FINAL_ANSWER_START_RE = re.compile(
+    r"(?im)^[ \t]*(?:#{1,6}[ \t]+)?"
+    r"(?:[A-Z][A-Z0-9_]{2,48}:|1[.)][ \t]+|(?:risk|finding)[ \t]+1\b)"
+)
+
+
+def _read_only_force_answer_after_stream_marker(content: str) -> tuple[str, int]:
+    match = _MTPLX_READ_ONLY_FORCE_ANSWER_STREAM_MARKER_RE.search(
+        str(content or "")
+    )
+    if match is None:
+        return str(content or ""), 0
+    return str(content or "")[match.end() :].lstrip(), match.end()
+
+
+def _strip_read_only_force_answer_visible_control_tags(content: str) -> str:
+    return (
+        _MTPLX_READ_ONLY_FORCE_ANSWER_STREAM_MARKER_RE.sub("", str(content or ""))
+        .replace(THINK_OPEN, "")
+        .replace(THINK_CLOSE, "")
+        .strip()
+    )
+
+
+def _read_only_force_answer_visible_text(content: str) -> tuple[str, int]:
+    cleaned = _strip_mtplx_internal_continuation_markers(
+        _strip_generated_chat_template_sentinels(str(content or ""))
+    ).strip()
+    if not cleaned:
+        return "", 0
+    marked_visible, marker_stripped_chars = _read_only_force_answer_after_stream_marker(
+        cleaned
+    )
+    if marker_stripped_chars:
+        return (
+            _strip_read_only_force_answer_visible_control_tags(marked_visible),
+            marker_stripped_chars,
+        )
+    reasoning_text, content_text = omlx_extract_thinking(cleaned)
+    visible = "\n\n".join(
+        part.strip()
+        for part in (reasoning_text, content_text)
+        if part and part.strip()
+    ) or cleaned
+    visible = _strip_read_only_force_answer_visible_control_tags(visible)
+    marker_match = re.search(r"(?im)^[ \t]*marker\s*=[^\n\r]+", visible)
+    search_end = marker_match.start() if marker_match else len(visible)
+    candidates = [
+        match.start()
+        for match in _READ_ONLY_FINAL_ANSWER_START_RE.finditer(visible[:search_end])
+    ]
+    if not candidates:
+        return visible, 0
+    start = candidates[-1]
+    return visible[start:].strip(), start
+
+
+def _append_tool_result_continuation_hint(
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]],
+) -> None:
+    if not _anonymous_coding_agent_tool_request(_tool_names(tools)):
+        return
+    if not messages:
+        return
+    last = messages[-1]
+    if last.get("role") != "tool":
+        return
+    if any(
+        "Continue the active coding task using the tool result immediately above"
+        in str(message.get("content") or "")
+        for message in messages
+    ):
+        return
+    hint = _mtplx_tool_result_continuation_hint_text()
+    # Keep this out of the tool result itself. OpenCode displays model
+    # reasoning, and a real app-path QA run showed the model treating an
+    # appended internal note as ambiguous command output. A trailing user
+    # instruction is accepted by Qwen's chat template, preserves the
+    # cache-friendly prefix, and keeps the evidence boundary clean.
+    messages.append({"role": "user", "content": hint})
 
 
 def _with_mtplx_tool_contract(
     normalized: list[dict[str, Any]],
     *,
     tools: list[dict[str, Any]] | None,
+    tool_choice: Any = None,
 ) -> list[dict[str, Any]]:
     if not tools:
         return normalized
-    contract = _mtplx_tool_contract_text(tools)
+    contract = _mtplx_tool_contract_text(tools, tool_choice=tool_choice)
+    tail_contract = (
+        _mtplx_coding_agent_tail_contract_text(tools)
+        if _should_add_mtplx_coding_agent_tail_contract(normalized, tools=tools)
+        else None
+    )
     if not normalized:
         return [{"role": "system", "content": contract}]
     messages = [dict(item) for item in normalized]
+    _append_tool_result_continuation_hint(messages, tools=tools)
     first = messages[0]
     if first.get("role") == "system":
         content = str(first.get("content") or "")
+        additions: list[str] = []
         if _MTPLX_TOOL_CONTRACT_SENTINEL not in content:
-            first["content"] = f"{content.rstrip()}\n\n{contract}".strip()
+            additions.append(contract)
+        if (
+            tail_contract
+            and _MTPLX_CODING_AGENT_TAIL_SENTINEL not in content
+        ):
+            additions.append(tail_contract)
+        if additions:
+            first["content"] = (
+                f"{content.rstrip()}\n\n" + "\n\n".join(additions)
+            ).strip()
         return messages
-    return [{"role": "system", "content": contract}, *messages]
+    system_parts = [contract]
+    if tail_contract:
+        system_parts.append(tail_contract)
+    return [{"role": "system", "content": "\n\n".join(system_parts)}, *messages]
+
+
+def _with_mtplx_native_agent_tail(
+    normalized: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Keep native template tools, but add the coding-agent tool-start nudge.
+
+    Native/oMLX mode should own the actual tool schema and XML format. The
+    extra tail here is only the product guard that prevents coding-agent tasks
+    from stopping at "let me inspect" reasoning without emitting a declared
+    tool call.
+    """
+
+    if not tools:
+        return normalized, False
+    messages = [dict(item) for item in normalized]
+    last_is_tool_result = bool(messages and messages[-1].get("role") == "tool")
+    _append_tool_result_continuation_hint(messages, tools=tools)
+    if last_is_tool_result:
+        return messages, False
+    tail_contract = (
+        _mtplx_coding_agent_tail_contract_text(tools)
+        if _should_add_mtplx_coding_agent_tail_contract(messages, tools=tools)
+        else None
+    )
+    if not tail_contract:
+        return messages, False
+    if not messages:
+        return [{"role": "system", "content": tail_contract}], True
+    first = messages[0]
+    if first.get("role") == "system":
+        content = str(first.get("content") or "")
+        if _MTPLX_CODING_AGENT_TAIL_SENTINEL not in content:
+            first["content"] = (
+                f"{content.rstrip()}\n\n{tail_contract}" if content else tail_contract
+            )
+            return messages, True
+        return messages, False
+    return [{"role": "system", "content": tail_contract}, *messages], True
 
 
 _NO_SUBAGENTS_RE = re.compile(
     r"\bno\s+(?:sub[- ]?agents?|subagents?|sub[- ]?tasks?|agent\s+tasks)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_SUBAGENTS_RE = re.compile(
+    r"\b(?:use|launch|spawn|run|create|delegate(?:\s+to)?|ask)\s+"
+    r"(?:a\s+|an\s+|the\s+)?"
+    r"(?:sub[- ]?agents?|subtasks?|agent\s+tasks?|parallel\s+agents?)\b"
+    r"|\bparallel\s+(?:sub[- ]?agents?|agents?)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_TODO_TOOL_RE = re.compile(
+    r"\b(?:todo|to-do|todos|checklist|task\s+list|write\s+a\s+plan|"
+    r"track\s+(?:tasks|todos)|maintain\s+(?:a\s+)?plan)\b",
+    re.IGNORECASE,
+)
+_SUBAGENT_TOOL_NAMES = {"task"}
+_TODO_TOOL_NAMES = {"todowrite"}
+_MUTATING_FILE_TOOL_NAMES = {
+    "edit",
+    "multi_edit",
+    "patch",
+    "str_replace_editor",
+    "write",
+}
+_STATIC_READ_ONLY_INSPECTION_TOOL_NAMES = {
+    "glob",
+    "grep",
+    "ls",
+    "read",
+    "session_status",
+}
+_STATIC_READ_ONLY_COMMAND_RE = re.compile(
+    r"\b(?:bash|benchmark|command|execute|lint|profile|pytest|run|serve|"
+    r"shell|start|terminal|test|typecheck)\b"
+    r"|\bbuild\s+(?:it|them|this|the|project|app|repo|repository|workspace|"
+    r"target|package)\b"
+    r"|\b(?:npm|pnpm|yarn|bun|uv|python|pytest|swift|xcodebuild|cargo|go|"
+    r"make)\s+(?:run|test|build|check|lint|typecheck|serve|start)\b",
+    re.IGNORECASE,
+)
+_NARROW_READ_ONLY_SHELL_RE = re.compile(
+    r"\b(?:bash|shell|terminal|command)\b|\brun\s+(?:pwd|ls|cat\b)",
+    re.IGNORECASE,
+)
+_NARROW_READ_ONLY_READ_RE = re.compile(
+    r"\b(?:read|inspect|open|view)\b.{0,80}"
+    r"\b(?:[\w.-]+(?:\.[a-z0-9]{1,12})|file|package\.json)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_NARROW_READ_ONLY_ANSWER_RE = re.compile(
+    r"\b(?:answer|respond|reply|report|return|finish|summari[sz]e)\b",
+    re.IGNORECASE,
+)
+_BROAD_READ_ONLY_DISCOVERY_RE = re.compile(
+    r"\b(?:search|find|grep|glob|rg|list|ls|relevant\s+files?|all\s+files?|"
+    r"scan\s+(?:the\s+)?(?:repo|repository|project|workspace))\b",
+    re.IGNORECASE,
+)
+_DEEP_READ_ONLY_DISCOVERY_RE = re.compile(
+    r"\b(?:search|find|grep|glob|rg|relevant\s+files?|all\s+files?|"
+    r"scan\s+(?:the\s+)?(?:repo|repository|project|workspace))\b",
+    re.IGNORECASE,
+)
+_SHALLOW_READ_ONLY_LISTING_RE = re.compile(
+    r"\b(?:list|ls)\s+(?:the\s+)?(?:top[- ]?level|root)\s+"
+    r"(?:files?|entries|directory|contents?)\b",
+    re.IGNORECASE,
+)
+_STATIC_READ_ONLY_REVIEW_RE = re.compile(
+    r"\b(?:audit|code\s+review|evaluate|identify\s+risks?|launch[- ]readiness|"
+    r"quality|release\s+review|review|risks?|strengths?\s+and\s+weaknesses?)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_SINGLE_TOOL_THEN_ANSWER_RE = re.compile(
+    r"\b(?:use|call|run)\b.{0,80}\b(?:exactly\s+)?(?:once|one\s+time)\b"
+    r".{0,120}\b(?:then|after(?:wards)?|and\s+then)\b.{0,80}"
+    r"\b(?:answer|reply|respond|return|finish)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_NARROW_READ_ONLY_TOOL_NAMES = {"bash", "read"}
+
+# Read-budget force-answer turns keep the read-only inspection toolset so the
+# model can still cite evidence, while explicit "use one tool then answer"
+# turns generate tool-free (QA-087/QA-088 contract).
+_READ_ONLY_FORCE_ANSWER_TOOL_NAMES = {"bash", "read", "glob", "grep"}
+_LOCAL_READ_ONLY_PROJECT_RE = re.compile(
+    r"\b(?:project|repo|repository|workspace|codebase|source|files?|package\.json|"
+    r"src/|tests?/|scripts?)\b",
+    re.IGNORECASE,
+)
+_LOCAL_READ_ONLY_ACTION_RE = re.compile(
+    r"\b(?:inspect|read|search|find|grep|glob|rg|list|scan|run|test|build|"
+    r"typecheck|lint|review|audit|evaluate)\b",
+    re.IGNORECASE,
+)
+_REMOTE_OR_INTERACTIVE_TOOL_RE = re.compile(
+    r"\b(?:web|webfetch|browser|internet|online|latest|docs?|documentation|"
+    r"https?://|url|ask|question|clarify|skill)\b",
+    re.IGNORECASE,
+)
+_LOCAL_READ_ONLY_TOOL_NAMES = {
+    "bash",
+    "glob",
+    "grep",
+    "ls",
+    "read",
+    "session_status",
+}
+_NO_FILE_MUTATION_RE = re.compile(
+    r"\b(?:do\s+not|don['’]?t|dont|without)\s+"
+    r"(?:edit|modify|change|write|create|patch|touch)\b.{0,48}"
+    r"\b(?:files?|source|project|repo|repository|workspace|code)\b"
+    r"|\bno\s+(?:file\s+)?(?:edits?|changes?|modifications?|writes?)\b"
+    r"|\b(?:read[- ]only|inspect[- ]only)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_NO_TOOL_USE_RE = re.compile(
+    r"\b(?:do\s+not|don['’]?t|dont|never)\s+"
+    r"(?:use|call|invoke)\s+(?:any\s+)?tools?\b"
+    r"|\bwithout\s+(?:using\s+)?tools?\b"
+    r"|\bno\s+tool\s+calls?\b"
+    r"|\bno\s+tools?\b",
+    re.IGNORECASE,
+)
+_NO_TOOL_USE_EXCEPTION_RE = re.compile(
+    r"\b(?:except|other\s+than|besides|apart\s+from|but\s+use|only\s+use)\b",
     re.IGNORECASE,
 )
 
@@ -2173,13 +4929,239 @@ def _request_disallows_subagents(messages: list[ChatMessage]) -> bool:
     return False
 
 
+def _request_explicitly_allows_subagents(messages: list[ChatMessage]) -> bool:
+    for message in reversed(messages):
+        if str(message.role).lower() != "user":
+            continue
+        return bool(_EXPLICIT_SUBAGENTS_RE.search(_content_to_text(message.content)))
+    return False
+
+
+def _request_explicitly_allows_todo_tool(messages: list[ChatMessage]) -> bool:
+    for message in reversed(messages):
+        if str(message.role).lower() != "user":
+            continue
+        return bool(_EXPLICIT_TODO_TOOL_RE.search(_content_to_text(message.content)))
+    return False
+
+
+def _request_disallows_file_mutation(messages: list[ChatMessage]) -> bool:
+    for message in reversed(messages):
+        if str(message.role).lower() != "user":
+            continue
+        return bool(_NO_FILE_MUTATION_RE.search(_content_to_text(message.content)))
+    return False
+
+
+def _request_disallows_tools(messages: list[ChatMessage]) -> bool:
+    for message in reversed(messages):
+        if str(message.role).lower() != "user":
+            continue
+        text = _content_to_text(message.content)
+        return bool(_NO_TOOL_USE_RE.search(text)) and not bool(
+            _NO_TOOL_USE_EXCEPTION_RE.search(text)
+        )
+    return False
+
+
+def _request_is_static_read_only_inspection(messages: list[ChatMessage]) -> bool:
+    last_user = _last_user_text(messages)
+    if not _is_read_only_inspection_request(last_user):
+        return False
+    return not bool(_STATIC_READ_ONLY_COMMAND_RE.search(last_user))
+
+
+def _static_read_only_inspection_tool_names(
+    messages: list[ChatMessage],
+) -> set[str]:
+    names = set(_STATIC_READ_ONLY_INSPECTION_TOOL_NAMES)
+    if _STATIC_READ_ONLY_REVIEW_RE.search(_last_user_text(messages)):
+        names.add("bash")
+    return names
+
+
+def _read_only_inspection_force_answer_after_tools() -> int:
+    return max(
+        0,
+        _env_int(
+            "MTPLX_READ_ONLY_INSPECTION_FORCE_ANSWER_AFTER_TOOLS",
+            0,
+        ),
+    )
+
+
+def _tool_result_message_count(messages: list[ChatMessage]) -> int:
+    return sum(1 for message in messages if str(message.role).lower() == "tool")
+
+
+def _request_explicit_single_tool_then_answer(messages: list[ChatMessage]) -> bool:
+    return bool(_EXPLICIT_SINGLE_TOOL_THEN_ANSWER_RE.search(_last_user_text(messages)))
+
+
+def _request_should_force_answer_for_read_only_inspection(
+    messages: list[ChatMessage],
+) -> bool:
+    if (
+        _tool_result_message_count(messages) > 0
+        and _request_explicit_single_tool_then_answer(messages)
+    ):
+        return True
+    if not _request_is_static_read_only_inspection(messages):
+        return False
+    limit = _read_only_inspection_force_answer_after_tools()
+    if limit <= 0:
+        return False
+    return _tool_result_message_count(messages) >= limit
+
+
+def _request_is_narrow_read_only_tool_choreography(
+    messages: list[ChatMessage],
+) -> bool:
+    last_user = _last_user_text(messages)
+    if not last_user or not _request_disallows_file_mutation(messages):
+        return False
+    if not _NARROW_READ_ONLY_SHELL_RE.search(last_user):
+        return False
+    if not _NARROW_READ_ONLY_READ_RE.search(last_user):
+        return False
+    if not _NARROW_READ_ONLY_ANSWER_RE.search(last_user):
+        return False
+    if _DEEP_READ_ONLY_DISCOVERY_RE.search(last_user):
+        return False
+    if _BROAD_READ_ONLY_DISCOVERY_RE.search(last_user):
+        return bool(_SHALLOW_READ_ONLY_LISTING_RE.search(last_user))
+    return True
+
+
+def _request_is_local_read_only_project_workflow(
+    messages: list[ChatMessage],
+) -> bool:
+    last_user = _last_user_text(messages)
+    if not last_user or not _request_disallows_file_mutation(messages):
+        return False
+    if not _LOCAL_READ_ONLY_PROJECT_RE.search(last_user):
+        return False
+    if not _LOCAL_READ_ONLY_ACTION_RE.search(last_user):
+        return False
+    return not bool(_REMOTE_OR_INTERACTIVE_TOOL_RE.search(last_user))
+
+
+def _without_tool_specs(
+    tools: list[dict[str, Any]],
+    hidden_names: set[str],
+) -> list[dict[str, Any]]:
+    return [
+        tool
+        for tool in tools
+        if (_tool_spec_name(tool) or "").strip().lower() not in hidden_names
+    ]
+
+
 def _filter_tool_specs_for_request(
     tools: list[dict[str, Any]],
     messages: list[ChatMessage],
+    *,
+    tool_choice: Any = None,
 ) -> list[dict[str, Any]]:
-    if not tools or not _request_disallows_subagents(messages):
+    if not tools:
         return tools
-    return [tool for tool in tools if _tool_spec_name(tool) != "Task"]
+    if _tool_choice_forces_tools(tool_choice):
+        return tools
+    if _request_disallows_tools(messages):
+        return []
+    hidden_tools: set[str] = set()
+    if _request_disallows_subagents(messages):
+        hidden_tools.update(_SUBAGENT_TOOL_NAMES)
+    elif not _request_explicitly_allows_subagents(messages):
+        hidden_tools.update(_SUBAGENT_TOOL_NAMES)
+    if not _request_explicitly_allows_todo_tool(messages):
+        hidden_tools.update(_TODO_TOOL_NAMES)
+    if _request_disallows_file_mutation(messages):
+        hidden_tools.update(_MUTATING_FILE_TOOL_NAMES)
+    if _request_is_narrow_read_only_tool_choreography(messages):
+        requested_names = {
+            (_tool_spec_name(tool) or "").strip().lower()
+            for tool in tools
+        }
+        if requested_names & _NARROW_READ_ONLY_TOOL_NAMES:
+            hidden_tools.update(
+                name
+                for tool in tools
+                if (name := (_tool_spec_name(tool) or "").strip().lower())
+                and name not in _NARROW_READ_ONLY_TOOL_NAMES
+            )
+    elif _request_is_local_read_only_project_workflow(messages):
+        requested_names = {
+            (_tool_spec_name(tool) or "").strip().lower()
+            for tool in tools
+        }
+        if requested_names & _LOCAL_READ_ONLY_TOOL_NAMES:
+            hidden_tools.update(
+                name
+                for tool in tools
+                if (name := (_tool_spec_name(tool) or "").strip().lower())
+                and name not in _LOCAL_READ_ONLY_TOOL_NAMES
+            )
+    if _request_is_static_read_only_inspection(messages):
+        # OpenCode-style "review / evaluate / audit" turns lock the model to
+        # a small read-only inspection toolset. That heuristic only makes
+        # sense for coding-agent clients whose toolset actually includes
+        # those read-only tools. Generic clients that ship a different
+        # toolset (e.g. the MTPLX in-app chat with `web_search` /
+        # `fetch_url`) would otherwise see every tool filtered out — the
+        # model then loses all tool definitions in its prompt and falls
+        # back to emitting `<tool_call>` XML guesses from training. Require
+        # at least one safe-set tool to be present before enforcing the
+        # lockdown.
+        requested_names = {
+            (_tool_spec_name(tool) or "").strip().lower()
+            for tool in tools
+        }
+        static_read_only_tool_names = _static_read_only_inspection_tool_names(messages)
+        if requested_names & static_read_only_tool_names:
+            hidden_tools.update(
+                name
+                for tool in tools
+                if (name := (_tool_spec_name(tool) or "").strip().lower())
+                and name not in static_read_only_tool_names
+            )
+    if hidden_tools:
+        return _without_tool_specs(tools, hidden_tools)
+    return tools
+
+
+def _should_add_no_tool_contract(
+    *,
+    requested_tools: list[dict[str, Any]],
+    tools_active: bool,
+    messages: list[ChatMessage],
+) -> bool:
+    if not requested_tools or tools_active:
+        return False
+    if _is_simple_chitchat_text(_last_user_text(messages)):
+        return False
+    return True
+
+
+def _opencode_prompt_contract_profile(
+    messages: list[ChatMessage],
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+    tool_choice: Any,
+) -> str | None:
+    if not _is_opencode_client(headers=headers, metadata=metadata):
+        return None
+    return _MTPLX_OPENCODE_AGENT_CONTRACT_PROFILE
+
+
+def _opencode_prompt_contract_system_prompt(profile: str | None) -> str | None:
+    # OpenCode owns its agent/system instructions. MTPLX owns runtime policy:
+    # sampler, reasoning, MTP depth, cache identity, and the extra tool contract
+    # reminder injected by _with_mtplx_tool_contract. Replacing OpenCode's
+    # system prompt makes the model look fast while starving it of the actual
+    # agent contract.
+    return None
 
 
 def _normalize_tool_specs(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -2208,6 +5190,21 @@ def _tool_choice_disables_tools(tool_choice: Any) -> bool:
     if isinstance(tool_choice, dict):
         value = tool_choice.get("type") or tool_choice.get("mode")
         return isinstance(value, str) and value.strip().lower() == "none"
+    return False
+
+
+def _tool_choice_forces_tools(tool_choice: Any) -> bool:
+    if tool_choice is None:
+        return False
+    if isinstance(tool_choice, str):
+        return tool_choice.strip().lower() in {"required", "tool", "function"}
+    if isinstance(tool_choice, dict):
+        value = tool_choice.get("type") or tool_choice.get("mode")
+        return isinstance(value, str) and value.strip().lower() in {
+            "function",
+            "tool",
+            "required",
+        }
     return False
 
 
@@ -2274,6 +5271,39 @@ def _json_object_string(value: Any, *, context: str) -> str:
     return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
 
 
+_TOOL_ARGUMENT_PRIMARY_ORDER: dict[str, tuple[str, ...]] = {
+    "read": ("filePath", "path", "offset", "limit"),
+    "grep": ("pattern", "path", "include", "limit"),
+    "glob": ("pattern", "path"),
+    "bash": ("command", "description", "timeout"),
+    "write": ("filePath", "path", "content"),
+    "edit": ("filePath", "path", "oldString", "newString", "replaceAll"),
+    "webfetch": ("url", "format", "timeout"),
+    "skill": ("name",),
+    "question": ("questions",),
+}
+
+
+def _order_tool_arguments_for_client_display(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    if not arguments:
+        return arguments
+    order = _TOOL_ARGUMENT_PRIMARY_ORDER.get(str(tool_name or "").strip().lower())
+    if not order:
+        return arguments
+    ordered: dict[str, Any] = {}
+    for key in order:
+        if key in arguments:
+            ordered[key] = arguments[key]
+    for key, value in arguments.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
 def _schema_type_names(schema: Any) -> set[str]:
     if not isinstance(schema, dict):
         return set()
@@ -2315,6 +5345,41 @@ def _decode_tool_parameter_value(value: str, schema: Any | None = None) -> Any:
     if not text:
         return ""
     schema_types = _schema_type_names(schema)
+    wrapper = _TOOL_PARAMETER_TYPE_WRAPPER_RE.match(text)
+    if wrapper is not None:
+        tag = wrapper.group(1).strip().casefold()
+        expected = {item.casefold() for item in schema_types if item != "null"}
+        placeholder_tags = {
+            "array",
+            "bool",
+            "boolean",
+            "float",
+            "int",
+            "integer",
+            "json",
+            "number",
+            "object",
+            "str",
+            "string",
+            "text",
+            "value",
+        }
+        aliases = {
+            "bool": "boolean",
+            "float": "number",
+            "int": "integer",
+            "json": "object",
+            "str": "string",
+            "text": "string",
+            "value": "string",
+        }
+        normalized_tag = aliases.get(tag, tag)
+        if (
+            tag in placeholder_tags
+            and (not expected or normalized_tag in expected or tag == "value")
+        ):
+            text = wrapper.group(2).strip()
+    text = html.unescape(text)
     if schema_types and schema_types <= {"string", "null"}:
         return text
     try:
@@ -2323,20 +5388,63 @@ def _decode_tool_parameter_value(value: str, schema: Any | None = None) -> Any:
         return text
 
 
+def _normalize_tool_arguments_for_schema(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    tools: list[dict[str, Any]],
+) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key, value in arguments.items():
+        if isinstance(value, str):
+            normalized[key] = _decode_tool_parameter_value(
+                value,
+                schema=_tool_parameter_schema(
+                    tools,
+                    tool_name=tool_name,
+                    parameter_name=str(key),
+                ),
+            )
+        else:
+            normalized[key] = value
+    return _order_tool_arguments_for_client_display(
+        tool_name=tool_name,
+        arguments=normalized,
+    )
+
+
 def _parse_json_tool_call(block: str) -> tuple[str, Any] | None:
     try:
         payload = json.loads(block)
     except json.JSONDecodeError:
         return None
+    if isinstance(payload, list):
+        for item in payload:
+            parsed = _parse_json_tool_call(json.dumps(item, ensure_ascii=False))
+            if parsed is not None:
+                return parsed
+        return None
     if not isinstance(payload, dict):
         raise _tool_protocol_error("JSON tool_call payload must be an object")
     function = payload.get("function")
     if isinstance(function, dict):
-        name = function.get("name")
-        arguments = function.get("arguments", {})
+        name = function.get("name") or function.get("tool") or function.get("function")
+        arguments = (
+            function.get("arguments")
+            if "arguments" in function
+            else function.get("args", function.get("parameters", {}))
+        )
     else:
-        name = payload.get("name")
-        arguments = payload.get("arguments", {})
+        name = (
+            payload.get("name")
+            or payload.get("tool")
+            or payload.get("function")
+            or payload.get("call")
+        )
+        arguments = payload.get(
+            "arguments",
+            payload.get("args", payload.get("parameters", {})),
+        )
     name_text = str(name or "").strip()
     if not name_text:
         raise _tool_protocol_error("JSON tool_call is missing a function name")
@@ -2568,7 +5676,6 @@ def _parse_generated_tool_calls(
     residue = "".join(residue_parts)
     if _tool_like_marker_present(residue, marker_pairs):
         raise _tool_protocol_error("nested or unmatched <tool_call> block")
-    known = {name for tool in tools if (name := _tool_spec_name(tool))}
     calls: list[dict[str, Any]] = []
     for index, (_start, _end, block, parsed) in enumerate(envelopes):
         if parsed is None:
@@ -2579,14 +5686,20 @@ def _parse_generated_tool_calls(
         if parsed is None:
             raise _tool_protocol_error("unsupported tool_call payload format")
         name, arguments = parsed
-        if name not in known:
+        canonical_name = _canonical_tool_name_for_model_output(name, tools)
+        if canonical_name is None:
             raise _tool_protocol_error(f"unknown tool '{name}'")
         arguments_value = _json_object_value(
             arguments,
             context=f"tool_call[{index}]",
         )
+        arguments_value = _normalize_tool_arguments_for_schema(
+            tool_name=canonical_name,
+            arguments=arguments_value,
+            tools=tools,
+        )
         _validate_tool_arguments_for_schema(
-            tool_name=name,
+            tool_name=canonical_name,
             arguments=arguments_value,
             tools=tools,
             context=f"tool_call[{index}]",
@@ -2596,7 +5709,7 @@ def _parse_generated_tool_calls(
                 "id": f"call_{uuid.uuid4().hex[:24]}",
                 "type": "function",
                 "function": {
-                    "name": name,
+                    "name": canonical_name,
                     "arguments": json.dumps(
                         arguments_value,
                         ensure_ascii=False,
@@ -2749,10 +5862,12 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
         *,
         tools: list[dict[str, Any]],
         call_index: int = 0,
+        repair_unclosed_complete: bool = True,
     ) -> None:
         self._tools = tools
         self._known = {name for tool in tools if (name := _tool_spec_name(tool))}
         self._call_index = int(call_index)
+        self._repair_unclosed_complete = bool(repair_unclosed_complete)
         self._call_id = f"call_{uuid.uuid4().hex[:24]}"
         self._buf = ""
         self._raw = ""
@@ -2788,7 +5903,21 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
     def remaining_text(self) -> str:
         return self._remaining_text
 
+    @property
+    def in_known_tool_parameter(self) -> bool:
+        return (
+            bool(self._started)
+            and bool(self._name)
+            and self._name in self._known
+            and self._stage == "in_parameter"
+        )
+
     def _finish_call(self, deltas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self._params = _normalize_tool_arguments_for_schema(
+            tool_name=str(self._name or ""),
+            arguments=self._params,
+            tools=self._tools,
+        )
         try:
             _validate_tool_arguments_for_schema(
                 tool_name=str(self._name or ""),
@@ -2847,10 +5976,14 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                 if not name:
                     self._fallback_reason = "tool_call function is missing a name"
                     return deltas
-                if name not in self._known:
+                canonical_name = _canonical_tool_name_for_model_output(
+                    name,
+                    self._tools,
+                )
+                if canonical_name is None:
                     self._fallback_reason = f"unknown tool '{name}'"
                     return deltas
-                self._name = name
+                self._name = canonical_name
                 self._started = True
                 self._buf = self._buf[function_end + 1 :]
                 self._stage = "find_parameter"
@@ -2938,11 +6071,9 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
         deltas = self.feed("")
         if self._done or self._fallback_reason:
             return deltas
-        if (
-            self._started
-            and self._name
-            and self._stage in {"find_parameter", "after_function"}
-            and (self._stage == "after_function" or bool(self._params))
+        if self._repair_unclosed_complete and self._started and self._name and (
+            self._stage == "after_function"
+            or (self._stage == "find_parameter" and bool(self._params))
         ):
             return self._finish_call(deltas)
         if self._started:
@@ -2962,10 +6093,12 @@ class _BufferedFallbackToolCallParser(_ToolCallStreamParser):
         tools: list[dict[str, Any]],
         argument_chunk_chars: int,
         tokenizer: Any | None = None,
+        repair_unclosed_complete: bool = True,
     ) -> None:
         self._tools = tools
         self._argument_chunk_chars = max(1, int(argument_chunk_chars))
         self._tokenizer = tokenizer
+        self._repair_unclosed_complete = bool(repair_unclosed_complete)
         self._raw = ""
         self._tool_calls: list[dict[str, Any]] | None = None
         self._fallback_reason: str | None = None
@@ -3019,10 +6152,12 @@ class _ToolAwareContentStreamTranslator:
         tools: list[dict[str, Any]],
         argument_chunk_chars: int,
         tokenizer: Any | None = None,
+        repair_unclosed_complete: bool = True,
     ) -> None:
         self._tools = tools
         self._argument_chunk_chars = max(1, int(argument_chunk_chars))
         self._tokenizer = tokenizer
+        self._repair_unclosed_complete = bool(repair_unclosed_complete)
         self._marker_pairs = _tool_marker_pairs_from_tokenizer(tokenizer)
         self._pending = ""
         self._trailing = ""
@@ -3032,10 +6167,84 @@ class _ToolAwareContentStreamTranslator:
         self.fallback_reason: str | None = None
         self.tool_parser_dialect: str | None = None
         self._suppress_remaining_tool_text = False
+        self._emitted_tool_deltas = False
+        self._suppressed_tool_markup = False
 
     @property
     def has_tool_calls(self) -> bool:
         return bool(self.tool_calls)
+
+    @property
+    def has_emitted_tool_deltas(self) -> bool:
+        return self._emitted_tool_deltas
+
+    @property
+    def suppressed_tool_markup(self) -> bool:
+        return self._suppressed_tool_markup
+
+    @property
+    def buffering_tool_call(self) -> bool:
+        return self._mode == "tool" or self._tool_parser is not None
+
+    @property
+    def tool_argument_in_progress(self) -> bool:
+        parser = self._tool_parser
+        return bool(getattr(parser, "in_known_tool_parameter", False))
+
+    @property
+    def ready_to_finish_tool_turn(self) -> bool:
+        """A valid tool-call assistant turn has reached a protocol boundary.
+
+        OpenAI clients do not need the model to keep free-running after it has
+        emitted a complete tool-call message. Once the current parser is done
+        and only whitespace remains, the server can finish the stream with
+        ``finish_reason=tool_calls`` and cancel further generation. This is not
+        a content guardrail; it is the protocol stop point for tool execution.
+        """
+
+        return (
+            bool(self.tool_calls)
+            and self._mode == "done"
+            and self._tool_parser is None
+            and not self._pending
+            and not self._trailing.strip()
+        )
+
+    @property
+    def invalid_trailing_after_tool_call(self) -> bool:
+        if not self.tool_calls or self._mode != "done" or self._tool_parser is not None:
+            return False
+        trailing = self._trailing.lstrip()
+        if not trailing:
+            return False
+        if self._could_grow_into_marker(trailing):
+            return False
+        if self._find_tool_start(trailing) == 0:
+            return False
+        return True
+
+    def _fallback_raw_tool_text_as_content(
+        self,
+        raw_text: str,
+        *,
+        emitted_tool_deltas: bool,
+    ) -> list[dict[str, Any]]:
+        """Preserve visible prose around malformed tool attempts, never markup."""
+        self._tool_parser = None
+        visible_text = _visible_malformed_tool_content(raw_text, self._tokenizer)
+        if visible_text != raw_text:
+            self._suppressed_tool_markup = True
+        self._mode = "done"
+        self._suppress_remaining_tool_text = True
+        if emitted_tool_deltas or self.tool_calls:
+            return []
+        return [{"content": visible_text}] if visible_text else []
+
+    def _content_delta(self, text: str) -> list[dict[str, Any]]:
+        visible_text = _strip_orphan_tool_control_markup(text)
+        if visible_text != text:
+            self._suppressed_tool_markup = True
+        return [{"content": visible_text}] if visible_text else []
 
     def feed(self, field: str, text: str) -> list[dict[str, Any]]:
         if not text:
@@ -3080,7 +6289,7 @@ class _ToolAwareContentStreamTranslator:
                 if self._mode == "undecided" and not pre.strip():
                     pass
                 else:
-                    deltas.append({"content": pre})
+                    deltas.extend(self._content_delta(pre))
             self._pending = self._pending[idx:]
             self._mode = "tool"
             deltas.extend(self._tool_deltas_if_complete(final=False))
@@ -3110,12 +6319,12 @@ class _ToolAwareContentStreamTranslator:
                 return []
             content = self._pending
             self._pending = ""
-            return [{"content": content}]
+            return self._content_delta(content)
 
         # Emit everything up to the partial-marker tail; hold the tail.
         pre = self._pending[:-held]
         self._pending = self._pending[-held:]
-        return [{"content": pre}]
+        return self._content_delta(pre)
 
     def _find_tool_start(self, text: str) -> int:
         candidates: list[int] = []
@@ -3257,13 +6466,13 @@ class _ToolAwareContentStreamTranslator:
                 trailing = cleaned
                 self._trailing = ""
                 self._mode = "content"
-                return [{"content": trailing}]
+                return self._content_delta(trailing)
             return []
         if self._pending:
             content = self._pending
             self._pending = ""
             self._mode = "content"
-            return [{"content": content}]
+            return self._content_delta(content)
         return []
 
     def _tool_deltas_if_complete(self, *, final: bool) -> list[dict[str, Any]]:
@@ -3271,6 +6480,7 @@ class _ToolAwareContentStreamTranslator:
             self._tool_parser = _QwenXMLToolCallStreamParser(
                 tools=self._tools,
                 call_index=len(self.tool_calls or []),
+                repair_unclosed_complete=self._repair_unclosed_complete,
             )
             self.tool_parser_dialect = self._tool_parser.dialect
         chunk = self._pending
@@ -3279,14 +6489,17 @@ class _ToolAwareContentStreamTranslator:
 
         while True:
             assert self._tool_parser is not None
-            deltas.extend(self._tool_parser.feed(chunk))
+            fed_deltas = self._tool_parser.feed(chunk)
+            if any(delta.get("tool_calls") for delta in fed_deltas):
+                self._emitted_tool_deltas = True
+            deltas.extend(fed_deltas)
             chunk = ""
             if self._tool_parser.fallback_reason:
                 self.fallback_reason = self._tool_parser.fallback_reason
-                self._tool_parser = None
-                self._mode = "done"
-                self._suppress_remaining_tool_text = True
-                return []
+                return self._fallback_raw_tool_text_as_content(
+                    self._tool_parser.raw_text,
+                    emitted_tool_deltas=bool(deltas) or self._emitted_tool_deltas,
+                )
             if self._tool_parser.tool_calls:
                 self.tool_calls = (self.tool_calls or []) + self._tool_parser.tool_calls
                 remaining = getattr(self._tool_parser, "remaining_text", "")
@@ -3299,6 +6512,7 @@ class _ToolAwareContentStreamTranslator:
                     self._tool_parser = _QwenXMLToolCallStreamParser(
                         tools=self._tools,
                         call_index=len(self.tool_calls or []),
+                        repair_unclosed_complete=self._repair_unclosed_complete,
                     )
                     self.tool_parser_dialect = self._tool_parser.dialect
                     chunk = remaining[idx:]
@@ -3307,11 +6521,25 @@ class _ToolAwareContentStreamTranslator:
                 self._trailing += remaining
                 self._mode = "done"
                 return deltas
+            if (
+                not final
+                and _find_casefold(self._tool_parser.raw_text, self._CLOSE_MARKER) >= 0
+                and _find_casefold(self._tool_parser.raw_text, "<function=") < 0
+            ):
+                buffered_deltas = self._complete_buffered_tool_call(
+                    self._tool_parser.raw_text,
+                    emitted_tool_deltas=bool(deltas) or self._emitted_tool_deltas,
+                )
+                if any(delta.get("tool_calls") for delta in buffered_deltas):
+                    self._emitted_tool_deltas = True
+                return deltas + buffered_deltas
             if not final:
                 return deltas
 
             final_deltas = self._tool_parser.finish()
             if final_deltas:
+                if any(delta.get("tool_calls") for delta in final_deltas):
+                    self._emitted_tool_deltas = True
                 deltas.extend(final_deltas)
             if self._tool_parser.tool_calls:
                 self.tool_calls = (self.tool_calls or []) + self._tool_parser.tool_calls
@@ -3325,6 +6553,7 @@ class _ToolAwareContentStreamTranslator:
                     self._tool_parser = _QwenXMLToolCallStreamParser(
                         tools=self._tools,
                         call_index=len(self.tool_calls or []),
+                        repair_unclosed_complete=self._repair_unclosed_complete,
                     )
                     self.tool_parser_dialect = self._tool_parser.dialect
                     chunk = remaining[idx:]
@@ -3335,14 +6564,15 @@ class _ToolAwareContentStreamTranslator:
                 return deltas
             if self._tool_parser.fallback_reason:
                 self.fallback_reason = self._tool_parser.fallback_reason
-                self._tool_parser = None
-                self._mode = "done"
-                self._suppress_remaining_tool_text = True
-                return deltas
+                return deltas + self._fallback_raw_tool_text_as_content(
+                    self._tool_parser.raw_text,
+                    emitted_tool_deltas=bool(deltas) or self._emitted_tool_deltas,
+                )
             buffered = _BufferedFallbackToolCallParser(
                 tools=self._tools,
                 argument_chunk_chars=self._argument_chunk_chars,
                 tokenizer=self._tokenizer,
+                repair_unclosed_complete=self._repair_unclosed_complete,
             )
             self.tool_parser_dialect = buffered.dialect
             buffered.feed(self._tool_parser.raw_text)
@@ -3351,15 +6581,49 @@ class _ToolAwareContentStreamTranslator:
             if buffered.tool_calls:
                 self.tool_calls = (self.tool_calls or []) + buffered.tool_calls
                 self._mode = "done"
+                if any(delta.get("tool_calls") for delta in buffered_deltas):
+                    self._emitted_tool_deltas = True
                 return deltas + buffered_deltas
             if buffered.fallback_reason:
                 self.fallback_reason = buffered.fallback_reason
-                self._mode = "done"
-                self._suppress_remaining_tool_text = True
-                return deltas
-            content = buffered.raw_text
-            self._mode = "content"
-            return [{"content": content}]
+                return deltas + self._fallback_raw_tool_text_as_content(
+                    buffered.raw_text,
+                    emitted_tool_deltas=bool(deltas) or self._emitted_tool_deltas,
+                )
+            return deltas + self._fallback_raw_tool_text_as_content(
+                buffered.raw_text,
+                emitted_tool_deltas=bool(deltas) or self._emitted_tool_deltas,
+            )
+
+    def _complete_buffered_tool_call(
+        self,
+        raw_text: str,
+        *,
+        emitted_tool_deltas: bool,
+    ) -> list[dict[str, Any]]:
+        """Parse a closed non-XML tool block at the stream protocol boundary."""
+        buffered = _BufferedFallbackToolCallParser(
+            tools=self._tools,
+            argument_chunk_chars=self._argument_chunk_chars,
+            tokenizer=self._tokenizer,
+            repair_unclosed_complete=self._repair_unclosed_complete,
+        )
+        self.tool_parser_dialect = buffered.dialect
+        buffered.feed(raw_text)
+        buffered_deltas = buffered.finish()
+        self._tool_parser = None
+        if buffered.tool_calls:
+            self.tool_calls = (self.tool_calls or []) + buffered.tool_calls
+            self._mode = "done"
+            return buffered_deltas
+        if buffered.fallback_reason:
+            self.fallback_reason = buffered.fallback_reason
+        else:
+            self.fallback_reason = "unrecognized <tool_call> payload"
+        return self._fallback_raw_tool_text_as_content(
+            raw_text,
+            emitted_tool_deltas=emitted_tool_deltas,
+        )
 
 
 def _template_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
@@ -3388,6 +6652,1830 @@ def _template_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
     if call_id:
         normalized["id"] = str(call_id)
     return normalized
+
+
+def _message_extra_map(message: ChatMessage) -> dict[str, Any]:
+    extra = getattr(message, "model_extra", None)
+    return extra if isinstance(extra, dict) else {}
+
+
+def _message_extra(message: ChatMessage, key: str, default: Any = None) -> Any:
+    value = getattr(message, key, None)
+    if value is not None:
+        return value
+    return _message_extra_map(message).get(key, default)
+
+
+def _copy_chat_message(message: ChatMessage, **updates: Any) -> ChatMessage:
+    try:
+        return message.model_copy(update=updates)
+    except AttributeError:
+        data = message.dict()
+        data.update(updates)
+        return ChatMessage(**data)
+
+
+def _retry_user_key(text: str) -> str | None:
+    key = re.sub(r"\s+", " ", (text or "").strip()).strip().lower()
+    key = key.strip(" \t\r\n")
+    if len(key) < 8 or len(key) > 4_000:
+        return None
+    return key
+
+
+_SIMPLE_CHITCHAT_COMPACT_CANONICAL: dict[str, str] = {
+    "hi": "hi",
+    "hello": "hello",
+    "hey": "hey",
+    "yo": "yo",
+    "sup": "sup",
+    "howdy": "howdy",
+    "hithere": "hi there",
+    "hellothere": "hello there",
+    "heythere": "hey there",
+    "hihowareyou": "hi, how are you?",
+    "hellohowareyou": "hello, how are you?",
+    "heyhowareyou": "hey, how are you?",
+    "hihowyou": "hi, how are you?",
+    "heyhowyou": "hey, how are you?",
+    "hihowareudoing": "hi, how are you doing?",
+    "hihowareyoudoing": "hi, how are you doing?",
+    "heyhowareyoudoing": "hey, how are you doing?",
+    "howareyou": "how are you?",
+    "howareu": "how are you?",
+    "howyou": "how are you?",
+    "howru": "how are you?",
+    "howsitgoing": "how's it going?",
+    "whatsup": "what's up?",
+}
+
+
+def _simple_chitchat_compact_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (text or "").strip().lower())
+
+
+def _collapse_repeated_simple_chitchat_text(text: str) -> str | None:
+    compact = _simple_chitchat_compact_key(text)
+    if not compact or len(compact) > 160:
+        return None
+    for key, canonical in sorted(
+        _SIMPLE_CHITCHAT_COMPACT_CANONICAL.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        if not key or len(compact) <= len(key) or len(compact) % len(key) != 0:
+            continue
+        repeat_count = len(compact) // len(key)
+        if 2 <= repeat_count <= 6 and compact == key * repeat_count:
+            return canonical
+    return None
+
+
+def _is_compact_simple_chitchat_key(compact: str) -> bool:
+    if compact in _SIMPLE_CHITCHAT_COMPACT_CANONICAL:
+        return True
+    return _collapse_repeated_simple_chitchat_text(compact) is not None
+
+
+def _collapse_repeated_user_text(text: str) -> str | None:
+    raw = text or ""
+    stripped = raw.strip()
+    key = _retry_user_key(stripped)
+    if key is not None and len(stripped) >= 16:
+        # OpenCode can persist a cancelled retry as one user part like
+        # "Hi, how are you?Hi, how are you?". Collapse exact tandem repeats
+        # first so the user's original casing/punctuation survives.
+        for split in range(8, len(stripped)):
+            first = stripped[:split].strip()
+            second = stripped[split:].strip()
+            if not first or not second:
+                continue
+            if _retry_user_key(first) == _retry_user_key(second):
+                return first
+    collapsed_chitchat = _collapse_repeated_simple_chitchat_text(stripped)
+    if collapsed_chitchat is not None:
+        return collapsed_chitchat
+    return None
+
+
+def _canonicalize_user_retry_pollution(
+    messages: list[ChatMessage],
+    stats: AgentTranscriptCanonicalization,
+) -> list[ChatMessage]:
+    if not messages:
+        return messages
+    canonical: list[ChatMessage] = []
+    for message in messages:
+        role = str(message.role).lower()
+        candidate = message
+        if role == "user":
+            text = _content_to_text(candidate.content)
+            collapsed = _collapse_repeated_user_text(text)
+            if collapsed is not None:
+                candidate = _copy_chat_message(candidate, content=collapsed)
+                stats.collapsed_repeated_user_messages += 1
+                stats.collapsed_repeated_user_chars += max(0, len(text) - len(collapsed))
+
+        if (
+            role == "user"
+            and canonical
+            and str(canonical[-1].role).lower() == "user"
+        ):
+            previous = canonical[-1]
+            previous_text = _content_to_text(previous.content).strip()
+            current_text = _content_to_text(candidate.content).strip()
+            previous_key = _retry_user_key(previous_text)
+            current_key = _retry_user_key(current_text)
+            if previous_key is not None and previous_key == current_key:
+                canonical[-1] = candidate
+                stats.dropped_duplicate_user_messages += 1
+                stats.dropped_duplicate_user_chars += len(previous_text)
+                continue
+            if _is_simple_chitchat_text(previous_text) and _is_simple_chitchat_text(
+                current_text
+            ):
+                canonical[-1] = candidate
+                stats.dropped_duplicate_user_messages += 1
+                stats.dropped_duplicate_user_chars += len(previous_text)
+                continue
+            if stats.skipped_repeated_assistant_messages:
+                canonical.append(candidate)
+                continue
+            merged = "\n\n".join(part for part in (previous_text, current_text) if part)
+            canonical[-1] = _copy_chat_message(candidate, content=merged)
+            stats.merged_consecutive_user_messages += 1
+            stats.merged_consecutive_user_chars += len(previous_text)
+            continue
+
+        canonical.append(candidate)
+    return canonical
+
+
+def _canonicalize_simple_chitchat_history(
+    messages: list[ChatMessage],
+    stats: AgentTranscriptCanonicalization,
+    *,
+    replace_system_prompt: bool = False,
+) -> list[ChatMessage]:
+    latest_user_index: int | None = None
+    latest_user_text = ""
+    for index, message in enumerate(messages):
+        if str(message.role).lower() != "user":
+            continue
+        latest_user_index = index
+        latest_user_text = _content_to_text(message.content)
+    if latest_user_index is None or not _is_simple_chitchat_text(latest_user_text):
+        return messages
+
+    if replace_system_prompt:
+        system_messages = [
+            message
+            for message in messages[:latest_user_index]
+            if str(message.role).lower() == "system"
+        ]
+        preserved = [
+            ChatMessage(role="system", content=_MTPLX_SIMPLE_CHAT_SYSTEM_PROMPT)
+        ]
+        stats.replaced_simple_chitchat_system_messages += len(system_messages)
+        stats.replaced_simple_chitchat_system_chars += sum(
+            len(_content_to_text(message.content)) for message in system_messages
+        )
+        stats.injected_simple_chitchat_system_chars += len(
+            _MTPLX_SIMPLE_CHAT_SYSTEM_PROMPT
+        )
+    else:
+        preserved = [
+            message
+            for message in messages[:latest_user_index]
+            if str(message.role).lower() == "system"
+        ]
+    preserved.append(messages[latest_user_index])
+    if len(preserved) == len(messages) and not replace_system_prompt:
+        return messages
+
+    preserved_ids = {id(message) for message in preserved}
+    dropped = [message for message in messages if id(message) not in preserved_ids]
+    stats.dropped_simple_chitchat_history_messages += len(dropped)
+    stats.dropped_simple_chitchat_history_chars += sum(
+        len(_content_to_text(message.content)) for message in dropped
+    )
+    return preserved
+
+
+def _replace_client_system_prompt(
+    messages: list[ChatMessage],
+    stats: AgentTranscriptCanonicalization,
+    *,
+    replacement: str | None,
+) -> list[ChatMessage]:
+    if not replacement:
+        return messages
+    first_non_system = 0
+    while first_non_system < len(messages):
+        role = str(messages[first_non_system].role).strip().lower()
+        if role != "system":
+            break
+        first_non_system += 1
+    leading_system = messages[:first_non_system]
+    if (
+        len(leading_system) == 1
+        and _content_to_text(leading_system[0].content) == replacement
+    ):
+        return messages
+    updated = [ChatMessage(role="system", content=replacement), *messages[first_non_system:]]
+    stats.replaced_client_system_messages += len(leading_system)
+    stats.replaced_client_system_chars += sum(
+        len(_content_to_text(message.content)) for message in leading_system
+    )
+    stats.injected_client_system_chars += len(replacement)
+    return updated
+
+
+def _with_backend_chat_policy(
+    state: "ServerState",
+    messages: list[ChatMessage],
+) -> tuple[list[ChatMessage], bool]:
+    backend = _backend_descriptor(state)
+    if backend.model_family != "step":
+        return messages, False
+    if not messages:
+        return [ChatMessage(role="system", content=_MTPLX_STEP_LANGUAGE_POLICY)], True
+
+    updated = list(messages)
+    first = updated[0]
+    if str(first.role).lower() == "system":
+        content = _content_to_text(first.content)
+        if _MTPLX_STEP_LANGUAGE_POLICY_SENTINEL in content:
+            return messages, False
+        updated[0] = _copy_chat_message(
+            first,
+            content=f"{content}\n\n{_MTPLX_STEP_LANGUAGE_POLICY}" if content else _MTPLX_STEP_LANGUAGE_POLICY,
+        )
+        return updated, True
+    return [ChatMessage(role="system", content=_MTPLX_STEP_LANGUAGE_POLICY), *updated], True
+
+
+def _message_declares_aborted_assistant_turn(message: ChatMessage) -> bool:
+    if message.role != "assistant" or message.tool_calls:
+        return False
+    extra = _message_extra_map(message)
+    status_values = [
+        extra.get("status"),
+        extra.get("finish_reason"),
+        extra.get("error"),
+        extra.get("stop_reason"),
+        _message_extra(message, "status"),
+        _message_extra(message, "finish_reason"),
+        _message_extra(message, "error"),
+        _message_extra(message, "stop_reason"),
+    ]
+    for value in status_values:
+        if value is None:
+            continue
+        text = str(value).lower()
+        if text in {"abort", "aborted", "cancel", "cancelled", "error"}:
+            return True
+        if "abort" in text or "cancel" in text or "messageabortederror" in text:
+            return True
+    return False
+
+
+def _looks_like_orphan_chitchat_assistant_turn(
+    messages: list[ChatMessage],
+    index: int,
+) -> bool:
+    message = messages[index]
+    if message.role != "assistant" or message.tool_calls:
+        return False
+    content = _content_to_text(message.content).strip()
+    if not content or len(content) > 96:
+        return False
+    if index <= 0 or index + 1 >= len(messages):
+        return False
+    previous = messages[index - 1]
+    following = messages[index + 1]
+    if previous.role != "user" or following.role != "user":
+        return False
+    return _is_simple_chitchat_text(
+        _content_to_text(previous.content)
+    ) and _is_simple_chitchat_text(_content_to_text(following.content))
+
+
+_AGENT_PREAMBLE_MARKERS = (
+    "let me ",
+    "i'll ",
+    "i will ",
+    "almost there",
+    "checking ",
+    "now let me ",
+    "now fixing",
+)
+_AGENT_ACTION_MARKERS = (
+    "fix",
+    "check",
+    "run",
+    "write",
+    "edit",
+    "update",
+    "continue",
+    "remaining",
+    "errors",
+    "typecheck",
+    "typescript",
+    "build",
+    "parallel",
+    "tool",
+)
+_TOOL_RESULT_COMPACT_THRESHOLD_CHARS = 6_000
+_TOOL_RESULT_COMPACT_HEAD_CHARS = 128
+_TOOL_RESULT_COMPACT_TAIL_CHARS = 128
+_ACTIVE_READ_COMPACT_THRESHOLD_CHARS = 4_000
+_ACTIVE_READ_COMPACT_HEAD_LINES = 16
+_ACTIVE_READ_COMPACT_TAIL_LINES = 8
+_ACTIVE_READ_COMPACT_MAX_LINES = 72
+_ACTIVE_READ_COMPACT_CONTEXT_LINES = 1
+_ACTIVE_READ_INSPECTION_COMPACT_THRESHOLD_CHARS = 1_800
+_ACTIVE_READ_INSPECTION_COMPACT_HEAD_LINES = 2
+_ACTIVE_READ_INSPECTION_COMPACT_TAIL_LINES = 1
+_ACTIVE_READ_INSPECTION_COMPACT_MAX_LINES = 48
+_ACTIVE_READ_INSPECTION_COMPACT_CONTEXT_LINES = 0
+_ACTIVE_READ_INSPECTION_LINE_MAX_CHARS = 180
+_ACTIVE_READ_INSPECTION_TOTAL_MAX_LINES = 96
+_ACTIVE_READ_INSPECTION_MIN_LINES_PER_FILE = 16
+_ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS = 150
+_ACTIVE_TOOL_RESULT_COMPACT_THRESHOLD_CHARS = 4_000
+_ACTIVE_TOOL_RESULT_COMPACT_HEAD_LINES = 8
+_ACTIVE_TOOL_RESULT_COMPACT_TAIL_LINES = 4
+_ACTIVE_TOOL_RESULT_COMPACT_MAX_LINES = 48
+_ACTIVE_TOOL_RESULT_LINE_MAX_CHARS = 280
+_LINE_NUMBERED_CONTENT_RE = re.compile(r"^\s*(\d+):\s?(.*)$")
+_READ_CONTINUATION_HINT_RE = re.compile(
+    r"\(\s*Showing lines\b.*?\bUse offset=\d+\s+to continue\.\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+_READ_ONLY_INSPECTION_REQUEST_RE = re.compile(
+    r"\b("
+    r"review|evaluate|evaluation|assess|audit|inspect|summari[sz]e|"
+    r"quality|strengths?|weaknesses?|improvement\s+plan|diagnos(?:e|is)|"
+    r"identify(?:\s+the)?\s+issue|read-only|look\s+through"
+    r")\b",
+    re.IGNORECASE,
+)
+_READ_ONLY_RECOMMENDATION_REQUEST_RE = re.compile(
+    r"\b(?:what|which)\s+(?:upgrade|upgrades|improvement|improvements|change|changes)\s+"
+    r"(?:(?:do|would)\s+you\s+(?:think\s+)?(?:i|we)\s+should|should\s+(?:i|we))\s+"
+    r"(?:do|make)\b"
+    r"|\b(?:recommend|suggest)\b.{0,80}\b(?:upgrade|upgrades|improvement|improvements|change|changes)\b",
+    re.IGNORECASE,
+)
+_MUTATING_REQUEST_RE = re.compile(
+    r"\b("
+    r"fix|implement|edit|write|create|build|modify|add|remove|delete|"
+    r"refactor|rewrite|generate|install|update|upgrade|change|patch"
+    r")\b",
+    re.IGNORECASE,
+)
+_ACTIVE_READ_PRIORITY_ANCHOR_RE = re.compile(
+    r"\b("
+    r"collid\w*|intersect\w*|distanceTo|raycast\w*|arrow\w*|terrain\w*|"
+    r"obstacle\w*|hit\w*|damage\w*|health\w*|embed\w*|isEmbedded|"
+    r"checkArrowCollisions|checkCollisionWithCharacter|getHeight|"
+    r"addEventListener|touchstart|keydown|visibilitychange|localStorage|"
+    r"requestAnimationFrame|WebGLRenderer|BoxGeometry|MeshStandardMaterial|"
+    r"SphereGeometry|PlaneGeometry|ShaderMaterial|BufferGeometry|PointsMaterial|"
+    r"Clock|MathUtils|Date\.now|clone\(|setPixelRatio|shadowMap|"
+    r"dispose|scene\.remove"
+    r")\b",
+    re.IGNORECASE,
+)
+_ACTIVE_READ_INSPECTION_PRIORITY_ANCHOR_RE = re.compile(
+    r"(?:"
+    r"\bfunction\s+(?:setDifficulty|checkCollision|animate|resetGame|flap|die)\b|"
+    r"\b(?:"
+    r"class|constructor|interface|type|enum|export|public|private|protected|"
+    r"localStorage|addEventListener|touchstart|keydown|resize|visibilitychange|"
+    r"checkCollision|requestAnimationFrame|Clock|getDelta|Date\.now|"
+    r"scene\.remove|dispose|pipes\.splice|pipeRemoveZ|server\.listen|"
+    r"fs\.readFile|path\.join|player|ai|hud|health|damage|arrow|bow|aim|"
+    r"shoot|update|render|state|score|power|difficulty"
+    r")\b"
+    r")",
+    re.IGNORECASE,
+)
+_ACTIVE_READ_INSPECTION_REQUIRED_ANCHOR_RES = (
+    re.compile(r"<meta\s+name=[\"']viewport[\"']", re.IGNORECASE),
+    re.compile(r"<title\b", re.IGNORECASE),
+    re.compile(r"three@|cdn\.jsdelivr", re.IGNORECASE),
+    re.compile(r"\bimportmap\b", re.IGNORECASE),
+    re.compile(r"\bWebGLRenderer\b", re.IGNORECASE),
+    re.compile(r"\bsetPixelRatio\b", re.IGNORECASE),
+    re.compile(r"\bShaderMaterial\b", re.IGNORECASE),
+    re.compile(r"\blocalStorage\b", re.IGNORECASE),
+    re.compile(r"\bpipeRemoveZ\b", re.IGNORECASE),
+    re.compile(r"\bfunction\s+checkCollision\b", re.IGNORECASE),
+    re.compile(r"\bscene\.remove\(pipe\)", re.IGNORECASE),
+    re.compile(r"\bpipes\.splice\b", re.IGNORECASE),
+    re.compile(r"\bparticles\.forEach\(p\s*=>\s*scene\.remove\(p\)\)", re.IGNORECASE),
+    re.compile(r"\bparticles\.length\s*=", re.IGNORECASE),
+    re.compile(r"\bscene\.remove\b|\bdispose\b", re.IGNORECASE),
+    re.compile(r"\btouchstart\b", re.IGNORECASE),
+    re.compile(r"\baddEventListener\s*\(\s*[\"']resize[\"']", re.IGNORECASE),
+    re.compile(r"\bcamera\.aspect\b", re.IGNORECASE),
+    re.compile(r"\bupdateProjectionMatrix\b", re.IGNORECASE),
+    re.compile(r"\brenderer\.setSize\b", re.IGNORECASE),
+    re.compile(r"\brequestAnimationFrame\b", re.IGNORECASE),
+    re.compile(r"\bgetDelta\b", re.IGNORECASE),
+    re.compile(r"\bDate\.now\b", re.IGNORECASE),
+    re.compile(r"for\s*\(\s*let\s+\w+\s*=\s*\w+\.length\s*-\s*1", re.IGNORECASE),
+    re.compile(r"\bfs\.readFile\b|\bpath\.join\b|\bserver\.listen\b", re.IGNORECASE),
+)
+_ACTIVE_READ_INSPECTION_CONTEXT_ANCHOR_RES = (
+    (re.compile(r"\bfunction\s+checkCollision\b", re.IGNORECASE), 5),
+    (re.compile(r"\bkeydown\b", re.IGNORECASE), 3),
+    (re.compile(r"\btouchstart\b", re.IGNORECASE), 3),
+)
+_ACTIVE_READ_ANCHOR_RE = re.compile(
+    r"\b("
+    r"class|constructor|function|interface|type|enum|export|public|private|protected|"
+    r"collid\w*|intersect\w*|distanceTo|raycast\w*|arrow\w*|terrain\w*|"
+    r"player\w*|obstacle\w*|hit\w*|damage\w*|health\w*|embed\w*|"
+    r"isEmbedded|check\w*|update\w*|handle\w*|getHeight|"
+    r"addEventListener|touchstart|keydown|visibilitychange|localStorage|"
+    r"requestAnimationFrame|WebGLRenderer|BoxGeometry|MeshStandardMaterial|"
+    r"SphereGeometry|PlaneGeometry|ShaderMaterial|BufferGeometry|PointsMaterial|"
+    r"Clock|MathUtils|Date\.now|clone\(|setPixelRatio|shadowMap|"
+    r"dispose|scene\.remove"
+    r")\b",
+    re.IGNORECASE,
+)
+_ACTIVE_TOOL_OUTPUT_IMPORTANT_LINE_RE = re.compile(
+    r"(^|/)(src|app|lib|components|pages|packages|Sources|Tests|test|tests)/|"
+    r"\b(Line \d+:|class|function|export|error|warning|failed|failure|"
+    r"exception|traceback|syntaxerror|typeerror|assertionerror|TS\d+|"
+    r"collid\w*|terrain\w*|arrow\w*|obstacle\w*|hit\w*|damage\w*|embed\w*)\b",
+    re.IGNORECASE,
+)
+_ACTIVE_TOOL_OUTPUT_LOW_VALUE_LINE_RE = re.compile(
+    r"(^|/)(node_modules|dist|build|vendor|\.git|DerivedData)/|"
+    r"\.map\b|package-lock\.json|pnpm-lock\.yaml|yarn\.lock",
+    re.IGNORECASE,
+)
+_SOURCE_PATH_EXT_PATTERN = (
+    r"ts|tsx|js|jsx|mjs|cjs|py|swift|html|css|json|yaml|yml|toml|md|"
+    r"sh|zsh|rs|go|java|kt|m|mm|h|hpp|cpp|c|cs|vue|svelte|sql"
+)
+_ACTIVE_TOOL_OUTPUT_PATH_LINE_RES = (
+    re.compile(
+        rf"(?P<path>(?:/|\.{{1,2}}/|[A-Za-z0-9_.-]+/)[^\n:()<>\"'`]+?"
+        rf"\.(?:{_SOURCE_PATH_EXT_PATTERN})):(?P<line>\d+)(?::(?P<col>\d+))?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?P<path>(?:/|\.{{1,2}}/|[A-Za-z0-9_.-]+/)[^\n:()<>\"'`]+?"
+        rf"\.(?:{_SOURCE_PATH_EXT_PATTERN}))\((?P<line>\d+),(?P<col>\d+)\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf'File "(?P<path>[^"\n]+?\.(?:{_SOURCE_PATH_EXT_PATTERN}))", '
+        r"line (?P<line>\d+)",
+        re.IGNORECASE,
+    ),
+)
+_ACTIVE_TOOL_OUTPUT_SOURCE_PATH_RE = re.compile(
+    rf"(?P<path>(?:/|\.{{1,2}}/|[A-Za-z0-9_.-]+/)[^\n:()<>\"'`]+?"
+    rf"\.(?:{_SOURCE_PATH_EXT_PATTERN}))(?=$|[\s:),])",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class _ActiveToolOutputHint:
+    path: str
+    start: int | None
+    end: int | None
+    source_lines: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ReadToolContentMeta:
+    path: str
+    file_type: str
+    line_numbers: frozenset[int]
+    first_line: int | None
+    last_line: int | None
+
+
+def _agent_preamble_key(content: str) -> str:
+    text = _strip_assistant_history_baggage(content or "")
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    text = text.strip(" :-\t\r\n")
+    return text
+
+
+def _looks_like_agent_action_preamble(content: str) -> bool:
+    key = _agent_preamble_key(content)
+    if len(key) < 12 or len(key) > 320:
+        return False
+    return any(marker in key for marker in _AGENT_PREAMBLE_MARKERS) and any(
+        marker in key for marker in _AGENT_ACTION_MARKERS
+    )
+
+
+def _looks_like_repeated_agent_preamble(content: str) -> bool:
+    normalized = _agent_preamble_key(content)
+    if len(normalized) < 160:
+        return False
+    loop_markers = (
+        "let me continue",
+        "write the sky, game, and utils",
+        "fix the sky, game, and utils",
+        "now let me fix",
+        "now fixing all",
+        "almost there",
+    )
+    if any(normalized.count(marker) >= 4 for marker in loop_markers):
+        return True
+
+    fragments = [
+        fragment.strip(" :-")
+        for fragment in re.split(
+            r"[\r\n]+|(?=let me continue:)|(?=now let me )|(?=almost there)",
+            content,
+        )
+        if 16 <= len(fragment.strip()) <= 180
+    ]
+    counts: dict[str, int] = {}
+    for fragment in fragments:
+        key = _agent_preamble_key(fragment)
+        if key:
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return False
+    repeated_fragment, repeated_count = max(counts.items(), key=lambda item: item[1])
+    repeated_chars = len(repeated_fragment) * repeated_count
+    return repeated_count >= 4 and repeated_chars >= max(160, len(normalized) // 3)
+
+
+def _looks_like_stalled_agent_preamble(content: str) -> bool:
+    key = _agent_preamble_key(content)
+    if not key:
+        return False
+    if _looks_like_repeated_agent_preamble(content):
+        return True
+    if not _looks_like_agent_action_preamble(content):
+        return False
+    # This catches visible OpenCode stalls such as "Let me fix this:" or
+    # "I need to remove the duplicates... Let me fix this:" without removing
+    # concrete answers that merely mention a next step.
+    if key.endswith(
+        (
+            ":",
+            "let me fix this",
+            "let me check this",
+            "let me run this",
+            "let me fix all remaining errors",
+            "fix all remaining errors",
+        )
+    ):
+        return True
+    return bool(re.search(r"\b(let me|i(?:'ll| will)|now let me)\b.{0,80}:$", key))
+
+
+def _looks_like_verbatim_tool_output_assistant_dump(content: str) -> bool:
+    text = _strip_assistant_history_baggage(content or "").strip()
+    if len(text) < 1_200:
+        return False
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < 24:
+        return False
+    sampled = lines[: min(96, len(lines))]
+    numbered_count = sum(
+        1 for line in sampled if _LINE_NUMBERED_CONTENT_RE.match(line)
+    )
+    if numbered_count < 20:
+        return False
+    first_is_numbered = bool(_LINE_NUMBERED_CONTENT_RE.match(sampled[0]))
+    return first_is_numbered or numbered_count >= max(20, int(len(sampled) * 0.65))
+
+
+def _is_read_only_inspection_request(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not normalized:
+        return False
+    recommendation_request = bool(
+        _READ_ONLY_RECOMMENDATION_REQUEST_RE.search(normalized)
+    )
+    if not _READ_ONLY_INSPECTION_REQUEST_RE.search(normalized) and not recommendation_request:
+        return False
+    if _MUTATING_REQUEST_RE.search(normalized):
+        return recommendation_request or bool(
+            re.search(
+                r"\b(no edits?|without editing|read-only)\b"
+                r"|\bdo not (?:edit|modify|write|change)\b"
+                r"|\bdon't (?:edit|modify|write|change)\b",
+                normalized,
+            )
+        )
+    return True
+
+
+def _tool_call_arguments(tool_call: dict[str, Any]) -> dict[str, Any]:
+    function = tool_call.get("function")
+    raw_args: Any
+    if isinstance(function, dict):
+        raw_args = function.get("arguments", {})
+    else:
+        raw_args = tool_call.get("arguments", {})
+    if isinstance(raw_args, dict):
+        return dict(raw_args)
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+        except Exception:
+            return {"_raw": raw_args}
+        if isinstance(parsed, dict):
+            return dict(parsed)
+        return {"_raw": raw_args}
+    return {}
+
+
+def _tool_call_name(tool_call: dict[str, Any]) -> str:
+    function = tool_call.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name") or "").strip()
+    return str(tool_call.get("name") or "").strip()
+
+
+def _tool_call_loop_key(tool_call: dict[str, Any]) -> tuple[str, str, str] | None:
+    name = _tool_call_name(tool_call)
+    if not name:
+        return None
+    args = _tool_call_arguments(tool_call)
+    command = str(
+        args.get("command")
+        or args.get("cmd")
+        or args.get("script")
+        or args.get("pattern")
+        or args.get("filePath")
+        or args.get("path")
+        or ""
+    ).strip()
+    if command:
+        key_payload = command
+    else:
+        try:
+            key_payload = json.dumps(args, sort_keys=True, separators=(",", ":"))
+        except TypeError:
+            key_payload = str(args)
+    if not key_payload:
+        return None
+    return name, key_payload, command or key_payload
+
+
+def _tool_result_is_timeout(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    if "timeout" not in lowered and "timed out" not in lowered:
+        return False
+    return (
+        "terminated command after exceeding timeout" in lowered
+        or "command timed out" in lowered
+        or ("<shell_metadata>" in lowered and "timeout" in lowered)
+    )
+
+
+def _compact_repeated_timeout_tool_result_text(
+    text: str,
+    *,
+    tool_name: str,
+    command: str,
+    repeat_count: int,
+) -> str:
+    command_excerpt = html.escape(_compact_tool_excerpt_line(command, 480))
+    output_excerpt = html.escape(_compact_tool_excerpt_line(text.strip(), 900))
+    return (
+        "<mtplx_repeated_timeout_tool_output "
+        f'tool="{html.escape(tool_name)}" repeat_count="{repeat_count}" '
+        f'original_chars="{len(text)}">\n'
+        "[This exact tool call has timed out repeatedly in this session. "
+        "Do not call the same command again unchanged. Change strategy: inspect "
+        "the relevant files/scripts, run a narrower command, increase timeout "
+        "only if that is clearly justified, or explain the blocker concretely.]\n"
+        f"<command>{command_excerpt}</command>\n"
+        f"<latest_output_excerpt>{output_excerpt}</latest_output_excerpt>\n"
+        "</mtplx_repeated_timeout_tool_output>"
+    )
+
+
+def _latest_plain_assistant_answer_index(messages: list[ChatMessage]) -> int | None:
+    latest: int | None = None
+    for index, message in enumerate(messages):
+        if str(message.role).lower() != "assistant" or message.tool_calls:
+            continue
+        if _content_to_text(message.content).strip():
+            latest = index
+    return latest
+
+
+def _latest_assistant_step_index(messages: list[ChatMessage]) -> int | None:
+    latest: int | None = None
+    for index, message in enumerate(messages):
+        if str(message.role).lower() == "assistant":
+            latest = index
+    return latest
+
+
+def _compact_tool_result_text(text: str) -> str | None:
+    threshold = max(
+        1,
+        _env_int(
+            "MTPLX_TOOL_RESULT_COMPACT_THRESHOLD_CHARS",
+            _TOOL_RESULT_COMPACT_THRESHOLD_CHARS,
+        ),
+    )
+    if len(text) <= threshold:
+        return None
+    head_chars = max(
+        0,
+        _env_int("MTPLX_TOOL_RESULT_COMPACT_HEAD_CHARS", _TOOL_RESULT_COMPACT_HEAD_CHARS),
+    )
+    tail_chars = max(
+        0,
+        _env_int("MTPLX_TOOL_RESULT_COMPACT_TAIL_CHARS", _TOOL_RESULT_COMPACT_TAIL_CHARS),
+    )
+    head = text[:head_chars].rstrip() if head_chars else ""
+    tail = text[-tail_chars:].lstrip() if tail_chars else ""
+    omitted = max(0, len(text) - len(head) - len(tail))
+    return (
+        "<mtplx_compacted_tool_output "
+        f"original_chars={len(text)} omitted_chars={omitted}>\n"
+        "[Older tool result abbreviated after a later assistant step already "
+        "digested it. "
+        "Call the tool again with a narrower range if exact omitted text is needed.]\n"
+        f"{head}\n\n"
+        f"... [MTPLX compacted {omitted} older-tool-output characters.] ...\n\n"
+        f"{tail}\n"
+        "</mtplx_compacted_tool_output>"
+    )
+
+
+def _tool_output_anchor(kind: str, *parts: object) -> str:
+    payload = "\x1f".join(str(part) for part in (kind, *parts))
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _line_range_label(start: int | None, end: int | None) -> str:
+    if start is None or end is None:
+        return "unknown"
+    return f"{start}-{end}" if start != end else str(start)
+
+
+def _omitted_line_ranges(
+    kept_lines: list[int],
+    *,
+    first_line: int,
+    last_line: int,
+) -> list[tuple[int, int]]:
+    if not kept_lines or first_line > last_line:
+        return []
+    ranges: list[tuple[int, int]] = []
+    cursor = first_line
+    for line_no in sorted(set(kept_lines)):
+        if line_no < first_line or line_no > last_line:
+            continue
+        if line_no > cursor:
+            ranges.append((cursor, line_no - 1))
+        cursor = max(cursor, line_no + 1)
+    if cursor <= last_line:
+        ranges.append((cursor, last_line))
+    return ranges
+
+
+def _render_next_read_hints(
+    *,
+    path: str,
+    ranges: list[tuple[int, int]],
+    max_hints: int = 4,
+) -> str:
+    if not ranges:
+        return ""
+    safe_path = html.escape(path)
+    lines = ["<next_read_hints>"]
+    for start, end in ranges[:max(1, max_hints)]:
+        limit = max(1, end - start + 1)
+        lines.append(
+            f'<range start="{start}" end="{end}" limit="{limit}">'
+            f'If exact omitted text matters, read filePath="{safe_path}" '
+            f"offset={start} limit={limit}; otherwise synthesize from the "
+            "visible anchors now."
+            "</range>"
+        )
+    if len(ranges) > max_hints:
+        lines.append(
+            f'<more omitted_range_count="{len(ranges) - max_hints}">'
+            "Prefer named symbols or one exact range over rereading the whole file."
+            "</more>"
+        )
+    lines.append("</next_read_hints>")
+    return "\n".join(lines)
+
+
+def _compact_tool_excerpt_line(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    tail_chars = min(96, max(32, max_chars // 4))
+    head_chars = max(32, max_chars - tail_chars - 48)
+    omitted = max(0, len(text) - head_chars - tail_chars)
+    return (
+        text[:head_chars].rstrip()
+        + f" ... [MTPLX truncated {omitted} chars] ... "
+        + text[-tail_chars:].lstrip()
+    )
+
+
+def _clean_active_tool_output_path(raw_path: str) -> str | None:
+    path = html.unescape(str(raw_path or "")).strip()
+    path = path.strip(" \t\r\n\"'`")
+    path = re.sub(r"[\),;]+$", "", path).strip()
+    if not path or len(path) > 320:
+        return None
+    if _ACTIVE_TOOL_OUTPUT_LOW_VALUE_LINE_RE.search(path):
+        return None
+    return path
+
+
+def _compressed_int_ranges(values: Iterable[int], *, max_ranges: int = 4) -> str:
+    ordered = sorted({int(value) for value in values if int(value) > 0})
+    if not ordered:
+        return ""
+    ranges: list[tuple[int, int]] = []
+    start = previous = ordered[0]
+    for value in ordered[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        ranges.append((start, previous))
+        start = previous = value
+    ranges.append((start, previous))
+    parts = [
+        str(start) if start == end else f"{start}-{end}"
+        for start, end in ranges[: max(1, max_ranges)]
+    ]
+    if len(ranges) > max_ranges:
+        parts.append(f"+{len(ranges) - max_ranges}")
+    return ",".join(parts)
+
+
+def _cluster_source_lines(lines: Iterable[int], *, max_gap: int = 80) -> list[list[int]]:
+    clusters: list[list[int]] = []
+    for line_no in sorted({int(line) for line in lines if int(line) > 0}):
+        if not clusters or line_no > clusters[-1][-1] + max_gap:
+            clusters.append([line_no])
+        else:
+            clusters[-1].append(line_no)
+    return clusters
+
+
+def _active_tool_output_read_hints(lines: list[str]) -> list[_ActiveToolOutputHint]:
+    path_lines: dict[str, set[int]] = {}
+    output_lines_by_path: dict[str, set[int]] = {}
+    plain_paths: dict[str, set[int]] = {}
+
+    for output_line_no, line in enumerate(lines, start=1):
+        if _ACTIVE_TOOL_OUTPUT_LOW_VALUE_LINE_RE.search(line):
+            continue
+        for path_line_re in _ACTIVE_TOOL_OUTPUT_PATH_LINE_RES:
+            for match in path_line_re.finditer(line):
+                path = _clean_active_tool_output_path(match.group("path"))
+                if path is None:
+                    continue
+                try:
+                    source_line = int(match.group("line"))
+                except (TypeError, ValueError):
+                    continue
+                if source_line <= 0:
+                    continue
+                path_lines.setdefault(path, set()).add(source_line)
+                output_lines_by_path.setdefault(path, set()).add(output_line_no)
+        for match in _ACTIVE_TOOL_OUTPUT_SOURCE_PATH_RE.finditer(line):
+            path = _clean_active_tool_output_path(match.group("path"))
+            if path is None:
+                continue
+            plain_paths.setdefault(path, set()).add(output_line_no)
+
+    hints: list[_ActiveToolOutputHint] = []
+    for path, source_lines in sorted(
+        path_lines.items(),
+        key=lambda item: (min(item[1]), item[0]),
+    ):
+        for cluster in _cluster_source_lines(source_lines)[:2]:
+            first = min(cluster)
+            last = max(cluster)
+            start = max(1, first - 20)
+            end = min(max(last + 20, first + 20), start + 119)
+            hints.append(
+                _ActiveToolOutputHint(
+                    path=path,
+                    start=start,
+                    end=end,
+                    source_lines=tuple(sorted(output_lines_by_path.get(path, set()))),
+                )
+            )
+            if len(hints) >= 6:
+                return hints
+
+    hinted_paths = {hint.path for hint in hints}
+    for path, output_lines in sorted(
+        plain_paths.items(),
+        key=lambda item: (min(item[1]), item[0]),
+    ):
+        if path in hinted_paths:
+            continue
+        hints.append(
+            _ActiveToolOutputHint(
+                path=path,
+                start=None,
+                end=None,
+                source_lines=tuple(sorted(output_lines)),
+            )
+        )
+        if len(hints) >= 6:
+            return hints
+    return hints
+
+
+def _render_active_tool_output_read_hints(
+    hints: list[_ActiveToolOutputHint],
+) -> str:
+    if not hints:
+        return ""
+    rendered = ["<next_read_hints>"]
+    for hint in hints:
+        safe_path = html.escape(hint.path, quote=True)
+        source_output_lines = html.escape(_compressed_int_ranges(hint.source_lines))
+        if hint.start is not None and hint.end is not None:
+            limit = max(1, hint.end - hint.start + 1)
+            rendered.append(
+                f'<range filePath="{safe_path}" start="{hint.start}" '
+                f'end="{hint.end}" limit="{limit}" '
+                f'source_output_lines="{source_output_lines}">'
+                "If exact context matters, read this range next. Do not rerun "
+                "the broad tool command unchanged."
+                "</range>"
+            )
+        else:
+            rendered.append(
+                f'<path filePath="{safe_path}" source_output_lines="{source_output_lines}">'
+                "Read this file only if it is the next relevant candidate. Avoid "
+                "broad list/glob/grep repeats."
+                "</path>"
+            )
+    rendered.append("</next_read_hints>")
+    return "\n".join(rendered)
+
+
+def _active_tool_result_read_hint_count(compacted: str) -> int:
+    match = re.search(r"\bread_hint_count=(\d+)", compacted)
+    if not match:
+        return 0
+    try:
+        return max(0, int(match.group(1)))
+    except ValueError:
+        return 0
+
+
+def _compact_active_tool_result_text(text: str) -> str | None:
+    """Compact large current grep/glob/bash outputs without hiding useful paths."""
+
+    threshold = max(
+        1,
+        _env_int(
+            "MTPLX_ACTIVE_TOOL_RESULT_COMPACT_THRESHOLD_CHARS",
+            _ACTIVE_TOOL_RESULT_COMPACT_THRESHOLD_CHARS,
+        ),
+    )
+    if len(text) <= threshold:
+        return None
+    lines = text.splitlines()
+    if not lines:
+        return None
+    read_hints = _active_tool_output_read_hints(lines)
+
+    head_lines = max(
+        0,
+        _env_int(
+            "MTPLX_ACTIVE_TOOL_RESULT_COMPACT_HEAD_LINES",
+            _ACTIVE_TOOL_RESULT_COMPACT_HEAD_LINES,
+        ),
+    )
+    tail_lines = max(
+        0,
+        _env_int(
+            "MTPLX_ACTIVE_TOOL_RESULT_COMPACT_TAIL_LINES",
+            _ACTIVE_TOOL_RESULT_COMPACT_TAIL_LINES,
+        ),
+    )
+    max_lines = max(
+        8,
+        _env_int(
+            "MTPLX_ACTIVE_TOOL_RESULT_COMPACT_MAX_LINES",
+            _ACTIVE_TOOL_RESULT_COMPACT_MAX_LINES,
+        ),
+    )
+    line_max_chars = max(
+        120,
+        _env_int(
+            "MTPLX_ACTIVE_TOOL_RESULT_LINE_MAX_CHARS",
+            _ACTIVE_TOOL_RESULT_LINE_MAX_CHARS,
+        ),
+    )
+
+    selected: set[int] = set()
+
+    def add_index(index: int) -> None:
+        if len(selected) >= max_lines:
+            return
+        if 0 <= index < len(lines):
+            selected.add(index)
+
+    for index in range(min(head_lines, len(lines))):
+        if not _ACTIVE_TOOL_OUTPUT_LOW_VALUE_LINE_RE.search(lines[index]):
+            add_index(index)
+    for index in range(max(0, len(lines) - tail_lines), len(lines)):
+        if not _ACTIVE_TOOL_OUTPUT_LOW_VALUE_LINE_RE.search(lines[index]):
+            add_index(index)
+
+    for index, line in enumerate(lines):
+        if len(selected) >= max_lines:
+            break
+        if _ACTIVE_TOOL_OUTPUT_LOW_VALUE_LINE_RE.search(line):
+            continue
+        if _ACTIVE_TOOL_OUTPUT_IMPORTANT_LINE_RE.search(line):
+            add_index(index)
+
+    for index, line in enumerate(lines):
+        if len(selected) >= max_lines:
+            break
+        if _ACTIVE_TOOL_OUTPUT_IMPORTANT_LINE_RE.search(line):
+            if _ACTIVE_TOOL_OUTPUT_LOW_VALUE_LINE_RE.search(line):
+                continue
+            add_index(index)
+
+    kept = sorted(selected)
+    if not kept:
+        return None
+
+    excerpt: list[str] = []
+    previous: int | None = None
+    for index in kept:
+        if previous is not None and index > previous + 1:
+            excerpt.append(
+                f"... [MTPLX omitted output lines {previous + 2}-{index}] ..."
+            )
+        excerpt.append(_compact_tool_excerpt_line(lines[index], line_max_chars))
+        previous = index
+    if previous is not None and previous < len(lines) - 1:
+        excerpt.append(
+            f"... [MTPLX omitted output lines {previous + 2}-{len(lines)}] ..."
+        )
+
+    body = "\n".join(excerpt).rstrip()
+    omitted_lines = max(0, len(lines) - len(kept))
+    read_hint_text = _render_active_tool_output_read_hints(read_hints)
+    source_path_count = len({hint.path for hint in read_hints})
+    anchor = _tool_output_anchor(
+        "active_tool",
+        len(text),
+        len(lines),
+        "\n".join(lines[index] for index in kept[:12]),
+    )
+    compacted = (
+        "<mtplx_compacted_active_tool_output "
+        f"original_chars={len(text)} original_lines={len(lines)} "
+        f"kept_lines={len(kept)} omitted_lines={omitted_lines} "
+        f"read_hint_count={len(read_hints)} source_path_count={source_path_count} "
+        f'anchor="{anchor}">\n'
+        "[Large current tool output abbreviated to keep OpenCode responsive. "
+        "Important source paths, errors, and match lines are prioritized. Use "
+        "the next_read_hints for exact follow-up reads; do not rerun broad "
+        "list/grep/build commands unchanged.]\n"
+        f"{body}\n"
+        f"{read_hint_text + chr(10) if read_hint_text else ''}"
+        "</mtplx_compacted_active_tool_output>"
+    )
+    return compacted if len(compacted) < len(text) else None
+
+
+def _extract_tag_text(text: str, tag: str) -> str | None:
+    match = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.IGNORECASE | re.DOTALL)
+    return match.group(1).strip() if match else None
+
+
+def _tag_plain_read_tool_result_text(text: str, *, path: str) -> str | None:
+    if not text or "<content>" in text or "</content>" in text:
+        return None
+    clean_path = (path or "").strip()
+    if not clean_path:
+        return None
+    lines = text.splitlines()
+    if len(lines) < 20:
+        return None
+    numbered: list[str] = []
+    already_numbered = 0
+    for index, line in enumerate(lines, start=1):
+        if _LINE_NUMBERED_CONTENT_RE.match(line):
+            already_numbered += 1
+            numbered.append(line)
+        else:
+            numbered.append(f"{index}: {line}")
+    if already_numbered >= max(20, int(len(lines) * 0.65)):
+        content = "\n".join(lines)
+    else:
+        content = "\n".join(numbered)
+    return (
+        f"<path>{html.escape(clean_path)}</path>\n"
+        "<type>file</type>\n"
+        "<content>\n"
+        f"{content}\n"
+        "</content>"
+    )
+
+
+def _read_tool_content_meta(text: str) -> _ReadToolContentMeta | None:
+    if "<content>" not in text or "</content>" not in text:
+        return None
+    content = _extract_tag_text(text, "content")
+    if not content:
+        return None
+    line_numbers: set[int] = set()
+    for raw_line in content.splitlines():
+        match = _LINE_NUMBERED_CONTENT_RE.match(raw_line)
+        if match:
+            line_numbers.add(int(match.group(1)))
+    if not line_numbers:
+        return None
+    return _ReadToolContentMeta(
+        path=_extract_tag_text(text, "path") or "(unknown path)",
+        file_type=_extract_tag_text(text, "type") or "file",
+        line_numbers=frozenset(line_numbers),
+        first_line=min(line_numbers),
+        last_line=max(line_numbers),
+    )
+
+
+def _inspection_read_budget_for_count(candidate_count: int) -> tuple[int | None, int | None]:
+    if candidate_count <= 1:
+        return None, None
+    total_lines = max(
+        0,
+        _env_int(
+            "MTPLX_ACTIVE_READ_INSPECTION_TOTAL_MAX_LINES",
+            _ACTIVE_READ_INSPECTION_TOTAL_MAX_LINES,
+        ),
+    )
+    if total_lines <= 0:
+        return None, None
+    min_lines = max(
+        8,
+        _env_int(
+            "MTPLX_ACTIVE_READ_INSPECTION_MIN_LINES_PER_FILE",
+            _ACTIVE_READ_INSPECTION_MIN_LINES_PER_FILE,
+        ),
+    )
+    max_lines = max(min_lines, total_lines // max(1, candidate_count))
+    line_max_chars = max(
+        120,
+        _env_int(
+            "MTPLX_ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS",
+            _ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS,
+        ),
+    )
+    return max_lines, line_max_chars
+
+
+def _compact_repeated_inspection_read_tool_result_text(
+    text: str,
+    *,
+    meta: _ReadToolContentMeta,
+    prior_covered_lines: int,
+    new_lines: int,
+) -> str:
+    path = html.escape(meta.path)
+    file_type = html.escape(meta.file_type)
+    line_range = (
+        f"{meta.first_line}-{meta.last_line}"
+        if meta.first_line is not None and meta.last_line is not None
+        else "unknown"
+    )
+    anchor = _tool_output_anchor(
+        "repeated_read",
+        meta.path,
+        line_range,
+        len(text),
+        prior_covered_lines,
+        new_lines,
+    )
+    return (
+        "<mtplx_repeated_read_inspection_digest "
+        f'original_chars="{len(text)}" '
+        f'anchor="{anchor}" '
+        f'line_range="{html.escape(line_range)}" '
+        f'covered_lines="{len(meta.line_numbers)}" '
+        f'prior_covered_lines="{prior_covered_lines}" '
+        f'new_lines="{new_lines}">\n'
+        "[This read repeats source lines already covered by an earlier digest "
+        "for the same read-only review/evaluation. Use the earlier digest and "
+        "the other tool outputs to synthesize now. Do not call read again for "
+        "this same path or adjacent ranges for completeness; only request a "
+        "new named symbol or exact line range if it would materially change "
+        "the answer.]\n"
+        f"<path>{path}</path>\n"
+        f"<type>{file_type}</type>\n"
+        "</mtplx_repeated_read_inspection_digest>"
+    )
+
+
+def _compact_active_read_tool_result_text(
+    text: str,
+    *,
+    inspection_request: bool = False,
+    inspection_max_lines: int | None = None,
+    inspection_line_max_chars: int | None = None,
+) -> str | None:
+    """Compact oversized current OpenCode read outputs without hiding anchors.
+
+    Old tool results can be reduced aggressively after a plain answer. During an
+    active multi-tool loop, though, the next model call still needs enough of a
+    freshly read file to decide whether to answer or request narrower ranges.
+    This excerpt keeps line numbers plus semantic anchors and tells the model to
+    rerun `read` narrowly for omitted exact text.
+    """
+
+    force_compact = bool(_READ_CONTINUATION_HINT_RE.search(text))
+    threshold = (
+        max(
+            1,
+            _env_int(
+                "MTPLX_ACTIVE_READ_INSPECTION_COMPACT_THRESHOLD_CHARS",
+                _ACTIVE_READ_INSPECTION_COMPACT_THRESHOLD_CHARS,
+            ),
+        )
+        if inspection_request
+        else _ACTIVE_READ_COMPACT_THRESHOLD_CHARS
+    )
+    if len(text) <= threshold and not force_compact:
+        return None
+    if "<content>" not in text or "</content>" not in text:
+        return None
+    path = _extract_tag_text(text, "path") or "(unknown path)"
+    file_type = _extract_tag_text(text, "type") or "file"
+    content = _extract_tag_text(text, "content")
+    if not content:
+        return None
+
+    numbered: list[tuple[int, str]] = []
+    for raw_line in content.splitlines():
+        match = _LINE_NUMBERED_CONTENT_RE.match(raw_line)
+        if match:
+            numbered.append((int(match.group(1)), match.group(2)))
+    selected: set[int] = set()
+    if inspection_request:
+        head_lines = max(
+            0,
+            _env_int(
+                "MTPLX_ACTIVE_READ_INSPECTION_COMPACT_HEAD_LINES",
+                _ACTIVE_READ_INSPECTION_COMPACT_HEAD_LINES,
+            ),
+        )
+        tail_lines = max(
+            0,
+            _env_int(
+                "MTPLX_ACTIVE_READ_INSPECTION_COMPACT_TAIL_LINES",
+                _ACTIVE_READ_INSPECTION_COMPACT_TAIL_LINES,
+            ),
+        )
+        max_lines = max(
+            8,
+            _env_int(
+                "MTPLX_ACTIVE_READ_INSPECTION_COMPACT_MAX_LINES",
+                _ACTIVE_READ_INSPECTION_COMPACT_MAX_LINES,
+            ),
+        )
+        if inspection_max_lines is not None:
+            max_lines = min(max_lines, max(8, int(inspection_max_lines)))
+        context_lines = max(
+            0,
+            _env_int(
+                "MTPLX_ACTIVE_READ_INSPECTION_COMPACT_CONTEXT_LINES",
+                _ACTIVE_READ_INSPECTION_COMPACT_CONTEXT_LINES,
+            ),
+        )
+        line_max_chars = max(
+            120,
+            _env_int(
+                "MTPLX_ACTIVE_READ_INSPECTION_LINE_MAX_CHARS",
+                _ACTIVE_READ_INSPECTION_LINE_MAX_CHARS,
+            ),
+        )
+        if inspection_line_max_chars is not None:
+            line_max_chars = min(line_max_chars, max(120, int(inspection_line_max_chars)))
+    else:
+        head_lines = max(
+            0,
+            _env_int(
+                "MTPLX_ACTIVE_READ_COMPACT_HEAD_LINES",
+                _ACTIVE_READ_COMPACT_HEAD_LINES,
+            ),
+        )
+        tail_lines = max(
+            0,
+            _env_int(
+                "MTPLX_ACTIVE_READ_COMPACT_TAIL_LINES",
+                _ACTIVE_READ_COMPACT_TAIL_LINES,
+            ),
+        )
+        max_lines = max(
+            8,
+            _env_int(
+                "MTPLX_ACTIVE_READ_COMPACT_MAX_LINES",
+                _ACTIVE_READ_COMPACT_MAX_LINES,
+            ),
+        )
+        context_lines = max(
+            0,
+            _env_int(
+                "MTPLX_ACTIVE_READ_COMPACT_CONTEXT_LINES",
+                _ACTIVE_READ_COMPACT_CONTEXT_LINES,
+            ),
+        )
+        line_max_chars = 360
+
+    def add_window(line_no: int, radius: int = 0) -> None:
+        for candidate in range(line_no - radius, line_no + radius + 1):
+            if len(selected) >= max_lines:
+                return
+            selected.add(candidate)
+
+    for line_no, _line in numbered[:head_lines]:
+        add_window(line_no)
+    if tail_lines > 0:
+        for line_no, _line in numbered[-tail_lines:]:
+            add_window(line_no)
+
+    def add_anchor_candidates(
+        candidates: list[int],
+        *,
+        radius: int = 0,
+        spread: bool = False,
+    ) -> None:
+        remaining = max_lines - len(selected)
+        if remaining <= 0:
+            return
+        unique: list[int] = []
+        seen: set[int] = set()
+        for line_no in candidates:
+            if line_no in seen:
+                continue
+            seen.add(line_no)
+            if radius == 0 and line_no in selected:
+                continue
+            unique.append(line_no)
+        if not unique:
+            return
+        if spread and len(unique) > remaining:
+            if remaining == 1:
+                unique = [unique[-1]]
+            else:
+                step = (len(unique) - 1) / (remaining - 1)
+                chosen: list[int] = []
+                for idx in range(remaining):
+                    line_no = unique[round(idx * step)]
+                    if line_no not in chosen:
+                        chosen.append(line_no)
+                unique = chosen
+        for line_no in unique:
+            if len(selected) >= max_lines:
+                return
+            before = set(selected)
+            add_window(line_no, radius)
+            if len(selected) > max_lines:
+                selected.clear()
+                selected.update(before)
+                return
+
+    if inspection_request:
+        required_anchor_lines: list[int] = []
+        for anchor_re in _ACTIVE_READ_INSPECTION_REQUIRED_ANCHOR_RES:
+            for line_no, line in numbered:
+                if anchor_re.search(line):
+                    required_anchor_lines.append(line_no)
+                    break
+        add_anchor_candidates(required_anchor_lines)
+        for anchor_re, radius in _ACTIVE_READ_INSPECTION_CONTEXT_ANCHOR_RES:
+            for line_no, line in numbered:
+                if anchor_re.search(line):
+                    add_anchor_candidates([line_no], radius=radius)
+                    break
+
+    priority_anchor_re = (
+        _ACTIVE_READ_INSPECTION_PRIORITY_ANCHOR_RE
+        if inspection_request
+        else _ACTIVE_READ_PRIORITY_ANCHOR_RE
+    )
+    priority_anchor_lines = [
+        line_no
+        for line_no, line in numbered
+        if priority_anchor_re.search(line)
+    ]
+    generic_anchor_lines = [
+        line_no for line_no, line in numbered if _ACTIVE_READ_ANCHOR_RE.search(line)
+    ]
+    add_anchor_candidates(
+        priority_anchor_lines,
+        radius=context_lines,
+        spread=inspection_request,
+    )
+    add_anchor_candidates(generic_anchor_lines, spread=inspection_request)
+
+    line_by_no = {line_no: line for line_no, line in numbered}
+    kept = [line_no for line_no in sorted(selected) if line_no in line_by_no]
+    if not kept:
+        return None
+
+    excerpt: list[str] = []
+    previous: int | None = None
+    for line_no in kept:
+        if previous is not None and line_no > previous + 1:
+            excerpt.append(f"... [MTPLX omitted lines {previous + 1}-{line_no - 1}] ...")
+        line = _compact_tool_excerpt_line(line_by_no[line_no], line_max_chars)
+        excerpt.append(f"{line_no}: {line}")
+        previous = line_no
+    if previous is not None and previous < numbered[-1][0]:
+        excerpt.append(f"... [MTPLX omitted lines {previous + 1}-{numbered[-1][0]}] ...")
+
+    omitted_lines = max(0, len(numbered) - len(kept))
+    if inspection_request:
+        evidence = "\n".join(
+            f"line {line_no}: {_compact_tool_excerpt_line(line_by_no[line_no], line_max_chars)}"
+            for line_no in kept
+        ).rstrip()
+        first_line = numbered[0][0]
+        last_line = numbered[-1][0]
+        anchor = _tool_output_anchor(
+            "inspection_read",
+            path,
+            first_line,
+            last_line,
+            len(text),
+            "|".join(str(line_no) for line_no in kept[:24]),
+        )
+        compacted = (
+            "<mtplx_read_inspection_digest "
+            f'original_chars="{len(text)}" '
+            f'original_lines="{len(numbered)}" '
+            f'evidence_lines="{len(kept)}" '
+            f'anchor="{anchor}" '
+            f'line_range="{html.escape(_line_range_label(first_line, last_line))}" '
+            f'continuation_hint_removed="{str(force_compact).lower()}" '
+            'full_file_expansion_needed="false">\n'
+            "[MTPLX already received this source from the read tool; this is "
+            "the intended read-only review/evaluation evidence digest. Treat "
+            "it as sufficient for synthesis with the other already-read files. "
+            "do not request adjacent ranges or the full file for completeness. "
+            "do not copy the numbered evidence lines into reasoning or final "
+            "content.]\n"
+            f"<path>{path}</path>\n"
+            f"<type>{file_type}</type>\n"
+            "<evidence>\n"
+            f"{evidence}\n"
+            "</evidence>\n"
+            "</mtplx_read_inspection_digest>"
+        )
+        return compacted if force_compact or len(compacted) < len(text) else None
+
+    first_line = numbered[0][0]
+    last_line = numbered[-1][0]
+    omitted_ranges = _omitted_line_ranges(
+        kept,
+        first_line=first_line,
+        last_line=last_line,
+    )
+    next_read_hints = _render_next_read_hints(path=path, ranges=omitted_ranges)
+    anchor = _tool_output_anchor(
+        "active_read",
+        path,
+        first_line,
+        last_line,
+        len(text),
+        "|".join(str(line_no) for line_no in kept[:24]),
+    )
+    guidance = (
+        "[Large current read abbreviated to keep OpenCode tool loops responsive. "
+        "The excerpt preserves file line numbers, definitions, and likely "
+        "collision/navigation/runtime anchors. For review or evaluation, answer "
+        "from this excerpt when the relevant anchors are visible; do not "
+        "reconstruct the full file from adjacent reads. Another read is only "
+        "for a named missing symbol or exact line range that would change the "
+        "answer.]"
+    )
+    compacted = (
+        "<mtplx_compacted_active_read_output "
+        f"original_chars={len(text)} original_lines={len(numbered)} "
+        f"kept_lines={len(kept)} omitted_lines={omitted_lines} "
+        f'anchor="{anchor}" '
+        f'line_range="{html.escape(_line_range_label(first_line, last_line))}" '
+        f'next_read_hint_count="{min(len(omitted_ranges), 4)}" '
+        f'continuation_hint_removed="{str(force_compact).lower()}">\n'
+        f"{guidance}\n"
+        f"<path>{path}</path>\n"
+        f"<type>{file_type}</type>\n"
+        "<content_excerpt>\n"
+        + "\n".join(excerpt).rstrip()
+        + "\n</content_excerpt>\n"
+        + (next_read_hints + "\n" if next_read_hints else "")
+        + "</mtplx_compacted_active_read_output>"
+    )
+    return compacted if force_compact or len(compacted) < len(text) else None
+
+
+def _assistant_reasoning_history_stats(
+    message: ChatMessage,
+) -> tuple[int, int, int]:
+    if str(message.role).lower() != "assistant":
+        return 0, 0, 0
+    chars = 0
+    structured_blocks = 0
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = _message_extra(message, key)
+        if value:
+            chars += len(str(value))
+            structured_blocks += 1
+    content = message.content
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "") != "thinking":
+                continue
+            thinking = str(item.get("thinking") or "")
+            if thinking:
+                chars += len(thinking)
+                structured_blocks += 1
+    elif isinstance(content, str):
+        chars += sum(len(match.group(0)) for match in _REASONING_TAG_RE.finditer(content))
+    return (1 if chars > 0 else 0), chars, structured_blocks
+
+
+def _canonicalize_agent_transcript(
+    messages: list[ChatMessage],
+    *,
+    tools_active: bool,
+    replace_simple_chitchat_system_prompt: bool = False,
+    initial_client_system_prompt: str | None = None,
+    strip_tool_call_preamble_text: bool = False,
+) -> tuple[list[ChatMessage], AgentTranscriptCanonicalization]:
+    stats = AgentTranscriptCanonicalization(
+        raw_message_chars=sum(
+            len(_content_to_text(message.content)) for message in messages
+        )
+    )
+    canonical = list(messages)
+    for message in messages:
+        reasoning_messages, reasoning_chars, structured_blocks = (
+            _assistant_reasoning_history_stats(message)
+        )
+        stats.assistant_reasoning_history_messages += reasoning_messages
+        stats.assistant_reasoning_history_chars += reasoning_chars
+        stats.assistant_structured_thinking_blocks += structured_blocks
+    if initial_client_system_prompt:
+        canonical = _replace_client_system_prompt(
+            canonical,
+            stats,
+            replacement=initial_client_system_prompt,
+        )
+    if not tools_active:
+        canonical = _canonicalize_simple_chitchat_history(
+            canonical,
+            stats,
+            replace_system_prompt=replace_simple_chitchat_system_prompt,
+        )
+    if tools_active:
+        source_messages = canonical
+        # OpenCode can feed back very large grep/read results. Old raw outputs
+        # punish every follow-up, while huge current full-file reads punish
+        # multi-tool exploration loops before a final answer exists. Keep
+        # non-read current outputs verbatim, but turn oversized line-numbered
+        # reads into anchor-rich excerpts so the model can request narrower
+        # ranges instead of carrying whole files forever.
+        plain_answer_cutoff = _latest_plain_assistant_answer_index(source_messages)
+        latest_assistant_cutoff = _latest_assistant_step_index(source_messages)
+        inspection_request = _is_read_only_inspection_request(
+            _last_user_text(source_messages)
+        )
+        tool_calls_by_id: dict[str, tuple[str, str, str]] = {}
+        for message in source_messages:
+            if str(message.role).lower() != "assistant" or not message.tool_calls:
+                continue
+            for tool_call in message.tool_calls:
+                call_id = str(tool_call.get("id") or "").strip()
+                signature = _tool_call_loop_key(tool_call)
+                if call_id and signature is not None:
+                    tool_calls_by_id[call_id] = signature
+        inspection_read_candidate_count = 0
+        if inspection_request:
+            for message in source_messages:
+                if str(message.role).lower() != "tool":
+                    continue
+                text = _content_to_text(message.content)
+                tool_call_id = str(
+                    message.tool_call_id
+                    or _message_extra(message, "tool_call_id")
+                    or ""
+                ).strip()
+                signature = tool_calls_by_id.get(tool_call_id)
+                read_text = text
+                if signature is not None:
+                    tool_name, _key_payload, command = signature
+                    if tool_name.strip().lower() == "read":
+                        tagged = _tag_plain_read_tool_result_text(text, path=command)
+                        if tagged is not None:
+                            read_text = tagged
+                read_meta = _read_tool_content_meta(read_text)
+                if read_meta is not None and len(read_meta.line_numbers) >= 20:
+                    inspection_read_candidate_count += 1
+        inspection_max_lines, inspection_line_max_chars = (
+            _inspection_read_budget_for_count(inspection_read_candidate_count)
+        )
+        if inspection_max_lines is not None:
+            stats.inspection_read_budget_candidate_messages = (
+                inspection_read_candidate_count
+            )
+            stats.inspection_read_budget_max_lines_per_file = inspection_max_lines
+        timeout_counts_by_key: dict[str, int] = {}
+        inspection_read_lines_by_path: dict[str, set[int]] = {}
+        canonical = []
+        for index, message in enumerate(source_messages):
+            role = str(message.role).lower()
+            if role == "assistant":
+                content = _content_to_text(message.content)
+                if _message_declares_aborted_assistant_turn(message):
+                    stats.skipped_aborted_assistant_messages += 1
+                    continue
+                if _looks_like_orphan_chitchat_assistant_turn(source_messages, index):
+                    stats.skipped_orphan_chitchat_assistant_messages += 1
+                    continue
+                if (
+                    message.tool_calls
+                    and content.strip()
+                    and (inspection_request or strip_tool_call_preamble_text)
+                ):
+                    stats.stripped_tool_preamble_messages += 1
+                    stats.stripped_tool_preamble_chars += len(content)
+                    message = _copy_chat_message(message, content="")
+                    content = ""
+                if not message.tool_calls:
+                    if _looks_like_verbatim_tool_output_assistant_dump(content):
+                        stats.skipped_verbatim_tool_output_assistant_messages += 1
+                        stats.skipped_verbatim_tool_output_assistant_chars += len(content)
+                        continue
+                    if _looks_like_repeated_agent_preamble(content):
+                        stats.skipped_repeated_assistant_messages += 1
+                        continue
+                    if _looks_like_stalled_agent_preamble(content):
+                        stats.skipped_stalled_agent_preamble_messages += 1
+                        stats.skipped_stalled_agent_preamble_chars += len(content)
+                        continue
+            if role == "tool":
+                text = _content_to_text(message.content)
+                tool_call_id = str(
+                    message.tool_call_id
+                    or _message_extra(message, "tool_call_id")
+                    or ""
+                ).strip()
+                signature = tool_calls_by_id.get(tool_call_id)
+                if signature is not None and _tool_result_is_timeout(text):
+                    tool_name, key_payload, command = signature
+                    timeout_key = f"{tool_name}\n{key_payload}"
+                    repeat_count = timeout_counts_by_key.get(timeout_key, 0) + 1
+                    timeout_counts_by_key[timeout_key] = repeat_count
+                    if repeat_count >= 2:
+                        canonical.append(
+                            _copy_chat_message(
+                                message,
+                                content=_compact_repeated_timeout_tool_result_text(
+                                    text,
+                                    tool_name=tool_name,
+                                    command=command,
+                                    repeat_count=repeat_count,
+                                ),
+                            )
+                        )
+                        stats.compacted_repeated_timeout_tool_messages += 1
+                        continue
+                if inspection_request:
+                    read_text = text
+                    if signature is not None:
+                        tool_name, _key_payload, command = signature
+                        if tool_name.strip().lower() == "read":
+                            tagged = _tag_plain_read_tool_result_text(
+                                text,
+                                path=command,
+                            )
+                            if tagged is not None:
+                                read_text = tagged
+                    read_meta = _read_tool_content_meta(read_text)
+                    if read_meta is not None:
+                        prior_lines = inspection_read_lines_by_path.setdefault(
+                            read_meta.path,
+                            set(),
+                        )
+                        new_lines = set(read_meta.line_numbers) - prior_lines
+                        duplicate_threshold = max(
+                            3,
+                            int(len(read_meta.line_numbers) * 0.08),
+                        )
+                        if prior_lines and len(new_lines) <= duplicate_threshold:
+                            compacted = _compact_repeated_inspection_read_tool_result_text(
+                                read_text,
+                                meta=read_meta,
+                                prior_covered_lines=len(prior_lines),
+                                new_lines=len(new_lines),
+                            )
+                            prior_lines.update(read_meta.line_numbers)
+                            canonical.append(
+                                _copy_chat_message(message, content=compacted)
+                            )
+                            saved_chars = max(0, len(text) - len(compacted))
+                            stats.compacted_active_read_messages += 1
+                            stats.compacted_active_read_chars += saved_chars
+                            stats.compacted_active_read_inspection_messages += 1
+                            stats.compacted_active_read_inspection_chars += saved_chars
+                            stats.compacted_repeated_read_inspection_messages += 1
+                            stats.compacted_repeated_read_inspection_chars += saved_chars
+                            continue
+                        prior_lines.update(read_meta.line_numbers)
+                    compacted = _compact_active_read_tool_result_text(
+                        read_text,
+                        inspection_request=True,
+                        inspection_max_lines=inspection_max_lines,
+                        inspection_line_max_chars=inspection_line_max_chars,
+                    )
+                    if compacted is not None:
+                        canonical.append(_copy_chat_message(message, content=compacted))
+                        stats.compacted_active_read_messages += 1
+                        stats.compacted_active_read_chars += max(
+                            0, len(text) - len(compacted)
+                        )
+                        stats.compacted_active_read_inspection_messages += 1
+                        stats.compacted_active_read_inspection_chars += max(
+                            0, len(text) - len(compacted)
+                        )
+                        continue
+                if (
+                    plain_answer_cutoff is not None
+                    and index < plain_answer_cutoff
+                    or latest_assistant_cutoff is not None
+                    and index < latest_assistant_cutoff
+                ):
+                    compacted = _compact_tool_result_text(text)
+                    if compacted is not None:
+                        canonical.append(_copy_chat_message(message, content=compacted))
+                        stats.compacted_tool_result_messages += 1
+                        stats.compacted_tool_result_chars += len(text) - len(compacted)
+                        continue
+                compacted = _compact_active_read_tool_result_text(
+                    text,
+                    inspection_request=inspection_request,
+                    inspection_max_lines=inspection_max_lines,
+                    inspection_line_max_chars=inspection_line_max_chars,
+                )
+                if compacted is not None:
+                    canonical.append(_copy_chat_message(message, content=compacted))
+                    stats.compacted_active_read_messages += 1
+                    stats.compacted_active_read_chars += max(
+                        0, len(text) - len(compacted)
+                    )
+                    if inspection_request:
+                        stats.compacted_active_read_inspection_messages += 1
+                        stats.compacted_active_read_inspection_chars += max(
+                            0, len(text) - len(compacted)
+                        )
+                    continue
+                compacted = _compact_active_tool_result_text(text)
+                if compacted is not None:
+                    canonical.append(_copy_chat_message(message, content=compacted))
+                    stats.compacted_active_tool_result_messages += 1
+                    stats.compacted_active_tool_result_chars += len(text) - len(compacted)
+                    stats.compacted_active_tool_result_read_hints += (
+                        _active_tool_result_read_hint_count(compacted)
+                    )
+                    continue
+            canonical.append(message)
+    if tools_active:
+        canonical = _canonicalize_user_retry_pollution(canonical, stats)
+    stats.canonical_message_chars = sum(
+        len(_content_to_text(message.content)) for message in canonical
+    )
+    return canonical, stats
 
 
 def _message_to_template_dict(
@@ -3465,6 +8553,12 @@ def _encode_plain_text(tokenizer: Any, text: str) -> list[int]:
 
 _QWEN_ASSISTANT_THINK_PROMPT = "<|im_start|>assistant\n<think>\n"
 _QWEN_IM_END = "<|im_end|>"
+_DISABLED_THINK_GENERATION_PROMPT_RE = re.compile(
+    r"(?is)(<\|im_start\|>assistant[^\n\r]*[\r\n]+)<think>\s*$"
+)
+_DISABLED_THINK_GENERATION_PROMPT_REPLACEMENT = (
+    r"\1<think>\n\n</think>\n\n"
+)
 
 
 def _render_messages_with_chat_template(
@@ -3473,6 +8567,7 @@ def _render_messages_with_chat_template(
     *,
     add_generation_prompt: bool,
     enable_thinking: bool,
+    reasoning_effort: str | None,
     preserve_thinking: bool,
     tools: list[dict[str, Any]] | None,
     template_observability: dict[str, Any] | None = None,
@@ -3483,6 +8578,8 @@ def _render_messages_with_chat_template(
         "enable_thinking": enable_thinking,
         "preserve_thinking": preserve_thinking,
     }
+    if reasoning_effort:
+        template_kwargs["reasoning_effort"] = reasoning_effort
     if tools:
         template_kwargs["tools"] = tools
     try:
@@ -3522,7 +8619,41 @@ def _render_messages_with_chat_template(
             )
         except Exception:
             return None
-    return rendered if isinstance(rendered, str) else None
+    if not isinstance(rendered, str):
+        return None
+    return _close_disabled_think_generation_prompt(
+        rendered,
+        enable_thinking=enable_thinking,
+        add_generation_prompt=add_generation_prompt,
+        template_observability=template_observability,
+    )
+
+
+def _close_disabled_think_generation_prompt(
+    rendered: str,
+    *,
+    enable_thinking: bool,
+    add_generation_prompt: bool,
+    template_observability: dict[str, Any] | None = None,
+) -> str:
+    """Pre-close backend templates that open hidden reasoning when it is off.
+
+    Step's tokenizer template currently appends ``<think>`` for generation
+    regardless of ``enable_thinking``. Removing the tag entirely leaves the
+    model in an unfamiliar assistant-turn format and it can generate a stray
+    ``</think>``/``</thinks>`` marker itself. Qwen-style no-thinking turns are
+    more stable when the empty thought block is already closed in the prompt.
+    """
+
+    if enable_thinking or not add_generation_prompt:
+        return rendered
+    closed = _DISABLED_THINK_GENERATION_PROMPT_RE.sub(
+        _DISABLED_THINK_GENERATION_PROMPT_REPLACEMENT,
+        rendered,
+    )
+    if closed != rendered and template_observability is not None:
+        template_observability["disabled_thinking_prompt_closed"] = True
+    return closed
 
 
 def _tool_history_generation_boundaries(rendered: str) -> list[int]:
@@ -3557,6 +8688,62 @@ def _tool_history_generation_boundaries(rendered: str) -> list[int]:
     return boundaries
 
 
+def _qwen_assistant_generation_boundaries(rendered: str) -> list[int]:
+    boundaries: list[int] = []
+    marker = _QWEN_ASSISTANT_THINK_PROMPT
+    marker_len = len(marker)
+    search_from = 0
+    while True:
+        marker_at = rendered.find(marker, search_from)
+        if marker_at < 0:
+            break
+        boundary = marker_at + marker_len
+        if 0 < boundary < len(rendered):
+            boundaries.append(boundary)
+        search_from = boundary
+    return boundaries
+
+
+def _qwen_plain_assistant_content_boundaries(rendered: str) -> list[int]:
+    """Find Qwen no-thinking plain-text assistant generation boundaries.
+
+    In no-thinking mode the request prompt already contains the closed empty
+    thought block. Plain assistant text starts after that whole scaffold. If a
+    postcommit snapshot splits after ``<think>\n`` instead, the newline pair is
+    tokenized differently from the next request and SessionBank misses even
+    though the rendered transcript is identical.
+    """
+
+    boundaries: list[int] = []
+    marker = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    marker_len = len(marker)
+    search_from = 0
+    while True:
+        marker_at = rendered.find(marker, search_from)
+        if marker_at < 0:
+            break
+        boundary = marker_at + marker_len
+        block_end = rendered.find(_QWEN_IM_END, boundary)
+        search_end = block_end if block_end >= 0 else len(rendered)
+        if (
+            0 < boundary < len(rendered)
+            and rendered.find("<tool_call>", boundary, search_end) < 0
+        ):
+            boundaries.append(boundary)
+        search_from = boundary
+    return boundaries
+
+
+def _last_qwen_assistant_generation_boundary(rendered: str) -> int | None:
+    marker_at = rendered.rfind(_QWEN_ASSISTANT_THINK_PROMPT)
+    if marker_at < 0:
+        return None
+    boundary = marker_at + len(_QWEN_ASSISTANT_THINK_PROMPT)
+    if boundary <= 0 or boundary >= len(rendered):
+        return None
+    return boundary
+
+
 def _encode_rendered_chat_text_segmented(
     tokenizer: Any,
     rendered: str,
@@ -3584,6 +8771,7 @@ def _encode_generation_compatible_tool_history(
     *,
     add_generation_prompt: bool,
     enable_thinking: bool,
+    reasoning_effort: str | None,
     preserve_thinking: bool,
     tools: list[dict[str, Any]] | None,
     template_observability: dict[str, Any] | None = None,
@@ -3597,13 +8785,14 @@ def _encode_generation_compatible_tool_history(
         normalized,
         add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
         preserve_thinking=preserve_thinking,
         tools=tools,
         template_observability=template_observability,
     )
     if not rendered:
         return None
-    boundaries = _tool_history_generation_boundaries(rendered)
+    boundaries = _qwen_assistant_generation_boundaries(rendered)
     if not boundaries:
         return None
     return _encode_rendered_chat_text_segmented(tokenizer, rendered, boundaries)
@@ -3614,41 +8803,107 @@ def _encode_messages(
     messages: list[ChatMessage],
     *,
     enable_thinking: bool,
+    reasoning_effort: str | None = None,
     strip_assistant_reasoning_history: bool = False,
     add_generation_prompt: bool = True,
     tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
+    tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
     template_observability: dict[str, Any] | None = None,
 ) -> list[int]:
-    normalized: list[dict[str, Any]] = []
+    prepared_messages: list[dict[str, Any]] = []
     for message in messages:
         item = _message_to_template_dict(
             message,
             strip_assistant_reasoning_history=strip_assistant_reasoning_history,
         )
         if item is not None:
-            normalized.append(item)
+            prepared_messages.append(item)
+    normalized = omlx_normalize_messages_for_template(
+        prepared_messages,
+        tokenizer=tokenizer,
+        native_reasoning_content=not strip_assistant_reasoning_history,
+    )
+    if strip_assistant_reasoning_history:
+        for item in normalized:
+            item.pop("reasoning_content", None)
     if not normalized:
         normalized = [{"role": "user", "content": ""}]
-    normalized = _with_mtplx_tool_contract(normalized, tools=tools)
+    effective_tool_prompt_mode = _normalize_tool_prompt_mode(tool_prompt_mode)
+    if _tool_contract_active_for_mode(
+        tools_active=bool(tools),
+        tool_prompt_mode=effective_tool_prompt_mode,
+    ):
+        normalized = _with_mtplx_tool_contract(
+            normalized,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+    elif effective_tool_prompt_mode == _TOOL_PROMPT_MODE_NATIVE and tools:
+        normalized, native_tail_added = _with_mtplx_native_agent_tail(
+            normalized,
+            tools=tools,
+        )
+        if template_observability is not None:
+            template_observability["native_agent_tail_contract_active"] = bool(
+                native_tail_added
+            )
+    if is_gemma4_tokenizer(tokenizer):
+        if template_observability is not None:
+            template_observability["backend_chat_encoding"] = "gemma4"
+        native_tools = (
+            tools
+            if effective_tool_prompt_mode == _TOOL_PROMPT_MODE_NATIVE and tools
+            else None
+        )
+        return encode_chat_messages(
+            tokenizer,
+            normalized,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+            add_generation_prompt=add_generation_prompt,
+            preserve_thinking=not strip_assistant_reasoning_history,
+            tools=native_tools,
+        )
+    template_tools = _template_tools_for_prompt_mode(
+        tools,
+        tool_prompt_mode=effective_tool_prompt_mode,
+    )
     segmented_tool_history = _encode_generation_compatible_tool_history(
         tokenizer,
         normalized,
         add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
         preserve_thinking=not strip_assistant_reasoning_history,
-        tools=tools,
+        tools=template_tools,
         template_observability=template_observability,
     )
     if segmented_tool_history is not None:
         return segmented_tool_history
+    if not enable_thinking:
+        rendered = _render_messages_with_chat_template(
+            tokenizer,
+            normalized,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+            preserve_thinking=not strip_assistant_reasoning_history,
+            tools=template_tools,
+            template_observability=template_observability,
+        )
+        if rendered is not None:
+            return _encode_rendered_chat_text(tokenizer, rendered)
     template_kwargs: dict[str, Any] = {
         "tokenize": True,
         "add_generation_prompt": add_generation_prompt,
         "enable_thinking": enable_thinking,
         "preserve_thinking": not strip_assistant_reasoning_history,
     }
-    if tools:
-        template_kwargs["tools"] = tools
+    if reasoning_effort:
+        template_kwargs["reasoning_effort"] = reasoning_effort
+    if template_tools:
+        template_kwargs["tools"] = template_tools
     try:
         return _coerce_token_ids(
             tokenizer.apply_chat_template(
@@ -3662,8 +8917,8 @@ def _encode_messages(
                 "tokenize": True,
                 "add_generation_prompt": add_generation_prompt,
             }
-            if tools:
-                fallback_kwargs["tools"] = tools
+            if template_tools:
+                fallback_kwargs["tools"] = template_tools
             return _coerce_token_ids(
                 tokenizer.apply_chat_template(
                     normalized,
@@ -3671,7 +8926,7 @@ def _encode_messages(
                 )
             )
         except (TypeError, Exception):
-            if tools:
+            if template_tools:
                 try:
                     if template_observability is not None:
                         template_observability["tool_template_fallback"] = True
@@ -3692,7 +8947,7 @@ def _encode_messages(
                     ) from schema_free_exc
             pass
     except Exception:
-        if tools:
+        if template_tools:
             try:
                 if template_observability is not None:
                     template_observability["tool_template_fallback"] = True
@@ -3723,17 +8978,29 @@ def _render_messages_for_postcommit(
     normalized: list[dict[str, Any]],
     *,
     enable_thinking: bool,
+    reasoning_effort: str | None = None,
     preserve_thinking: bool,
     tools: list[dict[str, Any]] | None,
+    tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
 ) -> str | None:
-    normalized = _with_mtplx_tool_contract(normalized, tools=tools)
+    effective_tool_prompt_mode = _normalize_tool_prompt_mode(tool_prompt_mode)
+    if _tool_contract_active_for_mode(
+        tools_active=bool(tools),
+        tool_prompt_mode=effective_tool_prompt_mode,
+    ):
+        normalized = _with_mtplx_tool_contract(normalized, tools=tools)
+    template_tools = _template_tools_for_prompt_mode(
+        tools,
+        tool_prompt_mode=effective_tool_prompt_mode,
+    )
     return _render_messages_with_chat_template(
         tokenizer,
         normalized,
         add_generation_prompt=False,
         enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
         preserve_thinking=preserve_thinking,
-        tools=tools,
+        tools=template_tools,
     )
 
 
@@ -3794,9 +9061,11 @@ def _postcommit_next_turn_prefix_ids(
     history_messages: list[ChatMessage],
     *,
     enable_thinking: bool,
+    reasoning_effort: str | None = None,
     strip_assistant_reasoning_history: bool,
     tools: list[dict[str, Any]] | None,
     assistant_tool_calls: list[dict[str, Any]] | None,
+    tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
 ) -> list[int] | None:
     sentinel_role = "user"
     sentinel_message = ChatMessage(role="user", content=_POSTCOMMIT_SENTINEL_CONTENT)
@@ -3810,13 +9079,21 @@ def _postcommit_next_turn_prefix_ids(
         )
 
     normalized: list[dict[str, Any]] = []
-    for message in [*history_messages, sentinel_message]:
+    last_history_role: str | None = None
+    for message in history_messages:
         item = _message_to_template_dict(
             message,
             strip_assistant_reasoning_history=strip_assistant_reasoning_history,
         )
         if item is not None:
             normalized.append(item)
+            last_history_role = str(item.get("role") or "")
+    item = _message_to_template_dict(
+        sentinel_message,
+        strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+    )
+    if item is not None:
+        normalized.append(item)
     if not normalized:
         return None
 
@@ -3824,8 +9101,10 @@ def _postcommit_next_turn_prefix_ids(
         tokenizer,
         normalized,
         enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
         preserve_thinking=not strip_assistant_reasoning_history,
         tools=tools,
+        tool_prompt_mode=tool_prompt_mode,
     )
     if not rendered:
         return None
@@ -3850,9 +9129,24 @@ def _postcommit_next_turn_prefix_ids(
     prefix_text = rendered[:turn_start]
     if not prefix_text:
         return None
-    boundaries = (
-        _tool_history_generation_boundaries(prefix_text) if assistant_tool_calls else []
+    # Match _encode_messages(): assistant-boundary segmentation is only used
+    # when native template tools are active. Compact OpenCode history uses the
+    # schema-free contract and the normal prompt path plain-tokenizes the
+    # rendered chat, so segmenting here would create a different cache key for
+    # identical rendered text.
+    template_tools = _template_tools_for_prompt_mode(
+        tools,
+        tool_prompt_mode=tool_prompt_mode,
     )
+    boundaries: list[int] = []
+    if template_tools:
+        boundaries = _tool_history_generation_boundaries(prefix_text)
+        if not enable_thinking:
+            boundaries.extend(_qwen_plain_assistant_content_boundaries(prefix_text))
+        elif last_history_role == "assistant":
+            boundary = _last_qwen_assistant_generation_boundary(prefix_text)
+            if boundary is not None:
+                boundaries.append(boundary)
     return _encode_rendered_chat_text_segmented(tokenizer, prefix_text, boundaries)
 
 
@@ -3911,6 +9205,25 @@ def _request_extra(model: BaseModel, key: str, default: Any = None) -> Any:
 def _request_metadata(model: BaseModel) -> dict[str, Any]:
     metadata = _request_extra(model, "metadata", {})
     return metadata if isinstance(metadata, dict) else {}
+
+
+_CLIENT_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$")
+
+
+def _response_id_from_client_hint(
+    *,
+    prefix: str,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> str:
+    raw = headers.get("x-mtplx-request-id") or metadata.get("mtplx_request_id")
+    if raw is None:
+        return f"{prefix}-{uuid.uuid4().hex}"
+    hint = str(raw).strip()
+    if not _CLIENT_REQUEST_ID_RE.fullmatch(hint):
+        return f"{prefix}-{uuid.uuid4().hex}"
+    prefix_with_dash = f"{prefix}-"
+    return hint if hint.startswith(prefix_with_dash) else f"{prefix_with_dash}{hint}"
 
 
 def _request_max_tokens(request: BaseModel) -> int | None:
@@ -4075,11 +9388,15 @@ def _request_generation_mode_value(request: BaseModel) -> Any:
 
 
 def _request_generation_mode_for_generation(
-    state: ServerState, request: BaseModel
+    state: ServerState,
+    request: BaseModel,
+    *,
+    allow_client_controls: bool = True,
 ) -> str:
     default = _normalize_generation_mode(getattr(state.args, "generation_mode", "mtp"))
     mode = _normalize_generation_mode(
-        _request_generation_mode_value(request), default=default
+        _request_generation_mode_value(request) if allow_client_controls else None,
+        default=default,
     )
     if mode == "mtp" and not bool(getattr(state.runtime, "mtp_enabled", False)):
         raise HTTPException(
@@ -4090,7 +9407,13 @@ def _request_generation_mode_for_generation(
 
 
 def _request_depth_value(request: BaseModel) -> Any:
-    for key in ("depth", "mtp_depth", "speculative_depth"):
+    for key in (
+        "depth",
+        "mtp_depth",
+        "speculative_depth",
+        "draft_block_size",
+        "gemma_draft_block_size",
+    ):
         value = getattr(request, key, None)
         if value is None:
             value = _request_extra(request, key)
@@ -4099,24 +9422,240 @@ def _request_depth_value(request: BaseModel) -> Any:
     return None
 
 
+def _request_draft_control_value(
+    request: BaseModel,
+    descriptor: BackendDescriptor,
+) -> Any:
+    if descriptor.draft_semantics.unit == "block":
+        ordered = (
+            descriptor.draft_semantics.request_field,
+            "draft_block_size",
+            "gemma_draft_block_size",
+            "depth",
+            "mtp_depth",
+            "speculative_depth",
+        )
+    else:
+        ordered = (
+            descriptor.draft_semantics.request_field,
+            "depth",
+            "mtp_depth",
+            "speculative_depth",
+            "draft_block_size",
+            "gemma_draft_block_size",
+        )
+    seen: set[str] = set()
+    for key in ordered:
+        if key in seen:
+            continue
+        seen.add(key)
+        value = getattr(request, key, None)
+        if value is None:
+            value = _request_extra(request, key)
+        if value is not None:
+            return value
+    return None
+
+
+def _request_client_hint_from_headers(
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> str | None:
+    user_agent = headers.get("user-agent") or headers.get("User-Agent") or ""
+    user_agent_lower = user_agent.lower()
+    explicit_client = (
+        headers.get("x-mtplx-client")
+        or headers.get("X-MTPLX-Client")
+        or headers.get("x-client-name")
+        or headers.get("X-Client-Name")
+        or metadata.get("client")
+        or metadata.get("client_label")
+    )
+    if explicit_client:
+        return str(explicit_client).strip().lower().replace(" ", "_")
+    launch_client = os.getenv("MTPLX_CLIENT", "").strip()
+    if launch_client:
+        return launch_client.lower().replace(" ", "_")
+    if "opencode" in user_agent_lower:
+        return "opencode"
+    if "android" in user_agent_lower or "jetbrains" in user_agent_lower:
+        return "android_studio"
+    if "ai-sdk" in user_agent_lower:
+        return "ai_sdk_agent"
+    return None
+
+
+def _truthy_control_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "allow"}
+
+
+_MTPLX_MANAGED_CLIENT_HINTS = {
+    "browser",
+    "chat",
+    "hermes",
+    "mtplx",
+    "mtplx_app",
+    "mtplxapp",
+    "opencode",
+    "openwebui",
+    "pi",
+}
+
+
+def _app_managed_client_hint(
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> str | None:
+    hint = _request_client_hint_from_headers(headers, metadata)
+    if not hint:
+        return None
+    normalized = str(hint).strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in _MTPLX_MANAGED_CLIENT_HINTS:
+        return normalized
+    if normalized.startswith("mtplx_"):
+        return normalized
+    return None
+
+
+def _client_controls_allowed(
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> bool:
+    if _app_managed_client_hint(headers, metadata):
+        return False
+    value = (
+        headers.get("x-mtplx-allow-client-controls")
+        or headers.get("X-MTPLX-Allow-Client-Controls")
+        or metadata.get("allow_client_controls")
+        or metadata.get("mtplx_allow_client_controls")
+    )
+    return _truthy_control_value(value)
+
+
+def _ignored_client_control_fields(request: BaseModel) -> list[str]:
+    """Request controls ignored unless the caller explicitly opts in.
+
+    MTPLX-owned launch/live settings are the authority for generation
+    policy. Client payload controls become observable hints by default.
+    """
+
+    fields: list[str] = []
+    if getattr(request, "temperature", None) is not None:
+        fields.append("temperature")
+    if getattr(request, "top_p", None) is not None:
+        fields.append("top_p")
+    if getattr(request, "top_k", None) is not None:
+        fields.append("top_k")
+    if getattr(request, "enable_thinking", None) is not None:
+        fields.append("enable_thinking")
+    if getattr(request, "reasoning_effort", None) is not None:
+        fields.append("reasoning_effort")
+    if _request_generation_mode_value(request) is not None:
+        fields.append("generation_mode")
+    if _request_depth_value(request) is not None:
+        fields.append("draft_control")
+    return fields
+
+
 def _request_depth_for_generation(
     state: ServerState,
     request: BaseModel,
     *,
     generation_mode: str,
+    allow_client_controls: bool = True,
 ) -> int:
+    descriptor = _backend_descriptor(state)
     if generation_mode == "ar":
         return 0
-    value = _request_depth_value(request)
+    value = (
+        _request_draft_control_value(request, descriptor)
+        if allow_client_controls
+        else None
+    )
     if value is None:
-        return int(getattr(state.args, "depth", 3))
+        default_value = getattr(
+            state.args,
+            descriptor.draft_semantics.request_field,
+            None,
+        )
+        if default_value is None:
+            default_value = getattr(
+                state.args,
+                "depth",
+                descriptor.draft_semantics.default,
+            )
+        return descriptor.draft_semantics.clamp(default_value)
     try:
         depth = int(value)
     except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="depth must be an integer") from exc
-    if depth < 1 or depth > 3:
-        raise HTTPException(status_code=400, detail="depth must be between 1 and 3")
+        detail = f"{descriptor.draft_semantics.display_label.lower()} must be an integer"
+        raise HTTPException(status_code=400, detail=detail) from exc
+    minimum = descriptor.draft_semantics.minimum
+    maximum = descriptor.draft_semantics.maximum
+    if depth < minimum or depth > maximum:
+        detail = (
+            f"{descriptor.draft_semantics.display_label.lower()} must be "
+            f"between {minimum} and {maximum}"
+        )
+        raise HTTPException(status_code=400, detail=detail)
     return depth
+
+
+def _opencode_short_context_depth_policy(
+    request: BaseModel,
+    *,
+    headers: dict[str, str],
+    metadata: dict[str, Any],
+    generation_mode: str,
+    request_depth: int,
+    prompt_tokens: int,
+) -> tuple[int, dict[str, Any]]:
+    client_hint = _request_client_hint_from_headers(headers, metadata)
+    policy = {
+        "active": False,
+        "client": client_hint,
+        "effective_depth": int(request_depth),
+        "explicit_depth": _request_depth_value(request) is not None,
+        "prompt_tokens": int(prompt_tokens),
+        "reason": "disabled_depth_preservation",
+        "requested_depth": int(request_depth),
+        "threshold": None,
+    }
+    if generation_mode == "ar" or request_depth <= 0:
+        policy["reason"] = "generation_mode_ar"
+        return request_depth, policy
+    if policy["explicit_depth"]:
+        policy["reason"] = "explicit_depth"
+        return request_depth, policy
+    if client_hint is None or "opencode" not in client_hint:
+        policy["reason"] = "not_opencode"
+        return request_depth, policy
+    return request_depth, policy
+
+
+def _long_context_mtp_depth_policy_for_request(
+    state: ServerState,
+    *,
+    generation_mode: str,
+    request_depth: int,
+    prompt_tokens: int,
+) -> tuple[int, dict[str, Any]]:
+    if generation_mode == "ar" or request_depth <= 0:
+        return 0, {}
+    descriptor = _backend_descriptor(state)
+    if not descriptor.supports("native_adaptive_depth_policy"):
+        return request_depth, {
+            "active": False,
+            "reason": f"{descriptor.backend_id}_owns_draft_policy",
+        }
+    effective_depth, policy = resolve_long_context_mtp_depth(
+        prompt_tokens=prompt_tokens,
+        requested_depth=request_depth,
+        min_depth=1,
+    )
+    return int(effective_depth), dict(policy)
 
 
 def _token_window_rate(token_times: list[float], window: int) -> float | None:
@@ -4143,6 +9682,58 @@ def _token_window_rate_first(token_times: list[float], window: int) -> float | N
     return (len(subset) - 1) / elapsed
 
 
+MAINTENANCE_TIMING_STATS_KEYS = (
+    "mtp_history_materialize_every",
+    "mtp_history_materialize_events",
+    "clear_cache_every",
+    "clear_cache_events",
+    "clear_cache_time_s",
+    "trunk_cache_materialize_every",
+    "trunk_cache_materialize_events",
+    "trunk_cache_materialize_time_s",
+    "dirty_detach_components",
+    "dirty_detach_mode",
+    "dirty_detach_gdn_every",
+    "dirty_detach_conv_every",
+    "dirty_detach_attn_every",
+    "dirty_detach_events",
+    "dirty_detach_time_s",
+    "dirty_detach_arrays",
+    "dirty_detach_bytes",
+    "live_output_detach_enabled",
+    "live_output_detach_mode",
+    "live_output_detach_events",
+    "live_output_detach_time_s",
+    "live_output_detach_arrays",
+    "live_output_detach_bytes",
+    "state_rebase_every",
+    "state_rebase_events",
+    "state_rebase_time_s",
+    "state_root_eval_enabled",
+    "state_root_eval_include_mtp",
+    "state_root_eval_events",
+    "state_root_eval_time_s",
+    "state_root_eval_arrays",
+    "capture_commit_detach_components",
+    "capture_commit_detach_mode",
+    "capture_commit_detach_gdn_every",
+    "capture_commit_detach_conv_every",
+    "capture_commit_detach_events",
+    "capture_commit_detach_time_s",
+    "capture_commit_detach_arrays",
+    "capture_commit_detach_bytes",
+    "trace_accounting_time_s",
+)
+
+
+def _maintenance_timing_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: stats[key]
+        for key in MAINTENANCE_TIMING_STATS_KEYS
+        if key in stats
+    }
+
+
 def _metrics_envelope(
     *,
     stats: dict[str, Any],
@@ -4160,6 +9751,18 @@ def _metrics_envelope(
     generation_limits: dict[str, Any],
 ) -> dict[str, Any]:
     decode_tok_s, decode_elapsed_s = _decode_timing(stats)
+    sliding_decode_tok_s_first_32 = _token_window_rate_first(token_times, 32)
+    sliding_decode_tok_s_first_64 = _token_window_rate_first(token_times, 64)
+    sliding_decode_tok_s_first_128 = _token_window_rate_first(token_times, 128)
+    sliding_decode_tok_s_first_256 = _token_window_rate_first(token_times, 256)
+    sliding_decode_tok_s_last_32 = _token_window_rate(token_times, 32)
+    sliding_decode_tok_s_last_64 = _token_window_rate(token_times, 64)
+    sliding_decode_tok_s_last_128 = _token_window_rate(token_times, 128)
+    sliding_decode_tok_s_last_256 = _token_window_rate(token_times, 256)
+    # Keep this legacy field equal to the completed-request generation TPS.
+    # The sliding-window rates below remain available for diagnostics, but
+    # consumer UI must not present a token-window burst as "TPS".
+    display_decode_tok_s = decode_tok_s
     prompt_eval_time_s = float(stats.get("prompt_eval_time_s") or 0.0)
     ttft_s = max(0.0, token_times[0] - request_started_s) if token_times else None
     cached_tokens = int(stats.get("cached_tokens") or 0)
@@ -4175,9 +9778,20 @@ def _metrics_envelope(
         "prompt_tokens": int(prompt_tokens),
         "cached_tokens": cached_tokens,
         "new_prefill_tokens": max(0, new_prefill_tokens),
+        "cache_source": str(stats.get("cache_source") or ("ram" if session_cache_hit else "none")),
+        "ssd_cache_hit": bool(stats.get("ssd_cache_hit") or False),
+        "ssd_cached_tokens": int(stats.get("ssd_cached_tokens") or 0),
+        "ssd_restore_s": float(stats.get("ssd_restore_s") or 0.0),
+        "ssd_suffix_tokens": int(stats.get("ssd_suffix_tokens") or 0),
         "completion_tokens": int(completion_tokens),
         "prompt_eval_time_s": prompt_eval_time_s,
+        "cache_restore_time_s": max(
+            float(stats.get("cache_restore_time_s") or 0.0),
+            float(stats.get("ssd_restore_s") or 0.0),
+        ),
         "prefill_tok_s": prefill_tok_s,
+        "prefill_compute_tok_s": prefill_tok_s,
+        "prefill_wall_tok_s": stats.get("prefill_wall_tok_s"),
         "prompt_tps": prefill_tok_s,
         "ttft_s": ttft_s,
         "decode_elapsed_s": decode_elapsed_s,
@@ -4186,23 +9800,83 @@ def _metrics_envelope(
         if request_elapsed_s > 0
         else 0.0,
         "decode_tok_s": decode_tok_s,
-        "sliding_decode_tok_s_first_32": _token_window_rate_first(token_times, 32),
-        "sliding_decode_tok_s_first_64": _token_window_rate_first(token_times, 64),
-        "sliding_decode_tok_s_last_32": _token_window_rate(token_times, 32),
-        "sliding_decode_tok_s_last_64": _token_window_rate(token_times, 64),
+        "display_decode_tok_s": display_decode_tok_s,
+        "sliding_decode_tok_s_first_32": sliding_decode_tok_s_first_32,
+        "sliding_decode_tok_s_first_64": sliding_decode_tok_s_first_64,
+        "sliding_decode_tok_s_first_128": sliding_decode_tok_s_first_128,
+        "sliding_decode_tok_s_first_256": sliding_decode_tok_s_first_256,
+        "sliding_decode_tok_s_last_32": sliding_decode_tok_s_last_32,
+        "sliding_decode_tok_s_last_64": sliding_decode_tok_s_last_64,
+        "sliding_decode_tok_s_last_128": sliding_decode_tok_s_last_128,
+        "sliding_decode_tok_s_last_256": sliding_decode_tok_s_last_256,
         "mtp_depth": int(mtp_depth),
         "verify_calls": int(stats.get("verify_calls") or 0),
         "accepted_by_depth": stats.get("accepted_by_depth") or [],
+        "drafted_by_depth": stats.get("drafted_by_depth") or [],
+        "mean_accept_probability_by_depth": (
+            stats.get("mean_accept_probability_by_depth") or []
+        ),
         "correction_tokens": int(stats.get("correction_tokens") or 0),
         "bonus_tokens": int(stats.get("bonus_tokens") or 0),
         "verify_time_s": float(stats.get("verify_time_s") or 0.0),
+        "verify_forward_time_s": float(stats.get("verify_forward_time_s") or 0.0),
+        "verify_eval_time_s": float(stats.get("verify_eval_time_s") or 0.0),
+        "verify_logits_eval_time_s": float(
+            stats.get("verify_logits_eval_time_s") or 0.0
+        ),
+        "verify_hidden_eval_time_s": float(
+            stats.get("verify_hidden_eval_time_s") or 0.0
+        ),
+        "verify_joint_eval_time_s": float(stats.get("verify_joint_eval_time_s") or 0.0),
+        "verify_target_distribution_time_s": float(
+            stats.get("verify_target_distribution_time_s") or 0.0
+        ),
+        "target_distribution_materialized_rows": int(
+            stats.get("target_distribution_materialized_rows") or 0
+        ),
+        "target_distribution_materialized_windows": int(
+            stats.get("target_distribution_materialized_windows") or 0
+        ),
+        "target_distribution_share": float(
+            stats.get("target_distribution_share") or 0.0
+        ),
+        "lazy_bonus_verify_calls": int(stats.get("lazy_bonus_verify_calls") or 0),
+        "lazy_bonus_commit_time_s": float(
+            stats.get("lazy_bonus_commit_time_s") or 0.0
+        ),
+        "verify_eval_unattributed_time_s": float(
+            stats.get("verify_eval_unattributed_time_s") or 0.0
+        ),
+        "target_forward_time_s": float(stats.get("target_forward_time_s") or 0.0),
         "draft_time_s": float(stats.get("draft_time_s") or 0.0),
         "accept_time_s": float(stats.get("accept_time_s") or 0.0),
         "repair_time_s": float(stats.get("repair_time_s") or 0.0),
+        "mtp_history_policy": str(stats.get("mtp_history_policy") or ""),
+        "mtp_history_window_tokens": int(
+            stats.get("mtp_history_window_tokens") or 0
+        ),
+        "mtp_history_position_base": int(
+            stats.get("mtp_history_position_base") or 0
+        ),
+        **_maintenance_timing_stats(stats),
         "session_cache_hit": bool(session_cache_hit),
         "cache_miss_reason": cache_miss_reason,
         "session_restore_mode": session_restore_mode,
         "context_len": int(prompt_tokens + completion_tokens),
+        "repetition_stop_triggered": bool(
+            stats.get("repetition_stop_triggered") or False
+        ),
+        "repetition_stop_reason": stats.get("repetition_stop_reason"),
+        "repetition_stop_block_tokens": int(
+            stats.get("repetition_stop_block_tokens") or 0
+        ),
+        "repetition_stop_repeats": int(stats.get("repetition_stop_repeats") or 0),
+        "repetition_stop_trimmed_tokens": int(
+            stats.get("repetition_stop_trimmed_tokens") or 0
+        ),
+        "repetition_stop_raw_tokens": int(
+            stats.get("repetition_stop_raw_tokens") or 0
+        ),
         "lock_wait_time_s": lock_wait_time_s,
         "session_id": session_id,
         **generation_limits,
@@ -4243,6 +9917,1181 @@ def _repair_streamed_generation_stats(
             float(completion_tokens) / elapsed_s if elapsed_s > 0 else 0.0
         )
     return repaired
+
+
+_MACHINE_INFO_CACHE: dict[str, Any] = {}
+
+
+def _machine_info() -> dict[str, Any]:
+    """Resolve hardware identity (chip, model, and unified-memory bytes), cached.
+
+    These values come from ``sysctl`` on macOS; on non-macOS the fields are
+    filled with best-effort fallbacks so the dashboard's HardwareBanner
+    always has something honest to render.
+    """
+
+    if _MACHINE_INFO_CACHE:
+        return dict(_MACHINE_INFO_CACHE)
+    chip: str | None = None
+    model: str | None = None
+    mem_bytes: int | None = None
+    try:
+        chip = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=1.0,
+        ).stdout.strip() or None
+    except Exception:
+        pass
+    try:
+        model = subprocess.run(
+            ["sysctl", "-n", "hw.model"],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=1.0,
+        ).stdout.strip() or None
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=1.0,
+        ).stdout.strip()
+        mem_bytes = int(result) if result.isdigit() else None
+    except Exception:
+        pass
+    if model is None:
+        try:
+            import platform as _platform
+
+            model = _platform.machine() or _platform.processor() or None
+        except Exception:
+            model = None
+    if mem_bytes is None:
+        try:
+            mem_bytes = int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+        except Exception:
+            mem_bytes = None
+    info = {"chip": chip, "machine_model": model, "unified_memory_bytes": mem_bytes}
+    _MACHINE_INFO_CACHE.update(info)
+    return dict(info)
+
+
+def _mlx_memory_stats_live() -> dict[str, Any]:
+    """Snapshot of MLX's live memory accessors (active, peak, cache).
+
+    Returns ``{"ok": False, ...}`` if MLX is unavailable or any accessor
+    raises; the dashboard surfaces ``ok`` as a graceful empty state.
+
+    Prefers the top-level ``mx.get_*`` accessors and falls back to
+    ``mx.metal.get_*`` for older MLX versions; the metal namespace was
+    deprecated in mlx 0.30+.
+    """
+
+    try:
+        import mlx.core as _mx
+    except Exception as exc:
+        return {"ok": False, "error": f"mlx unavailable: {exc!r}"}
+    snapshot: dict[str, Any] = {"ok": True}
+    metal_ns = getattr(_mx, "metal", None)
+    for attr in ("get_active_memory", "get_cache_memory", "get_peak_memory"):
+        fn = getattr(_mx, attr, None) or getattr(metal_ns, attr, None)
+        try:
+            snapshot[attr.removeprefix("get_") + "_bytes"] = int(fn()) if fn else None
+        except Exception:
+            snapshot[attr.removeprefix("get_") + "_bytes"] = None
+    return snapshot
+
+
+def _dashboard_prompt_preview(
+    request: Any, tokenizer: Any, *, max_chars: int = 96
+) -> str:
+    """Best-effort short preview of the last user message for the in-flight panel."""
+
+    del tokenizer  # reserved for future token-level previews
+    try:
+        messages = getattr(request, "messages", None) or []
+        prompt = getattr(request, "prompt", None)
+        text: str = ""
+        if isinstance(prompt, str) and prompt:
+            text = prompt
+        else:
+            for message in reversed(messages):
+                if getattr(message, "role", None) == "user":
+                    content = getattr(message, "content", None)
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                text = str(part.get("text") or "")
+                                if text:
+                                    break
+                    if text:
+                        break
+        text = text.replace("\n", " ").replace("\r", " ").strip()
+        if len(text) > max_chars:
+            text = text[: max_chars - 3].rstrip() + "..."
+        return text
+    except Exception:
+        return ""
+
+
+def _dashboard_record_completion(
+    state: "ServerState",
+    *,
+    envelope: dict[str, Any],
+    stats: dict[str, Any],
+) -> None:
+    """Feed a finished generation's envelope into the dashboard primitives.
+
+    Called once per generation completion. Safe to call when the dashboard
+    primitives are not yet initialized (early warmup): we short-circuit if
+    ``state.dashboard`` is unavailable. The function is deliberately
+    tolerant — a missing/malformed metric is treated as zero rather than
+    raising, so a transient stats glitch never breaks a user-visible
+    response.
+    """
+
+    dashboard = getattr(state, "dashboard", None)
+    if dashboard is None:
+        return
+    try:
+        request_id = envelope.get("request_id") or stats.get("request_id")
+        if isinstance(request_id, str) and request_id:
+            dashboard.in_flight.deregister(request_id)
+            dashboard.progress_events.forget(request_id)
+        prompt_tokens = int(envelope.get("prompt_tokens") or 0)
+        completion_tokens = int(envelope.get("completion_tokens") or 0)
+        cached_tokens = int(envelope.get("cached_tokens") or 0)
+        raw_decode_tok_s = envelope.get("decode_tok_s")
+        display_decode_tok_s = envelope.get("display_decode_tok_s")
+        decode_tok_s = (
+            raw_decode_tok_s
+            if isinstance(raw_decode_tok_s, (int, float)) and raw_decode_tok_s > 0
+            else display_decode_tok_s
+        )
+        session_id = envelope.get("session_id")
+        dashboard.lifetime.record_completion(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+        )
+        is_new_max = False
+        if isinstance(decode_tok_s, (int, float)) and decode_tok_s > 0:
+            is_new_max = dashboard.rolling.append(float(decode_tok_s), session_id)
+        prefill_row = {
+            "t": time.time(),
+            "session_id": session_id,
+            "prompt_tokens": prompt_tokens,
+            "cached_tokens": cached_tokens,
+            "new_prefill_tokens": int(envelope.get("new_prefill_tokens") or 0),
+            "prompt_eval_time_s": float(envelope.get("prompt_eval_time_s") or 0.0),
+            "prefill_tok_s": envelope.get("prefill_tok_s"),
+            "prefill_compute_tok_s": envelope.get("prefill_compute_tok_s")
+            or envelope.get("prefill_tok_s"),
+            "prefill_wall_tok_s": envelope.get("prefill_wall_tok_s"),
+            "ttft_s": envelope.get("ttft_s"),
+            "session_cache_hit": bool(envelope.get("session_cache_hit")),
+            "cache_miss_reason": envelope.get("cache_miss_reason"),
+            "context_len": int(envelope.get("context_len") or 0),
+            "model_id": state.model_id,
+        }
+        dashboard.prefill_history.append(prefill_row)
+        dashboard.bus.publish(
+            {
+                "kind": "completed",
+                "when_s": time.time(),
+                "envelope": dict(envelope),
+            }
+        )
+        if is_new_max and isinstance(decode_tok_s, (int, float)):
+            dashboard.bus.publish(
+                {
+                    "kind": "new_max_tps",
+                    "when_s": time.time(),
+                    "tok_s": float(decode_tok_s),
+                    "session_id": session_id,
+                    "raw_decode_tok_s": raw_decode_tok_s,
+                }
+            )
+    except Exception as exc:
+        # Never let a metrics bug break a user response.
+        _safe_stdout_print(f"[dashboard] record_completion suppressed error: {exc!r}")
+
+
+def _dashboard_publish_prefill(
+    state: "ServerState",
+    *,
+    request_id: str,
+    payload: dict[str, Any],
+    session_id: str | None,
+) -> None:
+    """Forward a chunked-prefill progress event into the bus + registry.
+
+    Payload shape (from generation.py):
+      - phase: "started" | "chunk" | "completed"
+      - tokens_total: prompt size in tokens
+      - tokens_done: tokens processed so far (chunk + completed phases)
+      - cached_tokens: tokens served from cache (no compute)
+      - elapsed_s: wall time since prefill_started
+      - prefill_tok_s: tokens/sec (computed at completion; cumulative on chunks)
+      - prefill_compute_tok_s: new prefilled tokens / model prompt eval time
+      - prefill_wall_tok_s: new prefilled tokens / wall prefill phase time
+      - cumulative_prefill_tok_s/live_prefill_tok_s: chunk-phase display rates
+      - chunk_size: most recent chunk size (chunk phase only)
+      - chunk_elapsed_s/chunk_prefill_tok_s: most recent chunk timing
+      - cache_hit: whether the bank served any prefix (completed)
+      - started_s: monotonic timestamp at prefill start
+
+    We enrich with request_id + session_id and a derived live tok/s so the
+    dashboard doesn't have to recompute on every event.
+    """
+
+    dashboard = getattr(state, "dashboard", None)
+    if dashboard is None:
+        return
+    try:
+        enriched = dict(payload)
+        enriched["request_id"] = request_id
+        enriched["session_id"] = session_id
+        # Live tok/s during chunked prefill (completion provides its own).
+        if enriched.get("phase") == "chunk":
+            tokens_done = float(enriched.get("tokens_done") or 0)
+            elapsed = float(enriched.get("elapsed_s") or 0)
+            if tokens_done > 0 and elapsed > 0:
+                cumulative_tok_s = tokens_done / elapsed
+                enriched.setdefault("prefill_tok_s", cumulative_tok_s)
+                enriched.setdefault("cumulative_prefill_tok_s", cumulative_tok_s)
+                enriched.setdefault("prefill_wall_tok_s", cumulative_tok_s)
+                chunk_tok_s = enriched.get("chunk_prefill_tok_s")
+                if isinstance(chunk_tok_s, (int, float)) and chunk_tok_s > 0:
+                    enriched.setdefault("live_prefill_tok_s", float(chunk_tok_s))
+                else:
+                    enriched.setdefault("live_prefill_tok_s", cumulative_tok_s)
+        # Update the in-flight handle so a poll of /v1/mtplx/snapshot
+        # immediately reflects the current prefill state without waiting
+        # for the SSE stream.
+        if enriched.get("phase") == "completed":
+            dashboard.in_flight.update_prefill(request_id, None)
+        else:
+            dashboard.in_flight.update_prefill(request_id, enriched)
+        dashboard.bus.publish({"kind": "prefill", "when_s": time.time(), **enriched})
+    except Exception as exc:
+        _safe_stdout_print(f"[dashboard] publish_prefill suppressed error: {exc!r}")
+
+
+def _dashboard_publish_progress(
+    state: "ServerState",
+    *,
+    request_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Forward a streaming progress chunk into the dashboard bus + registry."""
+
+    dashboard = getattr(state, "dashboard", None)
+    if dashboard is None:
+        return None
+    decision_started_s = time.perf_counter()
+    completion_tokens = int(payload.get("completion_tokens") or 0)
+    try:
+        should_publish = dashboard.progress_events.should_publish(
+            request_id,
+            completion_tokens=completion_tokens,
+        )
+        decision_time_s = time.perf_counter() - decision_started_s
+        if not should_publish:
+            dashboard.progress_events.record_overhead(
+                request_id,
+                published=False,
+                completion_tokens=completion_tokens,
+                decision_time_s=decision_time_s,
+            )
+            return None
+
+        enriched = dict(payload)
+        enriched["dashboard_progress_published"] = True
+        registry_started_s = time.perf_counter()
+        dashboard.in_flight.update_progress(request_id, enriched)
+        registry_update_time_s = time.perf_counter() - registry_started_s
+        decode_tok_s = payload.get("decode_tok_s")
+        is_new_max = False
+        rolling_update_time_s = 0.0
+        if isinstance(decode_tok_s, (int, float)) and decode_tok_s > 0:
+            rolling_started_s = time.perf_counter()
+            is_new_max = dashboard.rolling.observe_progress(
+                float(decode_tok_s),
+                payload.get("session_id") or request_id,
+            )
+            rolling_update_time_s = time.perf_counter() - rolling_started_s
+        bus_started_s = time.perf_counter()
+        dashboard.bus.publish(
+            {
+                "kind": "progress",
+                "when_s": time.time(),
+                "request_id": request_id,
+                "progress": dict(enriched),
+            }
+        )
+        if is_new_max and isinstance(decode_tok_s, (int, float)):
+            dashboard.bus.publish(
+                {
+                    "kind": "new_max_tps",
+                    "when_s": time.time(),
+                    "tok_s": float(decode_tok_s),
+                    "session_id": payload.get("session_id"),
+                }
+            )
+        bus_publish_time_s = time.perf_counter() - bus_started_s
+        dashboard.progress_events.record_overhead(
+            request_id,
+            published=True,
+            completion_tokens=completion_tokens,
+            decision_time_s=decision_time_s,
+            registry_update_time_s=registry_update_time_s,
+            rolling_update_time_s=rolling_update_time_s,
+            bus_publish_time_s=bus_publish_time_s,
+        )
+        enriched["dashboard_progress_decision_time_s"] = decision_time_s
+        enriched["dashboard_progress_registry_update_time_s"] = (
+            registry_update_time_s
+        )
+        enriched["dashboard_progress_rolling_update_time_s"] = (
+            rolling_update_time_s
+        )
+        enriched["dashboard_progress_bus_publish_time_s"] = bus_publish_time_s
+        return enriched
+    except Exception as exc:
+        _safe_stdout_print(f"[dashboard] publish_progress suppressed error: {exc!r}")
+        return None
+
+
+def _attach_dashboard_progress_stats(
+    state: "ServerState",
+    *,
+    request_id: str,
+    stats: dict[str, Any],
+) -> None:
+    dashboard = getattr(state, "dashboard", None)
+    if dashboard is None:
+        return
+    try:
+        stats.update(dashboard.progress_events.stats_for(request_id))
+    except Exception as exc:
+        _safe_stdout_print(f"[dashboard] progress stats suppressed error: {exc!r}")
+
+
+# --- Mutable settings surface for the dashboard ----------------------------
+#
+# Profile, model, MTP loading, host, port and a handful of other knobs are
+# immutable at startup (re-applying mid-run would need a model/runtime
+# reload). The dashboard sidebar splits "mutable" from "restart required";
+# this helper enforces the same split server-side.
+DASHBOARD_MUTABLE_SETTINGS_KEYS: tuple[str, ...] = (
+    "reasoning",
+    "generation_mode",
+    "depth",
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_response_tokens",
+    "stream_interval",
+    "enable_thinking",
+    "reasoning_parser",
+    "reasoning_effort",
+    "prefill_chunk_tokens",
+    "draft_temperature",
+    "draft_top_p",
+    "draft_top_k",
+)
+DASHBOARD_READ_ONLY_SETTINGS_KEYS: tuple[str, ...] = (
+    "architecture_id",
+    "backend_id",
+    "context_window",
+    "context_window_policy",
+    "depth_max",
+    "draft_control",
+    "kv_quant_policy",
+    "model_controls",
+    "model_family",
+    "reasoning_policy",
+    "sampling_defaults",
+    "support_level",
+    "tune_policy",
+)
+DASHBOARD_RESTART_REQUIRED_KEYS: tuple[str, ...] = (
+    "profile",
+    "model",
+    "host",
+    "port",
+    "load_mtp",
+    "verify_core",
+    "verify_strategy",
+    "scheduler_mode",
+    "batching_preset",
+    "max_active_requests",
+    "decode_batch_max",
+    "batch_wait_ms",
+    "experimental_mtp_cohorts",
+    "ram_session_cache_policy",
+    "ram_session_block_prefix_restore",
+    "ram_session_cache_max_entries",
+    "ram_session_cache_max_size",
+    "ram_session_cache_per_session_max_size",
+    "ssd_session_cache",
+    "ssd_session_cache_dir",
+    "ssd_session_cache_max_size",
+    "ssd_session_cache_min_prefix_tokens",
+    "paged_kv_quantization",
+    "context_window",
+    "api_key",
+)
+DASHBOARD_API_VERSION = 1
+DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS = 200
+DASHBOARD_SNAPSHOT_INTERVAL_MIN_MS = 100
+DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS = 5000
+
+
+def _dashboard_snapshot_interval_s(snapshot_interval_ms: int | None) -> float:
+    """Coerce the dashboard/native-app snapshot cadence into safe bounds."""
+
+    if snapshot_interval_ms is None:
+        value = DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS
+    else:
+        value = int(snapshot_interval_ms)
+    value = max(
+        DASHBOARD_SNAPSHOT_INTERVAL_MIN_MS,
+        min(DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS, value),
+    )
+    return value / 1000.0
+
+
+def _mtplx_app_capabilities() -> dict[str, Any]:
+    """Return the stable backend contract consumed by native app shells."""
+
+    from mtplx.dashboard import has_static_bundle
+
+    endpoints = {
+        "health": "/health",
+        "metrics": "/metrics",
+        "sessions": "/admin/sessions",
+        "session_clear": "/admin/sessions/{session_id}/clear",
+        "cache_clear": "/admin/cache/clear",
+        "ssd_cache": "/admin/cache/ssd",
+        "ssd_cache_archive": "/admin/cache/ssd/archive",
+        "snapshot": "/v1/mtplx/snapshot",
+        "metrics_stream": "/v1/mtplx/metrics/stream",
+        "prefill_history": "/v1/mtplx/prefill_history",
+        "settings": "/v1/mtplx/settings",
+        "cancel": "/v1/mtplx/cancel/{request_id}",
+        "dashboard": "/dashboard/",
+        "app_capabilities": "/v1/mtplx/app/capabilities",
+    }
+    return {
+        "ok": True,
+        "name": "MTPLX App Backend",
+        "api_version": DASHBOARD_API_VERSION,
+        "endpoints": endpoints,
+        "mutable_settings": list(DASHBOARD_MUTABLE_SETTINGS_KEYS),
+        "restart_required_settings": list(DASHBOARD_RESTART_REQUIRED_KEYS),
+        "snapshot_interval": {
+            "default_ms": DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS,
+            "min_ms": DASHBOARD_SNAPSHOT_INTERVAL_MIN_MS,
+            "max_ms": DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS,
+            "native_default_ms": 500,
+            "performance_lock_ms": 1000,
+        },
+        "features": {
+            "sse_metrics": True,
+            "request_cancel": True,
+            "cache_clear": True,
+            "ssd_session_cache": True,
+            "ram_session_cache_controls": True,
+            "paged_kv_quantization": True,
+            "ssd_cache_archive": True,
+            "session_clear": True,
+            "prefill_history": True,
+            "settings_mutation": True,
+            "thermal_polling": True,
+            "dashboard_static_bundle": has_static_bundle(),
+            "scheduler_telemetry": True,
+            "batching_policy": True,
+            "cooperative_scheduler_core": True,
+            "ar_batching_core": True,
+            "ar_batching_live": True,
+            "concurrent_mtp_ar_fallback": True,
+            "mtp_cohorts_experimental": True,
+            "mtp_cohorts_default_enabled": False,
+            "startup_ownership": True,
+            "strict_max_fan_startup": True,
+            "thermal_actual_ramp_verification": True,
+            "omlx_style_tool_parser": True,
+            "parse_tools_at_completion": True,
+            "early_tool_cancel_default": False,
+            "hidden_generation_repair_default": False,
+        },
+        "openai_bridge": {
+            "mode": "omlx_style",
+            "preserve_reasoning_content": True,
+            "preserve_tool_results": True,
+            "parse_order": ["native", "qwen_xml", "namespaced", "bracket"],
+            "malformed_tool_markup": "content_with_telemetry",
+            "early_tool_cancel_default": False,
+            "hidden_generation_repair_default": False,
+            "legacy_bridge_default": False,
+        },
+        "scheduler": {
+            "modes": list(SCHEDULER_MODE_CHOICES),
+            "presets": list(BATCHING_PRESET_CHOICES),
+            "v1_done_path": "path_a_solo_mtp_plus_cooperative_ar",
+            "default_ux": "coding_agents",
+            "default_policy": "solo_mtp_oracle",
+            "solo_mtp_protected": True,
+            "batched_mtp_required_for_v1": False,
+        },
+    }
+
+
+def _json_env(name: str) -> dict[str, Any] | None:
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _int_env(name: str) -> int | None:
+    try:
+        return int(str(os.environ.get(name) or "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _startup_health_payload(state: "ServerState") -> dict[str, Any]:
+    chat_template_report = getattr(state, "chat_template_report", {}) or {}
+    tool_prompt_mode = _tool_prompt_mode_from_args(state.args)
+    backend = _backend_descriptor(state)
+    model_ref = str(getattr(state.args, "model", None) or state.model_id)
+    model_context_window_max = getattr(state, "model_context_window_max", None)
+    model_controls = model_controls_for_descriptor(
+        backend,
+        model_ref=model_ref,
+        inspection=(
+            {"model_context_window": int(model_context_window_max)}
+            if model_context_window_max
+            else None
+        ),
+    )
+    return {
+        "launch_id": getattr(state.args, "app_launch_id", None)
+        or os.environ.get("MTPLX_APP_LAUNCH_ID"),
+        "pid": os.getpid(),
+        "app_parent_pid": _int_env("MTPLX_APP_PARENT_PID"),
+        "started_at": getattr(state, "started_at_s", None),
+        "model_id": state.model_id,
+        "api_key_required": bool(getattr(state.args, "api_key", None)),
+        "api_key_source": str(getattr(state.args, "api_key_source", "none") or "none"),
+        "paged_kv_quantization": _effective_paged_kv_quantization(),
+        "backend": backend.to_dict(),
+        "model_controls": model_controls,
+        "warmup": state.warmup_status,
+        "tool_prompt_mode": tool_prompt_mode,
+        "tool_contract_active": _tool_contract_active_for_mode(
+            tools_active=True,
+            tool_prompt_mode=tool_prompt_mode,
+        ),
+        "tool_contract_policy_version": _tool_prompt_policy_version(
+            tools_active=True,
+            tool_prompt_mode=tool_prompt_mode,
+        ),
+        "chat_template_profile": chat_template_report.get("profile")
+        or getattr(state, "chat_template_profile", _CHAT_TEMPLATE_PROFILE_LOCAL),
+        "chat_template_source": chat_template_report.get("source"),
+        "chat_template_path": chat_template_report.get("path"),
+        "chat_template_hash": getattr(state, "template_hash", None),
+    }
+
+
+def _server_fan_mode(state: Any) -> str:
+    try:
+        return normalize_fan_mode(
+            getattr(state, "fan_mode", None)
+            or getattr(getattr(state, "args", None), "fan_mode", None)
+            or os.environ.get("MTPLX_FAN_MODE")
+            or FAN_MODE_DEFAULT
+        )
+    except ValueError:
+        return FAN_MODE_DEFAULT
+
+
+def _smart_fan_status(state: Any) -> dict[str, Any]:
+    controller = getattr(state, "smart_fans", None)
+    if controller is None:
+        return {
+            "active": False,
+            "active_count": 0,
+            "commanded_max": False,
+        }
+    try:
+        return dict(controller.status())
+    except Exception as exc:
+        return {
+            "active": False,
+            "active_count": 0,
+            "commanded_max": False,
+            "last_error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _thermal_health_payload(*, fan_mode: str, smart_status: dict[str, Any] | None = None) -> dict[str, Any]:
+    max_verified = _json_env("MTPLX_MAX_VERIFIED_JSON")
+    fan_summary = (
+        max_verified.get("after")
+        if isinstance(max_verified, dict) and isinstance(max_verified.get("after"), dict)
+        else None
+    )
+    actual_ramp_verified = os.environ.get("MTPLX_MAX_ACTUAL_RAMP_VERIFIED") == "1"
+    smart = smart_status or {}
+    smart_boost_active = fan_mode == FAN_MODE_SMART and bool(
+        smart.get("commanded_max") or smart.get("active")
+    )
+    return {
+        "max_requested": fan_mode == FAN_MODE_MAX
+        or smart_boost_active
+        or os.environ.get("MTPLX_MAX_REQUESTED") == "1",
+        "max_verified": fan_mode == FAN_MODE_MAX and bool(max_verified is None or max_verified.get("ok", True)),
+        "actual_ramp_verified": actual_ramp_verified,
+        "smart": smart,
+        "fan_summary": fan_summary,
+        "verified_at": os.environ.get("MTPLX_MAX_VERIFIED_AT"),
+        "verified": max_verified,
+    }
+
+
+def _coerce_setting(name: str, value: Any) -> Any:
+    """Apply minimal type coercion so JSON ``"3"`` becomes int ``3``."""
+
+    if name in {
+        "depth",
+        "top_k",
+        "max_response_tokens",
+        "stream_interval",
+        "prefill_chunk_tokens",
+        "draft_top_k",
+    }:
+        if value is None:
+            return None
+        try:
+            coerced = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+        if name == "depth" and not 1 <= coerced <= 8:
+            raise ValueError("depth must be between 1 and 8")
+        if name == "prefill_chunk_tokens" and not 128 <= coerced <= 32768:
+            raise ValueError("prefill_chunk_tokens must be between 128 and 32768")
+        if name == "draft_top_k" and coerced < 0:
+            raise ValueError("draft_top_k must be non-negative")
+        return coerced
+    if name == "generation_mode":
+        text = str(value).strip().lower()
+        if text not in {"mtp", "ar"}:
+            raise ValueError("generation_mode must be 'mtp' or 'ar'")
+        return text
+    if name in {"temperature", "top_p", "draft_temperature", "draft_top_p"}:
+        try:
+            coerced = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a number") from exc
+        if name in {"top_p", "draft_top_p"} and coerced <= 0:
+            raise ValueError(f"{name} must be positive")
+        if name == "draft_temperature" and coerced < 0:
+            raise ValueError("draft_temperature must be non-negative")
+        return coerced
+    if name == "enable_thinking":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+    if name == "reasoning_parser":
+        text = str(value)
+        if text not in {"qwen3", "step3p5", "gemma4", "none"}:
+            raise ValueError(
+                "reasoning_parser must be 'qwen3', 'step3p5', 'gemma4', or 'none'"
+            )
+        return text
+    if name == "reasoning_effort":
+        text = str(value).strip().lower()
+        if text not in {"auto", "low", "medium", "high"}:
+            raise ValueError(
+                "reasoning_effort must be 'auto', 'low', 'medium', or 'high'"
+            )
+        return text
+    return value
+
+
+def _mtplx_apply_settings_payload(
+    state: "ServerState", payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply a partial settings update; respects restart-required keys.
+
+    Reasoning is delegated to the existing ``_set_server_reasoning_mode``
+    so behavior matches the prior ``/v1/mtplx/settings`` contract.
+    """
+
+    payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in DASHBOARD_READ_ONLY_SETTINGS_KEYS
+    }
+    restart_required = sorted(
+        set(payload.keys()) & set(DASHBOARD_RESTART_REQUIRED_KEYS)
+    )
+    if restart_required:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "restart_required",
+                "keys": restart_required,
+                "message": (
+                    "the following settings require a server restart: "
+                    + ", ".join(restart_required)
+                ),
+            },
+        )
+    unknown = sorted(
+        set(payload.keys())
+        - set(DASHBOARD_MUTABLE_SETTINGS_KEYS)
+        - set(DASHBOARD_READ_ONLY_SETTINGS_KEYS)
+        - set(DASHBOARD_RESTART_REQUIRED_KEYS)
+    )
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "unknown_settings",
+                "keys": unknown,
+                "supported": list(DASHBOARD_MUTABLE_SETTINGS_KEYS),
+            },
+        )
+    applied: dict[str, Any] = {}
+    with state.lock:
+        backend = _backend_descriptor(state)
+        for key, raw in payload.items():
+            if raw is None:
+                continue
+            if key == "reasoning":
+                try:
+                    _set_server_reasoning_mode(state, str(raw))
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                applied[key] = str(raw)
+                continue
+            try:
+                value = _coerce_setting(key, raw)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if key == "depth":
+                minimum = int(backend.draft_semantics.minimum)
+                maximum = int(backend.draft_semantics.maximum)
+                if not minimum <= int(value) <= maximum:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"depth must be between {minimum} and {maximum} "
+                            "for the loaded model"
+                        ),
+                    )
+            if (
+                key == "generation_mode"
+                and value == "mtp"
+                and not bool(getattr(getattr(state, "runtime", None), "mtp_enabled", False))
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="generation_mode 'mtp' requires a runtime loaded with MTP",
+                )
+            setattr(state.args, key, value)
+            applied[key] = value
+        implicit_draft_updates: dict[str, Any] = {}
+        if getattr(state, "draft_sampler", None) is not None:
+            for source, target in (
+                ("temperature", "draft_temperature"),
+                ("top_p", "draft_top_p"),
+                ("top_k", "draft_top_k"),
+            ):
+                if source in applied and target not in applied:
+                    implicit_draft_updates[target] = applied[source]
+        for key, value in implicit_draft_updates.items():
+            setattr(state.args, key, value)
+        if (
+            {"draft_temperature", "draft_top_p", "draft_top_k"} & set(applied)
+        ) or implicit_draft_updates:
+            current = getattr(state, "draft_sampler", None)
+            draft_temperature = getattr(state.args, "draft_temperature", None)
+            draft_top_p = getattr(state.args, "draft_top_p", None)
+            draft_top_k = getattr(state.args, "draft_top_k", None)
+            if draft_temperature is None:
+                draft_temperature = (
+                    getattr(current, "temperature", None)
+                    if current is not None
+                    else getattr(state.args, "temperature", 0.6)
+                )
+            if draft_top_p is None:
+                draft_top_p = (
+                    getattr(current, "top_p", None)
+                    if current is not None
+                    else getattr(state.args, "top_p", 0.95)
+                )
+            if draft_top_k is None:
+                draft_top_k = (
+                    getattr(current, "top_k", None)
+                    if current is not None
+                    else getattr(state.args, "top_k", 20)
+                )
+            state.draft_sampler = SamplerConfig(
+                temperature=float(draft_temperature),
+                top_p=float(draft_top_p),
+                top_k=int(draft_top_k),
+            )
+    return applied
+
+
+def _env_bool_setting(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _effective_ram_session_cache_settings() -> dict[str, Any]:
+    entries_raw = os.environ.get("MTPLX_SESSION_BANK_MAX_ENTRIES")
+    max_bytes = os.environ.get("MTPLX_SESSION_BANK_MAX_BYTES") or "8G"
+    per_session_bytes = os.environ.get("MTPLX_SESSION_BANK_PER_SESSION_BYTES") or "4G"
+    block_prefix_restore = _env_bool_setting(
+        "MTPLX_SESSION_BLOCK_PREFIX_RESTORE",
+        default=True,
+    )
+    try:
+        entries = max(1, int(entries_raw)) if entries_raw is not None else 4
+    except ValueError:
+        entries = 4
+    if (
+        entries_raw is None
+        and "MTPLX_SESSION_BANK_MAX_BYTES" not in os.environ
+        and "MTPLX_SESSION_BANK_PER_SESSION_BYTES" not in os.environ
+        and "MTPLX_SESSION_BLOCK_PREFIX_RESTORE" not in os.environ
+    ):
+        policy = "target-default"
+    elif entries <= 1 and max_bytes.upper() == "1G" and not block_prefix_restore:
+        policy = "minimal"
+    else:
+        policy = "bounded"
+    return {
+        "ram_session_cache_policy": policy,
+        "ram_session_block_prefix_restore": block_prefix_restore,
+        "ram_session_cache_max_entries": entries,
+        "ram_session_cache_max_size": max_bytes,
+        "ram_session_cache_per_session_max_size": per_session_bytes,
+    }
+
+
+def _effective_paged_kv_quantization() -> str:
+    raw = (
+        os.environ.get("MTPLX_VLLM_METAL_PAGED_KV_QUANT")
+        or os.environ.get("MTPLX_PAGED_KV_QUANT")
+        or ""
+    )
+    return str(normalize_paged_kv_quantization(raw))
+
+
+def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
+    """Read the live mutable settings for the dashboard."""
+
+    args = state.args
+    backend = _backend_descriptor(state)
+    model_ref = str(getattr(args, "model", None) or getattr(state, "model_id", None) or "")
+    model_context_window_max = getattr(state, "model_context_window_max", None)
+    model_controls = model_controls_for_descriptor(
+        backend,
+        model_ref=model_ref,
+        inspection=(
+            {"model_context_window": int(model_context_window_max)}
+            if model_context_window_max
+            else None
+        ),
+    )
+    reasoning = getattr(args, "reasoning", None)
+    if reasoning not in {"auto", "on", "off"}:
+        reasoning = "on" if bool(getattr(args, "enable_thinking", True)) else "off"
+    tool_prompt_mode = _tool_prompt_mode_from_args(args)
+    return {
+        "reasoning": reasoning,
+        "tool_prompt_mode": tool_prompt_mode,
+        "tool_contract_active": _tool_contract_active_for_mode(
+            tools_active=True,
+            tool_prompt_mode=tool_prompt_mode,
+        ),
+        "tool_contract_policy_version": _tool_prompt_policy_version(
+            tools_active=True,
+            tool_prompt_mode=tool_prompt_mode,
+        ),
+        "chat_template_profile": getattr(
+            state,
+            "chat_template_profile",
+            _CHAT_TEMPLATE_PROFILE_LOCAL,
+        ),
+        "chat_template_hash": getattr(state, "template_hash", None),
+        "generation_mode": str(getattr(args, "generation_mode", "mtp") or "mtp"),
+        "depth": int(getattr(args, "depth", 3) or 3),
+        "depth_max": int(backend.draft_semantics.maximum),
+        "draft_control": backend.draft_semantics.to_dict(),
+        "backend_id": backend.backend_id,
+        "architecture_id": backend.architecture_id,
+        "model_family": model_controls["model_family"],
+        "support_level": model_controls["support_level"],
+        "model_controls": model_controls,
+        "reasoning_policy": model_controls["reasoning"],
+        "kv_quant_policy": model_controls["kv_quant"],
+        "tune_policy": model_controls["tune"],
+        "context_window_policy": model_controls["context_window"],
+        "sampling_defaults": model_controls["sampling"],
+        "temperature": float(getattr(args, "temperature", 0.6) or 0.0),
+        "top_p": float(getattr(args, "top_p", 0.95) or 0.0),
+        "top_k": int(getattr(args, "top_k", 20) or 0),
+        "max_response_tokens": getattr(args, "max_response_tokens", None),
+        "stream_interval": int(getattr(args, "stream_interval", 1) or 1),
+        "enable_thinking": bool(getattr(args, "enable_thinking", False)),
+        "api_key_required": bool(getattr(args, "api_key", None)),
+        "api_key_source": str(getattr(args, "api_key_source", "none") or "none"),
+        "reasoning_parser": str(getattr(args, "reasoning_parser", "qwen3")),
+        "reasoning_effort": str(getattr(args, "reasoning_effort", "auto") or "auto"),
+        "draft_temperature": (
+            float(getattr(state.draft_sampler, "temperature"))
+            if getattr(state, "draft_sampler", None) is not None
+            else None
+        ),
+        "draft_top_p": (
+            float(getattr(state.draft_sampler, "top_p"))
+            if getattr(state, "draft_sampler", None) is not None
+            else None
+        ),
+        "draft_top_k": (
+            int(getattr(state.draft_sampler, "top_k"))
+            if getattr(state, "draft_sampler", None) is not None
+            else None
+        ),
+        "prefill_chunk_tokens": int(
+            getattr(args, "prefill_chunk_tokens", None) or 2048
+        ),
+        "ssd_session_cache": str(getattr(args, "ssd_session_cache", "off") or "off"),
+        "ssd_session_cache_dir": str(
+            getattr(args, "ssd_session_cache_dir", "~/.mtplx/session-bank")
+        ),
+        "ssd_session_cache_max_size": str(
+            getattr(args, "ssd_session_cache_max_size", "100GB")
+        ),
+        "ssd_session_cache_min_prefix_tokens": int(
+            getattr(args, "ssd_session_cache_min_prefix_tokens", 512) or 512
+        ),
+        "paged_kv_quantization": _effective_paged_kv_quantization(),
+        "restart_required_settings": [
+            "model",
+            "backend_id",
+            "context_window",
+            "paged_kv_quantization",
+            "ssd_session_cache",
+        ],
+        **_effective_ram_session_cache_settings(),
+    }
+
+
+def _scheduler_config_from_args(args: Any) -> BatchSchedulerConfig:
+    mode = str(getattr(args, "scheduler_mode", "serial") or "serial")
+    if mode not in SCHEDULER_MODE_CHOICES:
+        mode = "serial"
+    preset = str(getattr(args, "batching_preset", "latency") or "latency")
+    if preset not in BATCHING_PRESET_CHOICES:
+        preset = "latency"
+    try:
+        return BatchSchedulerConfig.from_values(
+            mode=mode,
+            preset=preset,
+            max_active_requests=getattr(args, "max_active_requests", None),
+            decode_batch_max=getattr(args, "decode_batch_max", None),
+            batch_wait_ms=getattr(args, "batch_wait_ms", None),
+            prefill_chunk_tokens=getattr(args, "prefill_chunk_tokens", None),
+            experimental_mtp_cohorts=bool(
+                getattr(args, "experimental_mtp_cohorts", False)
+            ),
+        )
+    except ValueError:
+        return BatchSchedulerConfig.from_values(mode="serial", preset="latency")
+
+
+def _scheduler_policy_label(config: BatchSchedulerConfig) -> str:
+    if (
+        config.mode
+        in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}
+        and config.preset == SchedulerPreset.AGENT
+    ):
+        return "open_code_fair"
+    if config.mode == SchedulerMode.AR_BATCH:
+        return "fair_ar_batch"
+    if config.mode == SchedulerMode.MTP_COHORT_EXPERIMENTAL:
+        return "experimental_mtp_cohort"
+    if config.mode == SchedulerMode.COOPERATIVE:
+        return "cooperative"
+    return "solo_mtp_oracle"
+
+
+def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
+    config = _scheduler_config_from_args(state.args)
+    scheduler = getattr(state, "model_scheduler", None)
+    scheduler_stats: dict[str, Any] = {}
+    if scheduler is not None and hasattr(scheduler, "stats"):
+        try:
+            scheduler_stats = dict(scheduler.stats())
+        except Exception as exc:
+            scheduler_stats = {"error": str(exc)}
+    ar_batch_stats: dict[str, Any] = {}
+    ar_batch_service = getattr(state, "ar_batch_service", None)
+    if ar_batch_service is not None and hasattr(ar_batch_service, "snapshot"):
+        try:
+            ar_batch_stats = dict(ar_batch_service.snapshot())
+        except Exception as exc:
+            ar_batch_stats = {"error": str(exc)}
+    try:
+        active_requests = int(state.dashboard.in_flight.count())
+    except Exception:
+        active_requests = 0
+    if not active_requests and hasattr(state, "foreground_count"):
+        try:
+            active_requests = int(state.foreground_count())
+        except Exception:
+            active_requests = 0
+    mtp_available = bool(
+        getattr(getattr(state, "runtime", None), "mtp_enabled", False)
+        and str(getattr(state.args, "generation_mode", "mtp")) == "mtp"
+    )
+    if active_requests <= 1 and mtp_available:
+        active_lane = "solo_mtp"
+        mtp_disabled_reason = None
+    elif active_requests > 1 and mtp_available:
+        active_lane = (
+            "ar_batch"
+            if config.mode
+            in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}
+            else "cooperative_ar"
+        )
+        mtp_disabled_reason = "batch_size_gt_1"
+    elif config.mode == SchedulerMode.AR_BATCH:
+        active_lane = "ar_batch"
+        mtp_disabled_reason = "generation_mode_ar"
+    else:
+        active_lane = "serial_ar" if not mtp_available else "serial_mtp"
+        mtp_disabled_reason = None if mtp_available else "generation_mode_ar"
+    return {
+        "config": config.to_dict(),
+        "mode": config.mode.value,
+        "preset": config.preset.value,
+        "scheduler_policy": _scheduler_policy_label(config),
+        "active_lane": active_lane,
+        "active_requests": active_requests,
+        "mtp_available": mtp_available,
+        "mtp_disabled_reason": mtp_disabled_reason,
+        "path": "path_a",
+        "path_a": {
+            "solo_mtp_protected": True,
+            "concurrent_strategy": "cooperative_ar_batch",
+            "batched_mtp_required_for_v1": False,
+        },
+        "path_b": {
+            "experimental_mtp_cohorts": bool(config.experimental_mtp_cohorts),
+            "default_enabled": False,
+        },
+        "telemetry": scheduler_stats,
+        "ar_batch": ar_batch_stats,
+    }
+
+
+def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
+    """Aggregate the dashboard snapshot served by SSE + the polling endpoint."""
+
+    dashboard = state.dashboard
+    bank_dict: dict[str, Any]
+    sessions_dict: dict[str, Any]
+    try:
+        sessions_dict = state.sessions.list_sessions()
+        bank_dict = sessions_dict.get("session_bank") or {}
+    except Exception as exc:
+        sessions_dict = {
+            "sessions": [],
+            "count": 0,
+            "session_bank": {},
+            "error": str(exc),
+        }
+        bank_dict = {}
+    return {
+        "ts": time.time(),
+        "model_id": state.model_id,
+        "profile": state.profile.to_dict()
+        if hasattr(state.profile, "to_dict")
+        else {"name": getattr(state.profile, "name", "unknown")},
+        "context_window": state.context_window,
+        "active_requests": state.dashboard.in_flight.count(),
+        "in_flight": dashboard.in_flight.snapshot(),
+        "latest": state.last_metrics[-1] if state.last_metrics else None,
+        "recent": state.last_metrics[-32:],
+        "rolling": dashboard.rolling.snapshot(),
+        "lifetime": dashboard.lifetime.snapshot(),
+        "sessions": sessions_dict,
+        "session_bank": bank_dict,
+        "mem": _mlx_memory_stats_live(),
+        "thermal": dashboard.last_thermal,
+        "thermal_when_s": dashboard.last_thermal_when_s,
+        "settings": _mtplx_current_settings(state),
+        "scheduler": _mtplx_scheduler_state(state),
+        "machine": _machine_info(),
+        "uptime_s": dashboard.lifetime.snapshot()["uptime_s"],
+    }
+
+
+async def _thermal_poll_loop(state: "ServerState", *, interval_s: float = 1.0) -> None:
+    """Optional background sampler that publishes fan snapshots to the bus.
+
+    Disabled by default because ``thermal.fan_summary()`` shells out to
+    ``thermalforge status`` and adds ~10-30 ms of subprocess churn per
+    poll. Enabled by ``--enable-thermal-poll``.
+    """
+
+    from mtplx.thermal import fan_summary
+
+    while True:
+        try:
+            snapshot = await asyncio.to_thread(fan_summary)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            snapshot = {"ok": False, "fans": [], "error": "fan_summary_failed"}
+        state.dashboard.last_thermal = snapshot
+        state.dashboard.last_thermal_when_s = time.time()
+        state.dashboard.bus.publish(
+            {"kind": "thermal", "thermal": snapshot, "when_s": time.time()}
+        )
+        try:
+            await asyncio.sleep(interval_s)
+        except asyncio.CancelledError:
+            raise
 
 
 def _stream_progress_payload(
@@ -4381,6 +11230,25 @@ def _session_keep_live_refs_for_request(
     )
 
 
+def _commit_prompt_prefix_for_request(
+    state: Any,
+    *,
+    prompt_ids: list[int],
+    tools_active: bool,
+) -> bool:
+    if tools_active:
+        return True
+    if not prompt_ids:
+        return False
+    tier = getattr(state, "session_bank_cold_tier", None)
+    if tier is None or not bool(getattr(tier, "enabled", False)):
+        return False
+    min_prefix_tokens = int(
+        getattr(tier, "min_prefix_tokens", 512) or 512
+    )
+    return len(prompt_ids) >= max(512, min_prefix_tokens)
+
+
 def _anonymous_coding_agent_tool_request(
     tool_names: list[str] | tuple[str, ...] | None,
 ) -> bool:
@@ -4405,6 +11273,97 @@ def _anonymous_coding_agent_tool_request(
         "write",
     }
     return bool(names & coding_agent_tools)
+
+
+def _tool_call_ids_from_messages(messages: list[ChatMessage]) -> set[str]:
+    ids: set[str] = set()
+    for message in messages:
+        if str(message.role).lower() != "assistant" or not message.tool_calls:
+            continue
+        for tool_call in message.tool_calls:
+            call_id = str(tool_call.get("id") or "").strip()
+            if call_id:
+                ids.add(call_id)
+    return ids
+
+
+def _tool_result_ids_from_messages(messages: list[ChatMessage]) -> set[str]:
+    ids: set[str] = set()
+    for message in messages:
+        if str(message.role).lower() != "tool":
+            continue
+        tool_call_id = str(
+            message.tool_call_id
+            or _message_extra(message, "tool_call_id")
+            or ""
+        ).strip()
+        if tool_call_id:
+            ids.add(tool_call_id)
+    return ids
+
+
+def _live_frontier_miss_reason_for_request(
+    *,
+    messages: list[ChatMessage],
+    cache_miss_reason: str | None,
+    session_source: str | None,
+    session_keep_live_ref: bool,
+) -> str | None:
+    """Translate a cache miss into the reason an agent frontier could not resume."""
+
+    assistant_tool_ids = _tool_call_ids_from_messages(messages)
+    tool_result_ids = _tool_result_ids_from_messages(messages)
+    return _live_frontier_miss_reason_from_counts(
+        assistant_tool_call_count=len(assistant_tool_ids),
+        tool_result_count=len(tool_result_ids),
+        unknown_tool_result_count=len(tool_result_ids - assistant_tool_ids),
+        cache_miss_reason=cache_miss_reason,
+        session_source=session_source,
+        session_keep_live_ref=session_keep_live_ref,
+    )
+
+
+def _live_frontier_miss_reason_from_counts(
+    *,
+    assistant_tool_call_count: int,
+    tool_result_count: int,
+    unknown_tool_result_count: int,
+    cache_miss_reason: str | None,
+    session_source: str | None,
+    session_keep_live_ref: bool,
+) -> str | None:
+    """Translate frontier counters plus a cache miss into a user-facing reason."""
+
+    if tool_result_count <= 0:
+        return "miss_no_tool_result"
+    if assistant_tool_call_count <= 0:
+        return "miss_no_assistant_tool_frontier"
+    if unknown_tool_result_count > 0:
+        return "miss_unknown_tool_id"
+    if cache_miss_reason is None:
+        if not session_keep_live_ref:
+            return "miss_live_frontier_not_armed"
+        return None
+
+    reason = str(cache_miss_reason or "").strip().lower()
+    reason_map = {
+        "template_mismatch": "miss_template_changed",
+        "policy_mismatch": "miss_policy_changed",
+        "model_mismatch": "miss_model_changed",
+        "evicted": "miss_cache_evicted",
+        "snapshot_desync": "miss_snapshot_desync",
+        "no_snapshot_coverage": "miss_live_frontier_consumed_or_missing",
+        "prefix_divergence_at_token": "miss_prompt_prefix_changed",
+        "new_session": "miss_wrong_session_or_no_prior_frontier",
+    }
+    if reason in reason_map:
+        return reason_map[reason]
+    source = str(session_source or "")
+    if not session_keep_live_ref:
+        return "miss_live_frontier_not_armed"
+    if source in {"", "new", "implicit_hash"}:
+        return "miss_wrong_session_or_no_prior_frontier"
+    return f"miss_{reason}" if reason else "miss_unknown"
 
 
 def _clear_mlx_cache_after_request(
@@ -4453,6 +11412,36 @@ def _clear_mlx_cache_after_request(
     finally:
         if acquired:
             lock.release()
+
+
+def _auto_clear_mlx_cache_after_completed_request(
+    state: Any,
+    *,
+    session_id: str | None,
+    request_observability: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    raw = (os.environ.get("MTPLX_CLEAR_CACHE_AFTER_REQUEST") or "auto").strip().lower()
+    if raw in {"0", "false", "no", "off", "never"}:
+        return None
+    request_observability = request_observability or {}
+    client = str(
+        request_observability.get("request_client_hint")
+        or request_observability.get("request_client_label")
+        or ""
+    ).lower()
+    if raw in {"1", "true", "yes", "always"}:
+        reason = "after_request_forced"
+    elif raw == "auto":
+        if client != "aime" or session_id is not None:
+            return None
+        reason = "aime_stateless_question"
+    elif raw == "aime":
+        if client != "aime":
+            return None
+        reason = "aime_configured"
+    else:
+        return None
+    return _clear_mlx_cache_after_request(state, reason=reason)
 
 
 def _attach_skipped_postcommit_cleanup(
@@ -4540,6 +11529,23 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "paged_kv_capacity_tokens",
     "paged_kv_num_blocks",
     "paged_active_array_calls",
+    "paged_active_array_time_s",
+    "paged_turboquant",
+    "paged_turboquant_k_quant",
+    "paged_turboquant_v_quant",
+    "paged_turboquant_attention_calls",
+    "paged_kv_quant",
+    "paged_kv_quant_mode",
+    "paged_kv_quant_attention_calls",
+    "paged_kv_quant_dequant_calls",
+    "paged_kv_quant_dequant_time_s",
+    "paged_kv_quant_dequant_tokens",
+    "paged_gqa_sdpa_calls",
+    "paged_gqa_sdpa_calls_by_route",
+    "paged_gqa_sdpa_calls_by_phase",
+    "paged_gqa_sdpa_route_misses_by_phase_reason",
+    "paged_gqa_sdpa_route_misses_by_q_len",
+    "paged_gqa_sdpa_last_route_miss",
     "attention_dense_fallback_calls",
     "prefill_dense_fallback_calls",
     "decode_dense_fallback_calls",
@@ -4567,13 +11573,19 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "elapsed_s",
     "tok_s",
     "end_to_end_tok_s",
+    "finish_reason",
+    "stop_sequence_hit",
+    "stop_sequence_matched",
     "prompt_eval_time_s",
+    "cache_restore_time_s",
     "prompt_target_prefill_time_s",
     "prompt_mtp_history_time_s",
     "prompt_target_prefill_tok_s",
     "prompt_mtp_history_tok_s",
     "prompt_tps",
     "prefill_tok_s",
+    "prefill_compute_tok_s",
+    "prefill_wall_tok_s",
     "ttft_s",
     "decode_elapsed_s",
     "request_elapsed_s",
@@ -4581,8 +11593,12 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "decode_tok_s",
     "sliding_decode_tok_s_first_32",
     "sliding_decode_tok_s_first_64",
+    "sliding_decode_tok_s_first_128",
+    "sliding_decode_tok_s_first_256",
     "sliding_decode_tok_s_last_32",
     "sliding_decode_tok_s_last_64",
+    "sliding_decode_tok_s_last_128",
+    "sliding_decode_tok_s_last_256",
     "accepted_drafts",
     "rejected_drafts",
     "drafted_tokens",
@@ -4596,18 +11612,59 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "draft_time_s",
     "accept_time_s",
     "repair_time_s",
+    # Verify-cycle decomposition for the dashboard's waterfall chart.
+    # All exist on `GenerationStats` but were not part of the public envelope
+    # before the dashboard work. Additive for existing clients (OpenWebUI,
+    # Pi, hippo, opencode) — they tolerate extras and ignore unknown keys.
+    "target_forward_time_s",
+    "verify_forward_time_s",
+    "verify_eval_time_s",
+    "verify_logits_eval_time_s",
+    "verify_hidden_eval_time_s",
+    "verify_target_distribution_time_s",
+    "target_distribution_materialized_rows",
+    "target_distribution_materialized_windows",
+    "target_distribution_share",
+    "lazy_bonus_verify_calls",
+    "lazy_bonus_commit_time_s",
+    "verify_eval_unattributed_time_s",
+    "mtp_history_policy",
+    "mtp_history_window_tokens",
+    "mtp_history_position_base",
+    "snapshot_time_s",
+    "commit_time_s",
+    "capture_commit_time_s",
+    "rollback_time_s",
+    "graphbank",
+    "repair_time_by_reject_depth_s",
+    *MAINTENANCE_TIMING_STATS_KEYS,
     "session_cache_hit",
     "session_prompt_prefix_bank_commit",
     "cached_tokens",
     "new_prefill_tokens",
+    "cache_source",
+    "ssd_cache_hit",
+    "ssd_cached_tokens",
+    "ssd_restore_s",
+    "ssd_suffix_tokens",
     "cache_miss_reason",
     "session_restore_mode",
+    "ar_batch_shared_prefix_tokens",
+    "ar_batch_shared_prefix_prefill_s",
+    "ar_batch_shared_prefix_snapshot_s",
+    "ar_batch_shared_prefix_bank_stored",
+    "ar_batch_shared_prefix_bank_error",
+    "ar_batch_prompt_prepare_s",
     "session_id",
     "context_len",
     "lock_wait_time_s",
     "request_max_tokens",
     "server_max_response_tokens",
     "effective_max_tokens",
+    "decode_lease_tokens",
+    "uncapped_response_requested",
+    "uncapped_response_lease_tokens",
+    "uncapped_response_lease_applied",
     "remaining_context_tokens",
     "server_cap_applied",
     "context_cap_applied",
@@ -4617,25 +11674,222 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "server_attempts",
     "server_blank_retries",
     "server_blank_retry_suppressed",
+    "scheduler_lane",
+    "ar_batch_bypass_reason",
+    "scheduler_mode",
+    "batching_preset",
+    "scheduler_policy",
+    "request_id",
+    "request_model",
+    "served_model_id",
+    "request_model_matches_served_model",
+    "request_message_count",
+    "request_message_roles",
+    "request_message_chars",
+    "request_effective_message_count",
+    "request_effective_message_roles",
+    "request_effective_message_chars",
+    "request_metadata_keys",
+    "request_client_hint",
+    "request_client_label",
+    "mtplx_control_owner",
+    "client_controls_allowed",
+    "client_control_fields_ignored",
+    "client_sampler_fields_ignored",
+    "request_enable_thinking",
+    "request_enable_thinking_override",
+    "request_reasoning_mode",
+    "request_reasoning_parser",
+    "request_temperature",
+    "request_top_p",
+    "request_top_k",
+    "effective_temperature",
+    "effective_top_p",
+    "effective_top_k",
+    "sampler_policy",
+    "sampler_policy_reason",
+    "sampler_policy_request_temperature",
+    "sampler_policy_request_top_p",
+    "sampler_policy_request_top_k",
+    "sampler_policy_temperature",
+    "sampler_policy_top_p",
+    "sampler_policy_top_k",
+    "mlx_cache_cleanup",
+    "request_cancelled",
+    "cancellation_reason",
+    "stream_cancelled_by_client",
+    "streamed_completion_tokens",
+    "partial_decode_tok_s",
+    "partial_request_tok_s",
+    "dashboard_progress_published_events",
+    "dashboard_progress_throttled_events",
+    "dashboard_progress_last_completion_tokens",
+    "dashboard_progress_decision_time_s",
+    "dashboard_progress_registry_update_time_s",
+    "dashboard_progress_rolling_update_time_s",
+    "dashboard_progress_bus_publish_time_s",
+    "cancellation_elapsed_s",
+    "client_label",
+    "queue_wait_s",
+    "active_batch_size",
+    "ar_batch_max_observed",
+    "mtp_disabled_reason",
     "mtp_depth",
     "speculative_depth",
     "requested_mtp_depth",
     "requested_speculative_depth",
     "long_context_mtp_depth_policy",
+    "opencode_short_context_depth_policy",
     "active_memory_bytes",
     "peak_memory_bytes",
     "cache_memory_bytes",
     "reasoning_reentries",
     "reasoning_tokens",
     "answer_tokens",
+    "reasoning_completion_repair_attempted",
+    "reasoning_completion_repair_succeeded",
+    "reasoning_completion_repair_skipped",
+    "reasoning_completion_repair_reason",
+    "reasoning_completion_repair_first_completion_tokens",
+    "reasoning_completion_repair_first_decode_tok_s",
+    "reasoning_completion_repair_prompt_tokens",
+    "reasoning_completion_repair_completion_tokens",
+    "reasoning_completion_repair_finish_reason",
+    "reasoning_completion_repair_decode_tok_s",
+    "inspection_empty_retry_attempted",
+    "inspection_empty_retry_succeeded",
+    "inspection_empty_retry_reason",
+    "inspection_empty_retry_first_completion_tokens",
+    "inspection_empty_retry_first_decode_tok_s",
+    "tool_fed_empty_retry_attempted",
+    "tool_fed_empty_retry_succeeded",
+    "tool_fed_empty_retry_reason",
+    "tool_fed_empty_retry_first_completion_tokens",
+    "tool_fed_empty_retry_first_decode_tok_s",
+    "tool_fed_empty_retry_prompt_tokens",
+    "tool_fed_empty_retry_completion_tokens",
+    "tool_fed_empty_retry_finish_reason",
+    "stalled_agent_retry_attempted",
+    "stalled_agent_retry_succeeded",
+    "stalled_agent_retry_reason",
+    "stalled_agent_retry_first_completion_tokens",
+    "stalled_agent_retry_first_decode_tok_s",
+    "stalled_agent_retry_prompt_tokens",
+    "stalled_agent_retry_completion_tokens",
+    "stalled_agent_retry_finish_reason",
+    "visible_reasoning_stripped",
+    "nonstream_reasoning_content_routed",
     "tool_parse_success",
     "tool_parse_fallback",
     "tool_parse_fallback_reason",
     "tool_parse_fallback_kind",
     "tool_parser_dialect",
+    "tool_stream_early_finish",
+    "tool_call_count",
+    "openai_bridge_mode",
+    "tool_parser_source",
+    "tool_parse_status",
+    "tool_calls_emitted",
+    "raw_tool_markup_suppressed",
+    "legacy_bridge_used",
+    "hidden_generation_repair_used",
+    "early_tool_cancel_used",
+    "openai_bridge_policy_version",
+    "tool_prompt_mode",
+    "tool_contract_policy_version",
+    "tool_contract_active",
+    "chat_template_profile",
+    "chat_template_source",
+    "chat_template_path",
+    "chat_template_hash",
+    "request_tool_count",
+    "request_tool_choice",
+    "request_tool_choice_forced",
+    "request_tool_choice_forced_name",
+    "request_filtered_tool_count",
+    "request_tools_hidden_by_bridge",
+    "request_read_only_inspection_force_answer",
+    "request_read_only_inspection_tool_result_count",
+    "request_read_only_inspection_force_answer_after_tools",
+    "read_only_force_answer_contract_active",
+    "request_pi_convergence_contract",
+    "request_pi_convergence_tool_result_count",
+    "request_pi_convergence_after_tools",
+    "pi_convergence_contract_active",
+    "opencode_simple_chat_contract_active",
+    "opencode_prompt_contract_profile",
+    "read_only_force_answer_retry_attempted",
+    "read_only_force_answer_retry_succeeded",
+    "read_only_force_answer_retry_reason",
+    "read_only_force_answer_retry_first_completion_tokens",
+    "read_only_force_answer_retry_first_decode_tok_s",
+    "read_only_force_answer_retry_prompt_tokens",
+    "read_only_force_answer_retry_completion_tokens",
+    "read_only_force_answer_retry_finish_reason",
+    "read_only_force_answer_buffered_stream",
+    "read_only_force_answer_marker_stream_started",
+    "read_only_force_answer_stream_marker_stripped_chars",
+    "read_only_force_answer_visible_prefix_stripped_chars",
+    "read_only_force_answer_visible_tokens",
     "request_session_source",
+    "opencode_tool_history_cache_bypass",
+    "opencode_tool_history_force_clone_restore",
+    "opencode_tool_history_live_frontier_restore",
+    "transcript_raw_message_chars",
+    "transcript_canonical_message_chars",
+    "transcript_canonicalized",
+    "transcript_stripped_tool_preamble_messages",
+    "transcript_stripped_tool_preamble_chars",
+    "transcript_skipped_aborted_assistant_messages",
+    "transcript_skipped_orphan_chitchat_assistant_messages",
+    "transcript_dropped_simple_chitchat_history_messages",
+    "transcript_dropped_simple_chitchat_history_chars",
+    "transcript_replaced_simple_chitchat_system_messages",
+    "transcript_replaced_simple_chitchat_system_chars",
+    "transcript_injected_simple_chitchat_system_chars",
+    "transcript_replaced_client_system_messages",
+    "transcript_replaced_client_system_chars",
+    "transcript_injected_client_system_chars",
+    "transcript_replaced_initial_client_system_messages",
+    "transcript_replaced_initial_client_system_chars",
+    "transcript_injected_initial_client_system_chars",
+    "transcript_skipped_repeated_assistant_messages",
+    "transcript_skipped_stalled_agent_preamble_messages",
+    "transcript_skipped_stalled_agent_preamble_chars",
+    "transcript_collapsed_repeated_user_messages",
+    "transcript_collapsed_repeated_user_chars",
+    "transcript_dropped_duplicate_user_messages",
+    "transcript_dropped_duplicate_user_chars",
+    "transcript_merged_consecutive_user_messages",
+    "transcript_merged_consecutive_user_chars",
+    "transcript_compacted_repeated_timeout_tool_messages",
+    "transcript_compacted_tool_result_messages",
+    "transcript_compacted_tool_result_chars",
+    "transcript_compacted_active_tool_result_messages",
+    "transcript_compacted_active_tool_result_chars",
+    "transcript_compacted_active_read_messages",
+    "transcript_compacted_active_read_chars",
+    "transcript_compacted_active_read_inspection_messages",
+    "transcript_compacted_active_read_inspection_chars",
+    "transcript_inspection_read_budget_candidate_messages",
+    "transcript_inspection_read_budget_max_lines_per_file",
+    "transcript_skipped_verbatim_tool_output_assistant_messages",
+    "transcript_skipped_verbatim_tool_output_assistant_chars",
+    "transcript_compacted_repeated_read_inspection_messages",
+    "transcript_compacted_repeated_read_inspection_chars",
     "request_session_keep_live_ref",
+    "request_session_keep_live_ref_reason",
+    "request_session_bank_bypass",
     "request_session_prefix_diagnostic",
+    "live_frontier_candidate",
+    "live_frontier_result_turn",
+    "live_frontier_policy",
+    "live_frontier_hit",
+    "live_frontier_restore_mode",
+    "live_frontier_miss_reason",
+    "live_frontier_assistant_tool_call_count",
+    "live_frontier_tool_result_count",
+    "live_frontier_unknown_tool_result_count",
     "dynamic_paged_kv",
     "session_prompt_prefix_commit",
 )
@@ -4650,6 +11904,11 @@ PUBLIC_POSTCOMMIT_KEYS = (
     "cache_hit",
     "cached_tokens",
     "suffix_tokens",
+    "cache_source",
+    "ssd_cache_hit",
+    "ssd_cached_tokens",
+    "ssd_restore_s",
+    "ssd_suffix_tokens",
     "cache_miss_reason",
     "mlx_cache_cleanup",
     "error",
@@ -4665,6 +11924,100 @@ def _public_mtplx_stats(generated: dict[str, Any]) -> dict[str, Any]:
             key: postcommit[key] for key in PUBLIC_POSTCOMMIT_KEYS if key in postcommit
         }
     return _json_safe(public)
+
+
+def _merge_final_bridge_stats_into_latest_metrics(
+    state: ServerState,
+    stats: dict[str, Any],
+) -> None:
+    if not getattr(state, "last_metrics", None):
+        return
+    latest = state.last_metrics[-1]
+    for key in (
+        "openai_bridge_mode",
+        "tool_parser_source",
+        "tool_parse_status",
+        "tool_calls_emitted",
+        "tool_parse_success",
+        "tool_parse_fallback",
+        "tool_parse_fallback_reason",
+        "tool_parse_fallback_kind",
+        "raw_tool_markup_suppressed",
+        "tool_call_count",
+        "read_only_force_answer_buffered_stream",
+        "read_only_force_answer_visible_prefix_stripped_chars",
+        "read_only_force_answer_visible_tokens",
+        "session_prompt_prefix_commit",
+        "session_postcommit_snapshot",
+        "finish_reason",
+    ):
+        if key in stats:
+            latest[key] = stats[key]
+
+
+def _record_stream_cancellation_metric(
+    state: ServerState,
+    *,
+    response_id: str,
+    session_id: str | None,
+    prompt_tokens: int,
+    streamed_completion_tokens: int,
+    stream_started_s: float,
+    reason: str,
+    request_observability: dict[str, Any],
+    client_disconnected: bool,
+) -> None:
+    elapsed_s = max(0.0, time.perf_counter() - stream_started_s)
+    streamed_tokens = int(streamed_completion_tokens)
+    partial_tok_s = streamed_tokens / elapsed_s if elapsed_s > 0.0 else 0.0
+    envelope: dict[str, Any] = {
+        "mode": "stream",
+        "request_id": response_id,
+        "session_id": session_id,
+        "prompt_tokens": int(prompt_tokens),
+        "completion_tokens": streamed_tokens,
+        "generated_tokens": streamed_tokens,
+        "request_elapsed_s": elapsed_s,
+        "elapsed_s": elapsed_s,
+        "server_elapsed_s": elapsed_s,
+        "decode_elapsed_s": elapsed_s,
+        "cancellation_elapsed_s": elapsed_s,
+        "request_cancelled": True,
+        "cancellation_reason": reason,
+        "stream_cancelled_by_client": bool(client_disconnected),
+        "streamed_completion_tokens": streamed_tokens,
+        "decode_tok_s": partial_tok_s,
+        "request_tok_s": partial_tok_s,
+        "tok_s": partial_tok_s,
+        "server_tok_s": partial_tok_s,
+        "partial_decode_tok_s": partial_tok_s,
+        "partial_request_tok_s": partial_tok_s,
+        "session_cache_hit": False,
+        "cache_miss_reason": None,
+    }
+    cleanup = _auto_clear_mlx_cache_after_completed_request(
+        state,
+        session_id=session_id,
+        request_observability=request_observability,
+    )
+    if cleanup is not None:
+        envelope["mlx_cache_cleanup"] = cleanup
+    envelope.update(_mlx_allocator_public_stats())
+    envelope.update(request_observability)
+    state.last_metrics.append(_json_safe(envelope))
+    state.last_metrics = state.last_metrics[-100:]
+    state.last_request_at = time.time()
+    state.requests_cancelled = int(getattr(state, "requests_cancelled", 0) or 0) + 1
+    try:
+        state.dashboard.bus.publish(
+            {
+                "kind": "cancelled",
+                "when_s": time.time(),
+                "envelope": dict(envelope),
+            }
+        )
+    except BaseException:
+        pass
 
 
 def _request_observability(
@@ -4689,12 +12042,7 @@ def _request_observability(
         if getattr(request, key, None) is not None
     ]
     model_extra_keys = sorted((getattr(request, "model_extra", None) or {}).keys())
-    user_agent = headers.get("user-agent") or headers.get("User-Agent") or ""
-    client_hint = (
-        "android_studio"
-        if "android" in user_agent.lower() or "jetbrains" in user_agent.lower()
-        else None
-    )
+    client_hint = _request_client_hint_from_headers(headers, metadata)
     user_texts = [
         _content_to_text(message.content)
         for message in request.messages
@@ -4709,6 +12057,7 @@ def _request_observability(
             "x-openwebui-chat-id",
             "x-openwebui-user-id",
             "x-openwebui-task",
+            "x-mtplx-request-id",
         }
     }
     return {
@@ -4720,10 +12069,16 @@ def _request_observability(
         "request_extra_keys": sorted(set(model_extra_keys + declared_extra_keys)),
         "request_metadata_keys": sorted(metadata.keys()),
         "request_client_hint": client_hint,
+        "request_client_label": client_hint or "openai",
         "request_tool_count": len(request.tools or []),
         "request_tool_names": [
             name for tool in (request.tools or []) if (name := _tool_spec_name(tool))
         ],
+        "request_tool_choice": _tool_choice_policy_signature(request.tool_choice),
+        "request_tool_choice_forced": _tool_choice_forces_tools(request.tool_choice),
+        "request_tool_choice_forced_name": _forced_tool_choice_name(
+            request.tool_choice
+        ),
         "request_session_source": session_source,
         "request_session_candidate_headers": candidate_headers,
         "request_generation_mode": request_generation_mode,
@@ -4733,13 +12088,142 @@ def _request_observability(
     }
 
 
+def _last_user_text(messages: list[ChatMessage] | list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        role = (
+            getattr(message, "role", None)
+            if not isinstance(message, dict)
+            else message.get("role")
+        )
+        if role != "user":
+            continue
+        content = (
+            getattr(message, "content", "")
+            if not isinstance(message, dict)
+            else message.get("content", "")
+        )
+        return _content_to_text(content).strip()
+    return ""
+
+
+def _is_simple_chitchat_text(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    normalized = normalized.strip(" .!?")
+    if not normalized or len(normalized) > 80:
+        return False
+    if re.search(
+        r"\b("
+        r"read|write|edit|fix|build|run|test|debug|implement|create|search|find|"
+        r"open|inspect|refactor|package|file|folder|directory|code|script|npm|git"
+        r")\b",
+        normalized,
+    ):
+        return False
+    if _is_compact_simple_chitchat_key(_simple_chitchat_compact_key(normalized)):
+        return True
+    return bool(
+        re.fullmatch(
+            r"(hi|hello|hey|yo|sup|howdy)"
+            r"([, ]+(there|codex|mtplx|please|thanks|thank you))*"
+            r"([, ]+how ((are|r) )?(you|u)( doing| today)?)?",
+            normalized,
+        )
+        or re.fullmatch(
+            r"(how ((are|r) )?(you|u)( doing| today)?|how'?s it going|what'?s up)",
+            normalized,
+        )
+    )
+
+
+def _opencode_default_sampler_override(
+    *,
+    messages: list[ChatMessage],
+    tools_active: bool,
+    request_temperature: float | None,
+    request_top_p: float | None,
+    request_top_k: int | None,
+    request_observability: dict[str, Any],
+    default_temperature: float,
+    default_top_p: float,
+    default_top_k: int,
+) -> SamplerConfig | None:
+    client_hint = str(request_observability.get("request_client_hint") or "").lower()
+    if "opencode" not in client_hint:
+        return None
+    simple_chitchat = _is_simple_chitchat_text(_last_user_text(messages))
+    opencode_default_sampler = (
+        (request_temperature is None or abs(float(request_temperature) - 0.55) < 1e-9)
+        and (request_top_p is None or abs(float(request_top_p) - 1.0) < 1e-9)
+        and (
+            request_top_k is None
+            or int(request_top_k) == int(default_top_k)
+        )
+    )
+    if not tools_active and not simple_chitchat:
+        return None
+    if not opencode_default_sampler:
+        return None
+    request_observability["sampler_policy"] = "opencode_default_sampler"
+    request_observability["sampler_policy_reason"] = (
+        "OpenCode sent its implicit default sampler; normalize target sampling "
+        "to the launched MTPLX defaults"
+    )
+    request_observability["sampler_policy_request_temperature"] = request_temperature
+    request_observability["sampler_policy_request_top_p"] = request_top_p
+    request_observability["sampler_policy_request_top_k"] = request_top_k
+    temperature = float(default_temperature)
+    top_p = float(default_top_p)
+    top_k = int(default_top_k)
+    request_observability["sampler_policy_temperature"] = temperature
+    request_observability["sampler_policy_top_p"] = top_p
+    request_observability["sampler_policy_top_k"] = top_k
+    return SamplerConfig(
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+    )
+
+
+def _opencode_default_draft_sampler_for_request(
+    state: ServerState,
+    request_observability: dict[str, Any],
+) -> SamplerConfig | None:
+    launched = getattr(state, "draft_sampler", None)
+    if not isinstance(launched, SamplerConfig):
+        return None
+    request_observability["draft_sampler_policy"] = "launch_default"
+    request_observability["draft_sampler_policy_reason"] = (
+        "OpenCode default target sampler normalized; keep the launched "
+        "model-contract proposal sampler for speculative decoding"
+    )
+    request_observability["draft_sampler_policy_temperature"] = float(
+        launched.temperature
+    )
+    request_observability["draft_sampler_policy_top_p"] = float(launched.top_p)
+    request_observability["draft_sampler_policy_top_k"] = int(launched.top_k)
+    return launched
+
+
 def _policy_fingerprint(
     state: ServerState,
     *,
     thinking_enabled: bool,
     generation_mode: str | None = None,
     depth: int | None = None,
+    tools_active: bool = False,
+    tool_prompt_mode: str | None = None,
+    tool_choice: Any = None,
+    no_tools_contract_active: bool = False,
+    read_only_force_answer_contract_active: bool = False,
+    pi_convergence_contract_active: bool = False,
+    simple_chat_contract_active: bool = False,
+    opencode_prompt_contract_profile: str | None = None,
+    cache_scope: str | None = None,
 ) -> str:
+    effective_tool_prompt_mode = _normalize_tool_prompt_mode(
+        tool_prompt_mode,
+        default=_tool_prompt_mode_from_args(state.args),
+    )
     effective_mode = _normalize_generation_mode(
         generation_mode,
         default=getattr(state.args, "generation_mode", "mtp"),
@@ -4752,21 +12236,202 @@ def _policy_fingerprint(
     adaptive = _adaptive_config(state.args, max_depth=effective_depth)
     proposal_cache = _proposal_cache_config(state.args)
     online_hidden = _online_hidden_config(state.args)
-    return ";".join(
-        [
-            f"template={state.template_hash}",
-            f"thinking={int(bool(thinking_enabled))}",
-            f"strip_reasoning={int(bool(state.args.strip_assistant_reasoning_history))}",
-            f"generation_mode={effective_mode}",
-            f"depth={effective_depth}",
-            "hidden_variant=post_norm",
-            "mtp_history_policy=committed",
-            f"draft_head={state.draft_head_identity}",
-            f"adaptive={json.dumps(adaptive, sort_keys=True, separators=(',', ':'))}",
-            f"proposal_cache={json.dumps(proposal_cache, sort_keys=True, separators=(',', ':'))}",
-            f"online_hidden={json.dumps(online_hidden, sort_keys=True, separators=(',', ':'))}",
-        ]
+    parts = [
+        f"template={state.template_hash}",
+        f"thinking={int(bool(thinking_enabled))}",
+        f"strip_reasoning={int(bool(state.args.strip_assistant_reasoning_history))}",
+        f"openai_bridge={_OPENAI_BRIDGE_POLICY_VERSION}",
+        f"tool_prompt_mode={effective_tool_prompt_mode}",
+        "tool_contract="
+        + _tool_prompt_policy_version_for_request(
+            tools_active=tools_active,
+            tool_prompt_mode=effective_tool_prompt_mode,
+            no_tools_contract_active=no_tools_contract_active,
+            read_only_force_answer_contract_active=read_only_force_answer_contract_active,
+            pi_convergence_contract_active=pi_convergence_contract_active,
+        ),
+        f"tool_choice={_tool_choice_policy_signature(tool_choice)}",
+        f"no_tools_contract={int(bool(no_tools_contract_active))}",
+        "read_only_force_answer_contract="
+        f"{int(bool(read_only_force_answer_contract_active))}",
+        f"pi_convergence_contract={int(bool(pi_convergence_contract_active))}",
+        f"simple_chat_contract={int(bool(simple_chat_contract_active))}",
+        f"opencode_prompt_contract={opencode_prompt_contract_profile or 'none'}",
+        f"generation_mode={effective_mode}",
+        f"depth={effective_depth}",
+        "hidden_variant=post_norm",
+        "mtp_history_policy=committed",
+        f"draft_head={state.draft_head_identity}",
+        f"adaptive={json.dumps(adaptive, sort_keys=True, separators=(',', ':'))}",
+        f"proposal_cache={json.dumps(proposal_cache, sort_keys=True, separators=(',', ':'))}",
+        f"online_hidden={json.dumps(online_hidden, sort_keys=True, separators=(',', ':'))}",
+    ]
+    normalized_cache_scope = str(cache_scope or "").strip()
+    if normalized_cache_scope and normalized_cache_scope != "stable":
+        parts.append(f"cache_scope={normalized_cache_scope}")
+    return ";".join(parts)
+
+
+def _session_cache_scope_for_request(
+    state: ServerState,
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> str:
+    client_hint = str(_request_client_hint_from_headers(headers, metadata) or "")
+    if "opencode" not in client_hint:
+        return "stable"
+    launch_id = str(getattr(state.args, "app_launch_id", "") or "").strip()
+    if not launch_id:
+        launch_id = f"pid:{os.getpid()}"
+    return f"opencode_process_cache:v1:{launch_id}"
+
+
+def _is_opencode_client(
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> bool:
+    client_hint = str(_request_client_hint_from_headers(headers, metadata) or "")
+    return "opencode" in client_hint
+
+
+def _request_tool_prompt_mode_override(
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> str | None:
+    raw = None
+    for header in _TOOL_PROMPT_MODE_REQUEST_HEADERS:
+        raw = headers.get(header)
+        if raw:
+            break
+    if raw is None:
+        raw = metadata.get("tool_prompt_mode")
+    if raw is None:
+        return None
+    try:
+        return _normalize_tool_prompt_mode(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _agent_tool_contract_client_hint(
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> str | None:
+    client_hint = str(_request_client_hint_from_headers(headers, metadata) or "")
+    for marker in _TOOL_CONTRACT_AGENT_CLIENT_HINTS:
+        if marker in client_hint:
+            return marker
+    return None
+
+
+def _tool_prompt_mode_for_request(
+    args: argparse.Namespace,
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+    tools_active: bool,
+) -> tuple[str, dict[str, Any]]:
+    launch_mode = _tool_prompt_mode_from_args(args)
+    requested_mode = _request_tool_prompt_mode_override(
+        headers=headers,
+        metadata=metadata,
     )
+    client_hint = _agent_tool_contract_client_hint(
+        headers=headers,
+        metadata=metadata,
+    )
+    if requested_mode is not None:
+        mode = requested_mode
+        source = "request"
+    elif tools_active and client_hint == "opencode":
+        mode = _TOOL_PROMPT_MODE_COMPACT
+        source = "client:opencode"
+    elif tools_active and client_hint is not None:
+        mode = _TOOL_PROMPT_MODE_HYBRID
+        source = f"client:{client_hint}"
+    else:
+        mode = launch_mode
+        source = "launch"
+    return mode, {
+        "tool_prompt_mode_launch": launch_mode,
+        "tool_prompt_mode_source": source,
+        "tool_prompt_mode_client": client_hint,
+        "tool_prompt_mode_request_override": requested_mode,
+        "tool_prompt_mode_client_repaired": bool(
+            mode != launch_mode and requested_mode is None
+        ),
+    }
+
+
+def _should_bypass_session_cache_for_opencode_tool_history(
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+    tool_result_history_present: bool,
+) -> bool:
+    if not _should_force_clone_session_cache_for_opencode_tool_history(
+        headers=headers,
+        metadata=metadata,
+        tool_result_history_present=tool_result_history_present,
+    ):
+        return False
+    return _env_bool_setting(
+        "MTPLX_OPENCODE_TOOL_HISTORY_SESSIONBANK_BYPASS",
+        default=False,
+    )
+
+
+def _opencode_tool_history_live_frontier_enabled() -> bool:
+    return _env_bool_setting(
+        "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER",
+        default=False,
+    )
+
+
+def _should_force_clone_session_cache_for_opencode_tool_history(
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+    tool_result_history_present: bool,
+) -> bool:
+    if not tool_result_history_present:
+        return False
+    return _is_opencode_client(headers=headers, metadata=metadata)
+
+
+def _opencode_tool_history_restore_policy(
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+    tool_result_history_present: bool,
+) -> dict[str, bool]:
+    eligible = _should_force_clone_session_cache_for_opencode_tool_history(
+        headers=headers,
+        metadata=metadata,
+        tool_result_history_present=tool_result_history_present,
+    )
+    cache_bypass = eligible and _should_bypass_session_cache_for_opencode_tool_history(
+        headers=headers,
+        metadata=metadata,
+        tool_result_history_present=tool_result_history_present,
+    )
+    live_frontier_restore = (
+        eligible
+        and not cache_bypass
+        and _opencode_tool_history_live_frontier_enabled()
+    )
+    return {
+        "eligible": bool(eligible),
+        "cache_bypass": bool(cache_bypass),
+        "live_frontier_restore": bool(live_frontier_restore),
+        "force_clone_restore": bool(
+            eligible and not cache_bypass and not live_frontier_restore
+        ),
+    }
 
 
 def _proposal_cache_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -4793,6 +12458,37 @@ def _online_hidden_config(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _bridge_policy_observability(
+    *,
+    tools_active: bool,
+    tool_prompt_mode: str,
+    no_tools_contract_active: bool = False,
+    read_only_force_answer_contract_active: bool = False,
+    pi_convergence_contract_active: bool = False,
+) -> dict[str, Any]:
+    effective_tool_prompt_mode = _normalize_tool_prompt_mode(tool_prompt_mode)
+    return {
+        "openai_bridge_policy_version": _OPENAI_BRIDGE_POLICY_VERSION,
+        "tool_prompt_mode": effective_tool_prompt_mode,
+        "tool_contract_policy_version": _tool_prompt_policy_version_for_request(
+            tools_active=tools_active,
+            tool_prompt_mode=effective_tool_prompt_mode,
+            no_tools_contract_active=no_tools_contract_active,
+            read_only_force_answer_contract_active=read_only_force_answer_contract_active,
+            pi_convergence_contract_active=pi_convergence_contract_active,
+        ),
+        "tool_contract_active": _tool_contract_active_for_mode(
+            tools_active=tools_active,
+            tool_prompt_mode=effective_tool_prompt_mode,
+        ),
+        "no_tools_contract_active": bool(no_tools_contract_active),
+        "read_only_force_answer_contract_active": bool(
+            read_only_force_answer_contract_active
+        ),
+        "pi_convergence_contract_active": bool(pi_convergence_contract_active),
+    }
+
+
 def _adaptive_config(
     args: argparse.Namespace,
     *,
@@ -4801,14 +12497,19 @@ def _adaptive_config(
     policy = str(getattr(args, "adaptive_policy", "none") or "none")
     if policy == "none":
         return {"policy": "none"}
-    effective_max_depth = int(
-        max_depth if max_depth is not None else getattr(args, "depth", 3)
+    effective_max_depth = max(
+        1,
+        int(max_depth if max_depth is not None else getattr(args, "depth", 3)),
     )
+    configured_min_depth = max(1, int(args.adaptive_min_depth))
+    effective_min_depth = min(configured_min_depth, effective_max_depth)
     config: dict[str, Any] = {
         "policy": policy,
         "max_depth": effective_max_depth,
-        "min_depth": int(args.adaptive_min_depth),
+        "min_depth": effective_min_depth,
     }
+    if effective_min_depth != configured_min_depth:
+        config["configured_min_depth"] = configured_min_depth
     if policy == "streak":
         config.update(
             {
@@ -4818,9 +12519,14 @@ def _adaptive_config(
             }
         )
     elif policy == "expected_value":
+        configured_base_depth = max(1, int(args.adaptive_ev_base_depth))
+        effective_base_depth = max(
+            effective_min_depth,
+            min(configured_base_depth, effective_max_depth),
+        )
         config.update(
             {
-                "base_depth": int(args.adaptive_ev_base_depth),
+                "base_depth": effective_base_depth,
                 "accept_priors": [float(v) for v in args.adaptive_ev_accept_priors],
                 "draft_cost_s": float(args.adaptive_ev_draft_cost_s),
                 "extra_verify_cost_s": float(args.adaptive_ev_extra_verify_cost_s),
@@ -4832,8 +12538,14 @@ def _adaptive_config(
                 "min_extra_accept_probability": float(
                     args.adaptive_ev_min_extra_accept_probability
                 ),
+                "warmup_full_depth_cycles": int(
+                    args.adaptive_ev_warmup_full_depth_cycles
+                ),
+                "exploration_interval": int(args.adaptive_ev_exploration_interval),
             }
         )
+        if effective_base_depth != configured_base_depth:
+            config["configured_base_depth"] = configured_base_depth
     return config
 
 
@@ -4845,22 +12557,31 @@ def _make_adaptive_policy(
     policy = str(getattr(args, "adaptive_policy", "none") or "none")
     if policy == "none":
         return None
-    effective_max_depth = int(
-        max_depth if max_depth is not None else getattr(args, "depth", 3)
+    effective_max_depth = max(
+        1,
+        int(max_depth if max_depth is not None else getattr(args, "depth", 3)),
+    )
+    effective_min_depth = min(
+        max(1, int(args.adaptive_min_depth)),
+        effective_max_depth,
     )
     if policy == "streak":
         return AdaptiveDepthPolicy(
             max_depth=effective_max_depth,
-            min_depth=int(args.adaptive_min_depth),
+            min_depth=effective_min_depth,
             start_depth=int(args.adaptive_start_depth),
             increase_after=int(args.adaptive_increase_after),
             decrease_after=int(args.adaptive_decrease_after),
         )
     if policy == "expected_value":
+        effective_base_depth = max(
+            effective_min_depth,
+            min(max(1, int(args.adaptive_ev_base_depth)), effective_max_depth),
+        )
         return ExpectedValueDepthPolicy(
             max_depth=effective_max_depth,
-            min_depth=int(args.adaptive_min_depth),
-            base_depth=int(args.adaptive_ev_base_depth),
+            min_depth=effective_min_depth,
+            base_depth=effective_base_depth,
             accept_priors=tuple(float(v) for v in args.adaptive_ev_accept_priors),
             draft_cost_s=float(args.adaptive_ev_draft_cost_s),
             extra_verify_cost_s=float(args.adaptive_ev_extra_verify_cost_s),
@@ -4872,6 +12593,10 @@ def _make_adaptive_policy(
             min_extra_accept_probability=float(
                 args.adaptive_ev_min_extra_accept_probability
             ),
+            warmup_full_depth_cycles=int(
+                args.adaptive_ev_warmup_full_depth_cycles
+            ),
+            exploration_interval=int(args.adaptive_ev_exploration_interval),
         )
     raise ValueError(f"unknown adaptive policy: {policy}")
 
@@ -4893,6 +12618,8 @@ def _store_retokenized_history_snapshot(
     abort_reason: Callable[[], str] | None = None,
     pending_record: Any | None = None,
     keep_live_ref: bool = True,
+    tool_prompt_mode: str | None = None,
+    strip_tool_call_preamble_text: bool = False,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "reason": "no_session_id"}
@@ -4922,6 +12649,8 @@ def _store_retokenized_history_snapshot(
         assistant_tool_calls=assistant_tool_calls,
         thinking_enabled=thinking_enabled,
         tool_specs=tool_specs,
+        tool_prompt_mode=tool_prompt_mode,
+        strip_tool_call_preamble_text=strip_tool_call_preamble_text,
     )
     if not history_ids:
         return {"stored": False, "reason": "empty_boundary_prefix"}
@@ -4932,17 +12661,44 @@ def _store_retokenized_history_snapshot(
         except BaseException:
             pass
     best_prefix_len = 0
+    best_prefix_nbytes = 0
     try:
         best_prefix = state.sessions.bank.longest_prefix(history_ids)
         if best_prefix is not None:
             best_prefix_len = int(getattr(best_prefix, "prefix_len", 0) or 0)
+            best_prefix_nbytes = int(getattr(best_prefix, "nbytes", 0) or 0)
     except BaseException:
         best_prefix_len = 0
+        best_prefix_nbytes = 0
     prefix_probe = {
         "best_prefix_len": int(best_prefix_len),
         "history_tokens": int(history_tokens),
         "suffix_tokens": max(0, int(history_tokens) - int(best_prefix_len)),
     }
+    bank_budget = int(getattr(state.sessions.bank, "per_session_max_bytes", 0) or 0)
+    estimated_nbytes = 0
+    if best_prefix_len > 0 and best_prefix_nbytes > 0:
+        # SessionBank snapshots scale roughly with prefix length. If the
+        # previous committed boundary is already close to the per-session
+        # cap, attempting to materialize a larger postcommit snapshot can
+        # burn tens of seconds only to be rejected as oversized. Skip that
+        # best-effort cache maintenance before touching MLX arrays; the
+        # foreground user request can still reuse the existing shorter
+        # prefix and prefill only the suffix.
+        estimated_nbytes = int(
+            (float(best_prefix_nbytes) * float(history_tokens) / float(best_prefix_len))
+            * 1.03
+        )
+    if bank_budget > 0 and estimated_nbytes > bank_budget:
+        return {
+            "stored": False,
+            "mode": "retokenized_history",
+            "reason": "estimated_oversized_snapshot",
+            "estimated_nbytes": int(estimated_nbytes),
+            "budget": int(bank_budget),
+            "best_prefix_nbytes": int(best_prefix_nbytes),
+            **prefix_probe,
+        }
     if _abort_requested():
         return {
             "stored": False,
@@ -5086,6 +12842,15 @@ def _store_retokenized_history_snapshot(
         "cache_hit": bool(getattr(prompt_state, "cache_hit", False)),
         "cached_tokens": int(getattr(prompt_state, "cached_tokens", 0) or 0),
         "suffix_tokens": int(getattr(prompt_state, "suffix_tokens", 0) or 0),
+        "cache_source": getattr(prompt_state, "cache_source", "none"),
+        "ssd_cache_hit": bool(getattr(prompt_state, "ssd_cache_hit", False)),
+        "ssd_cached_tokens": int(getattr(prompt_state, "ssd_cached_tokens", 0) or 0),
+        "ssd_restore_s": float(getattr(prompt_state, "ssd_restore_s", 0.0) or 0.0),
+        "ssd_suffix_tokens": (
+            int(getattr(prompt_state, "suffix_tokens", 0) or 0)
+            if bool(getattr(prompt_state, "ssd_cache_hit", False))
+            else 0
+        ),
         "cache_miss_reason": getattr(prompt_state, "cache_miss_reason", None),
         "session_commit": session_commit,
     }
@@ -5099,7 +12864,17 @@ def _history_ids_for_postcommit(
     assistant_tool_calls: list[dict[str, Any]] | None,
     thinking_enabled: bool,
     tool_specs: list[dict[str, Any]] | None = None,
+    tool_prompt_mode: str | None = None,
+    strip_tool_call_preamble_text: bool = False,
 ) -> list[int]:
+    reasoning_effort = _reasoning_effort_for_state(
+        state,
+        thinking_enabled=thinking_enabled,
+    )
+    effective_tool_prompt_mode = _normalize_tool_prompt_mode(
+        tool_prompt_mode,
+        default=_tool_prompt_mode_from_args(state.args),
+    )
     history_messages = list(messages) + [
         ChatMessage(
             role="assistant",
@@ -5107,13 +12882,39 @@ def _history_ids_for_postcommit(
             tool_calls=assistant_tool_calls,
         ),
     ]
+    if tool_specs:
+        # The generation prompt may compact the current large read as an
+        # active-read excerpt. Once the assistant response is appended, that
+        # same tool result is historical context for the next OpenCode turn
+        # and must use the older-tool digest shape the next request will build.
+        canonicalization_messages = history_messages
+        if not assistant_tool_calls:
+            canonicalization_messages = [
+                *history_messages,
+                ChatMessage(role="user", content=_POSTCOMMIT_SENTINEL_CONTENT),
+            ]
+        history_messages, _stats = _canonicalize_agent_transcript(
+            canonicalization_messages,
+            tools_active=True,
+            strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+        )
+        if (
+            not assistant_tool_calls
+            and history_messages
+            and str(history_messages[-1].role).lower() == "user"
+            and _content_to_text(history_messages[-1].content)
+            == _POSTCOMMIT_SENTINEL_CONTENT
+        ):
+            history_messages = history_messages[:-1]
     next_turn_prefix_ids = _postcommit_next_turn_prefix_ids(
         state.runtime.tokenizer,
         history_messages,
         enable_thinking=thinking_enabled,
+        reasoning_effort=reasoning_effort,
         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
         tools=tool_specs,
         assistant_tool_calls=assistant_tool_calls,
+        tool_prompt_mode=effective_tool_prompt_mode,
     )
     if next_turn_prefix_ids:
         return next_turn_prefix_ids
@@ -5121,9 +12922,11 @@ def _history_ids_for_postcommit(
         state.runtime.tokenizer,
         history_messages,
         enable_thinking=thinking_enabled,
+        reasoning_effort=reasoning_effort,
         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
         add_generation_prompt=False,
         tools=tool_specs,
+        tool_prompt_mode=effective_tool_prompt_mode,
     )
 
 
@@ -5137,6 +12940,8 @@ def _generation_final_postcommit_compatibility(
     assistant_tool_calls: list[dict[str, Any]] | None = None,
     thinking_enabled: bool,
     tool_specs: list[dict[str, Any]] | None = None,
+    tool_prompt_mode: str | None = None,
+    strip_tool_call_preamble_text: bool = False,
 ) -> dict[str, Any]:
     if assistant_tool_calls:
         return {
@@ -5152,6 +12957,12 @@ def _generation_final_postcommit_compatibility(
             "safe": False,
             "mode": "unsafe",
             "reason": "stats_footer_in_assistant_history",
+        }
+    if _reasoning_parser_for_state(state) == "gemma4" and thinking_enabled:
+        return {
+            "safe": False,
+            "mode": "unsafe",
+            "reason": "gemma4_reasoning_history_retokenize",
         }
     final_state = generated.get("_final_state")
     if final_state is None:
@@ -5189,6 +13000,8 @@ def _generation_final_postcommit_compatibility(
         assistant_tool_calls=assistant_tool_calls,
         thinking_enabled=thinking_enabled,
         tool_specs=tool_specs,
+        tool_prompt_mode=tool_prompt_mode,
+        strip_tool_call_preamble_text=strip_tool_call_preamble_text,
     )
     if history_ids == final_token_ids:
         return {
@@ -5236,6 +13049,8 @@ def _store_generation_final_history_snapshot(
     policy_fingerprint: str,
     tool_specs: list[dict[str, Any]] | None = None,
     keep_live_ref: bool = True,
+    tool_prompt_mode: str | None = None,
+    strip_tool_call_preamble_text: bool = False,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "mode": "unsafe", "reason": "no_session_id"}
@@ -5249,6 +13064,8 @@ def _store_generation_final_history_snapshot(
         assistant_tool_calls=assistant_tool_calls,
         thinking_enabled=thinking_enabled,
         tool_specs=tool_specs,
+        tool_prompt_mode=tool_prompt_mode,
+        strip_tool_call_preamble_text=strip_tool_call_preamble_text,
     )
     if not bool(compatibility.get("safe")):
         return {
@@ -5289,6 +13106,7 @@ def _store_generation_final_history_snapshot(
             mtp_history_snapshot=mtp_snapshot,
             snapshot_epoch=len(token_ids),
             mtp_snapshot_epoch=len(token_ids) if mtp_snapshot is not None else None,
+            extra_state=getattr(final_state, "extra_state", None),
         )
     finally:
         state.lock.release()
@@ -5329,6 +13147,8 @@ def _schedule_idle_postcommit_snapshot(
     session: Any | None = None,
     expected_session_revision: int | None = None,
     keep_live_ref: bool = True,
+    tool_prompt_mode: str | None = None,
+    strip_tool_call_preamble_text: bool = False,
 ) -> dict[str, Any]:
     """Schedule a background SessionBank commit for a response the
     generation-final compatibility check rejected as unsafe (most commonly
@@ -5370,7 +13190,7 @@ def _schedule_idle_postcommit_snapshot(
         if _server_console_enabled(state):
             return
         try:
-            print(
+            _safe_stdout_print(
                 "[mtplx] idle async session postcommit "
                 + json.dumps(
                     {
@@ -5380,8 +13200,7 @@ def _schedule_idle_postcommit_snapshot(
                     },
                     sort_keys=True,
                     default=str,
-                ),
-                flush=True,
+                )
             )
         except BaseException:
             # Logging must never bring down the executor; fail silently.
@@ -5465,6 +13284,8 @@ def _schedule_idle_postcommit_snapshot(
                     abort_reason=_postcommit_abort_reason,
                     pending_record=record,
                     keep_live_ref=bool(keep_live_ref),
+                    tool_prompt_mode=tool_prompt_mode,
+                    strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                 )
                 if postcommit.get("stored"):
                     _log(postcommit)
@@ -5519,38 +13340,46 @@ def _schedule_idle_postcommit_snapshot(
 
 def _skipped_idle_postcommit_snapshot(
     *,
+    state: ServerState | None = None,
     unsafe_reason: str,
     assistant_tool_calls: list[dict[str, Any]] | None = None,
     prompt_prefix_len: int | None = None,
 ) -> dict[str, Any] | None:
-    """Return a cheap postcommit result for unsafe cases that should not prefill.
+    backend_id = getattr(getattr(state, "backend_descriptor", None), "backend_id", "")
+    if backend_id == GEMMA4_BACKEND:
+        return {
+            "stored": False,
+            "mode": "skipped",
+            "reason": "gemma4_retokenized_postcommit_unsupported",
+            "unsafe_reason": unsafe_reason,
+            "assistant_tool_calls": len(assistant_tool_calls or []),
+            "prompt_prefix_len": int(prompt_prefix_len or 0),
+        }
+    del unsafe_reason, assistant_tool_calls, prompt_prefix_len
+    return None
 
-    OpenCode often finishes a tool-result turn with a tiny assistant message
-    whose canonical chat-template history differs from the generated boundary
-    only because of stop-token framing. The foreground path has already
-    committed the prompt prefix, so scheduling a full retokenized postcommit
-    here burns GPU for seconds without improving the next request materially.
 
-    Tool-call turns are different: the next request sends structured
-    assistant tool-call history, so they must still use the retokenized async
-    path.
-    """
-    reason = str(unsafe_reason or "")
-    if assistant_tool_calls:
+_UNCAPPED_RESPONSE_LEASE_DISABLED_VALUES = {
+    "0",
+    "off",
+    "false",
+    "no",
+    "none",
+    "unlimited",
+}
+
+
+def _uncapped_response_lease_tokens_from_env() -> int | None:
+    raw_value = os.environ.get("MTPLX_UNCAPPED_RESPONSE_LEASE_TOKENS")
+    if raw_value is None:
         return None
-    if reason != "stop_token_boundary_mismatch":
+    raw = raw_value.strip().lower()
+    if raw in _UNCAPPED_RESPONSE_LEASE_DISABLED_VALUES:
         return None
-    result: dict[str, Any] = {
-        "stored": False,
-        "mode": "async_skipped",
-        "reason": reason,
-    }
-    if prompt_prefix_len is not None:
-        try:
-            result["prefix_len"] = int(prompt_prefix_len)
-        except (TypeError, ValueError):
-            pass
-    return result
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return None
 
 
 def _generation_params(
@@ -5564,24 +13393,40 @@ def _generation_params(
 ) -> tuple[int, SamplerConfig, dict[str, Any]]:
     remaining_context = max(1, int(state.context_window) - int(prompt_token_count))
     request_max_tokens = None if max_tokens is None else int(max_tokens)
-    requested_max = (
+    semantic_requested_max = (
         remaining_context if request_max_tokens is None else request_max_tokens
     )
-    before_server_cap = requested_max
+    before_server_cap = semantic_requested_max
     server_max_response_tokens = state.args.max_response_tokens
     if state.args.max_response_tokens is not None:
-        requested_max = min(requested_max, int(state.args.max_response_tokens))
-    after_server_cap = requested_max
-    requested_max = max(1, min(after_server_cap, remaining_context))
+        semantic_requested_max = min(
+            semantic_requested_max, int(state.args.max_response_tokens)
+        )
+    after_server_cap = semantic_requested_max
+    semantic_effective_max = max(1, min(after_server_cap, remaining_context))
+    decode_lease_tokens = semantic_effective_max
+    uncapped_response_requested = request_max_tokens is None
+    uncapped_response_lease_tokens: int | None = None
+    uncapped_response_lease_applied = False
+    if uncapped_response_requested and server_max_response_tokens is None:
+        uncapped_response_lease_tokens = _uncapped_response_lease_tokens_from_env()
+        if uncapped_response_lease_tokens is not None:
+            decode_lease_tokens = max(
+                1, min(semantic_effective_max, uncapped_response_lease_tokens)
+            )
+            uncapped_response_lease_applied = decode_lease_tokens < semantic_effective_max
+    sampler_temperature = (
+        state.args.temperature if temperature is None else float(temperature)
+    )
+    sampler_top_p = state.args.top_p if top_p is None else float(top_p)
+    sampler_top_k = state.args.top_k if top_k is None else int(top_k)
     sampler = SamplerConfig(
-        temperature=state.args.temperature
-        if temperature is None
-        else float(temperature),
-        top_p=state.args.top_p if top_p is None else float(top_p),
-        top_k=state.args.top_k if top_k is None else int(top_k),
+        temperature=sampler_temperature,
+        top_p=sampler_top_p,
+        top_k=sampler_top_k,
     )
     return (
-        requested_max,
+        decode_lease_tokens,
         sampler,
         {
             "request_max_tokens": request_max_tokens,
@@ -5590,15 +13435,37 @@ def _generation_params(
                 if server_max_response_tokens is None
                 else int(server_max_response_tokens)
             ),
-            "effective_max_tokens": int(requested_max),
+            "effective_max_tokens": int(semantic_effective_max),
+            "decode_lease_tokens": int(decode_lease_tokens),
+            "uncapped_response_requested": bool(uncapped_response_requested),
+            "uncapped_response_lease_tokens": (
+                None
+                if uncapped_response_lease_tokens is None
+                else int(uncapped_response_lease_tokens)
+            ),
+            "uncapped_response_lease_applied": bool(
+                uncapped_response_lease_applied
+            ),
             "remaining_context_tokens": int(remaining_context),
             "server_cap_applied": bool(
                 server_max_response_tokens is not None
                 and after_server_cap < before_server_cap
             ),
-            "context_cap_applied": bool(requested_max < after_server_cap),
+            "context_cap_applied": bool(semantic_effective_max < after_server_cap),
+            "effective_temperature": float(sampler.temperature),
+            "effective_top_p": float(sampler.top_p),
+            "effective_top_k": int(sampler.top_k),
         },
     )
+
+
+def _uncapped_repetition_stop_enabled(generation_limits: dict[str, Any]) -> bool:
+    if not bool(generation_limits.get("uncapped_response_requested")):
+        return False
+    if generation_limits.get("server_max_response_tokens") is not None:
+        return False
+    raw = os.environ.get("MTPLX_UNCAPPED_REPETITION_STOP", "1").strip().lower()
+    return raw not in _UNCAPPED_RESPONSE_LEASE_DISABLED_VALUES
 
 
 def _fresh_seed() -> int:
@@ -5623,6 +13490,408 @@ def _resolve_seed(state: ServerState, request_seed: int | None) -> tuple[int, bo
     return _fresh_seed(), False
 
 
+def _dashboard_in_flight_count(state: ServerState) -> int:
+    try:
+        return int(state.dashboard.in_flight.count())
+    except Exception:
+        return 0
+
+
+def _ar_batch_mtp_fallback_reason(state: ServerState) -> str | None:
+    config = _scheduler_config_from_args(state.args)
+    if config.mode not in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}:
+        return None
+    burst_reason = (
+        "open_code_fair_burst"
+        if _scheduler_policy_label(config) == "open_code_fair"
+        else "batch_size_gt_1"
+    )
+    wait_s = max(0.0, float(config.to_dict()["batch_wait_ms"]) / 1000.0)
+    deadline = time.perf_counter() + wait_s
+    while True:
+        service = getattr(state, "ar_batch_service", None)
+        service_snapshot: dict[str, Any] = {}
+        if service is not None and hasattr(service, "snapshot"):
+            try:
+                service_snapshot = dict(service.snapshot())
+            except Exception:
+                service_snapshot = {}
+        if (
+            _dashboard_in_flight_count(state) > 1
+            or int(service_snapshot.get("pending") or 0) > 0
+            or int(service_snapshot.get("active") or 0) > 0
+        ):
+            return burst_reason
+        if time.perf_counter() >= deadline:
+            return None
+        time.sleep(0.001)
+
+
+def _use_live_ar_batch(
+    state: ServerState,
+    *,
+    effective_mode: str,
+) -> tuple[bool, str | None]:
+    config = _scheduler_config_from_args(state.args)
+    if config.mode not in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}:
+        return False, None
+    if effective_mode == "ar":
+        return True, "generation_mode_ar"
+    fallback_reason = _ar_batch_mtp_fallback_reason(state)
+    if fallback_reason is None:
+        return False, None
+    return True, fallback_reason
+
+
+def _ar_batch_history_bypass_reason(
+    request_observability: dict[str, Any] | None,
+) -> str | None:
+    """Return why a request must stay out of the live AR batch lane.
+
+    The live AR batch lane is an agent fairness feature, not a generic OpenAI
+    API compatibility mode. Anonymous benchmark/API calls should keep the solo
+    MTP path so concurrent `mtplx serve` users do not see hidden AR fallback.
+
+    Tool/history turns are still plain prompt tokens when no restored cache is
+    handed to mlx-lm's ``BatchGenerator``. The unsafe object is the restored
+    non-mergeable paged KV history cache, not the existence of assistant/tool
+    roles in the prompt. Keep this hook for future explicit bypass reasons, but
+    do not serialize OpenCode follow-up turns by role alone.
+    """
+
+    request_observability = request_observability or {}
+    client_hint = str(request_observability.get("request_client_hint") or "").lower()
+    client_label = str(request_observability.get("request_client_label") or "").lower()
+    client = client_hint or client_label
+    if client in {"", "openai"}:
+        return "generic_openai_solo_mtp"
+    return None
+
+
+def _finalize_batched_ar_generation(
+    state: ServerState,
+    prompt_ids: list[int],
+    generated: dict[str, Any],
+    *,
+    session_id: str | None,
+    session_cache_hit: bool,
+    cache_miss_reason: str | None,
+    session_restore_mode: str,
+    request_observability: dict[str, Any] | None,
+) -> dict[str, Any]:
+    token_times = [float(value) for value in generated.pop("_token_times", [])]
+    generation_limits = dict(generated.pop("_generation_limits", {}) or {})
+    completion_tokens = _effective_completion_tokens(
+        generated_tokens=list(generated.get("tokens") or []),
+        streamed_token_times=token_times,
+    )
+    elapsed_s = float(generated.get("elapsed_s") or 0.0)
+    stats = _repair_streamed_generation_stats(
+        dict(generated.get("stats") or {}),
+        completion_tokens=completion_tokens,
+        elapsed_s=elapsed_s,
+    )
+    envelope = _metrics_envelope(
+        stats=stats,
+        prompt_tokens=len(prompt_ids),
+        completion_tokens=completion_tokens,
+        request_elapsed_s=elapsed_s,
+        token_times=token_times,
+        request_started_s=float(stats.get("request_started_s") or time.perf_counter()),
+        lock_wait_time_s=float(stats.get("queue_wait_s") or 0.0),
+        session_id=session_id,
+        session_cache_hit=session_cache_hit,
+        cache_miss_reason=cache_miss_reason,
+        session_restore_mode=session_restore_mode,
+        mtp_depth=0,
+        generation_limits=generation_limits,
+    )
+    envelope["generation_mode"] = "ar"
+    envelope["requested_mtp_depth"] = 0
+    envelope["long_context_mtp_depth_policy"] = {}
+    envelope["mtp_depth"] = 0
+    envelope["verify_calls"] = 0
+    envelope["verify_time_s"] = 0.0
+    envelope["accepted_by_depth"] = []
+    envelope["draft_time_s"] = 0.0
+    for key in (
+        "cached_tokens",
+        "new_prefill_tokens",
+        "session_cache_hit",
+        "cache_source",
+        "ssd_cache_hit",
+        "ssd_cached_tokens",
+        "ssd_restore_s",
+        "ssd_suffix_tokens",
+        "cache_miss_reason",
+        "session_restore_mode",
+        "ar_batch_shared_prefix_tokens",
+        "ar_batch_shared_prefix_prefill_s",
+        "ar_batch_shared_prefix_snapshot_s",
+        "ar_batch_prompt_prepare_s",
+        "scheduler_lane",
+        "scheduler_mode",
+        "batching_preset",
+        "scheduler_policy",
+        "request_id",
+        "client_label",
+        "queue_wait_s",
+        "active_batch_size",
+        "ar_batch_max_observed",
+        "mtp_disabled_reason",
+    ):
+        if key in stats:
+            envelope[key] = stats[key]
+    if request_observability:
+        envelope.update(request_observability)
+    cleanup = _auto_clear_mlx_cache_after_completed_request(
+        state,
+        session_id=session_id,
+        request_observability=request_observability,
+    )
+    if cleanup is not None:
+        envelope["mlx_cache_cleanup"] = cleanup
+    envelope.update(_mlx_allocator_public_stats())
+    for key in (
+        "cached_tokens",
+        "new_prefill_tokens",
+        "session_cache_hit",
+        "cache_source",
+        "ssd_cache_hit",
+        "ssd_cached_tokens",
+        "ssd_restore_s",
+        "ssd_suffix_tokens",
+        "cache_miss_reason",
+        "session_restore_mode",
+        "ar_batch_shared_prefix_tokens",
+        "ar_batch_shared_prefix_prefill_s",
+        "ar_batch_shared_prefix_snapshot_s",
+        "ar_batch_prompt_prepare_s",
+    ):
+        if key in stats:
+            envelope[key] = stats[key]
+    if bool(envelope.get("session_cache_hit")):
+        envelope["cache_miss_reason"] = None
+    stats.update(envelope)
+    stats.update(_generation_truth_stats(state, "ar"))
+    stats["server_elapsed_s"] = elapsed_s
+    stats["server_tok_s"] = (
+        completion_tokens / elapsed_s if elapsed_s > 0 else 0.0
+    )
+    state.last_metrics.append(dict(envelope))
+    state.last_metrics = state.last_metrics[-100:]
+    state.last_request_at = time.time()
+    state.requests_completed += 1
+    _dashboard_record_completion(state, envelope=envelope, stats=stats)
+    generated["stats"] = _json_safe(stats)
+    generated["completion_tokens"] = completion_tokens
+    generated["tok_s"] = stats.get("decode_tok_s") or generated.get("tok_s") or 0.0
+    generated["end_to_end_tok_s"] = stats["server_tok_s"]
+    if not bool((request_observability or {}).get("warmup")) and not _server_console_enabled(state):
+        _safe_stdout_print(
+            json.dumps(
+                {
+                    "event": "mtplx_openai_generation",
+                    "scheduler_lane": "ar_batch",
+                    "prompt_tokens": generated.get("prompt_tokens"),
+                    "completion_tokens": completion_tokens,
+                    "elapsed_s": round(elapsed_s, 6),
+                    "tok_s": round(float(generated.get("tok_s") or 0.0), 6),
+                    "end_to_end_tok_s": round(float(generated["end_to_end_tok_s"]), 6),
+                    "seed": stats.get("server_seed"),
+                    "mtp_disabled_reason": stats.get("mtp_disabled_reason"),
+                    "text_preview": str(generated.get("text") or "")[:120],
+                },
+                ensure_ascii=False,
+            )
+        )
+    return generated
+
+
+def _smart_fan_request_id(response_id: str | None, fallback_prefix: str) -> str:
+    return response_id or f"{fallback_prefix}-{uuid.uuid4().hex}"
+
+
+def _begin_smart_fan_request(
+    state: Any,
+    *,
+    request_id: str | None,
+    background_request: bool = False,
+    request_observability: dict[str, Any] | None = None,
+) -> str | None:
+    if background_request:
+        return None
+    if bool((request_observability or {}).get("warmup")):
+        return None
+    try:
+        mode = normalize_fan_mode(getattr(state, "fan_mode", FAN_MODE_DEFAULT))
+    except ValueError:
+        mode = FAN_MODE_DEFAULT
+    if mode != FAN_MODE_SMART:
+        return None
+    controller = getattr(state, "smart_fans", None)
+    if controller is None:
+        return None
+    lease_id = request_id or f"request-{uuid.uuid4().hex}"
+    try:
+        controller.begin_request(lease_id)
+    except Exception as exc:
+        LOGGER.warning("Smart fan begin failed: %s", exc)
+    return lease_id
+
+
+def _end_smart_fan_request(
+    state: Any,
+    lease_id: str | None,
+    *,
+    wait_for_restore: bool = False,
+) -> None:
+    if lease_id is None:
+        return
+    controller = getattr(state, "smart_fans", None)
+    if controller is None:
+        return
+    try:
+        controller.end_request(lease_id, wait_for_restore=wait_for_restore)
+    except Exception as exc:
+        LOGGER.warning("Smart fan restore failed: %s", exc)
+
+
+def _run_generation_dispatched(
+    state: ServerState,
+    prompt_ids: list[int],
+    *,
+    batch_key: str,
+    response_id: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    effective_mode = _normalize_generation_mode(
+        kwargs.get("generation_mode"),
+        default=getattr(state.args, "generation_mode", "mtp"),
+    )
+    request_observability_for_lane = dict(kwargs.get("request_observability") or {})
+    if response_id:
+        request_observability_for_lane.setdefault("request_id", response_id)
+    kwargs["request_observability"] = request_observability_for_lane
+    history_bypass_reason = _ar_batch_history_bypass_reason(
+        request_observability_for_lane
+    )
+    if history_bypass_reason is not None:
+        use_ar_batch = False
+        mtp_disabled_reason = None
+        request_observability_for_lane["scheduler_lane"] = (
+            "solo_mtp_generic"
+            if history_bypass_reason == "generic_openai_solo_mtp"
+            else "solo_mtp_history"
+        )
+        request_observability_for_lane["ar_batch_bypass_reason"] = (
+            history_bypass_reason
+        )
+    else:
+        use_ar_batch, mtp_disabled_reason = _use_live_ar_batch(
+            state,
+            effective_mode=effective_mode,
+        )
+    if use_ar_batch:
+        if mtp_disabled_reason not in {None, "generation_mode_ar"}:
+            LOGGER.warning(
+                "Solo MTP bypassed for fair AR batching",
+                extra={
+                    "request_id": response_id,
+                    "mtp_disabled_reason": mtp_disabled_reason,
+                    "scheduler_policy": _scheduler_policy_label(
+                        _scheduler_config_from_args(state.args)
+                    ),
+                },
+            )
+        response_max, sampler, generation_limits = _generation_params(
+            state,
+            prompt_token_count=len(prompt_ids),
+            max_tokens=kwargs.get("max_tokens"),
+            temperature=kwargs.get("temperature"),
+            top_p=kwargs.get("top_p"),
+            top_k=kwargs.get("top_k"),
+        )
+        generation_seed, _seed_is_explicit = _resolve_seed(state, kwargs.get("seed"))
+        request_observability = dict(kwargs.get("request_observability") or {})
+        request_observability["scheduler_lane"] = "ar_batch"
+        if kwargs.get("cache_miss_reason") is not None:
+            request_observability.setdefault(
+                "cache_miss_reason", kwargs.get("cache_miss_reason")
+            )
+        request_observability.setdefault(
+            "session_restore_mode", str(kwargs.get("session_restore_mode") or "cold")
+        )
+        if mtp_disabled_reason:
+            request_observability["mtp_disabled_reason"] = mtp_disabled_reason
+        job = _BatchedARJob(
+            request_id=response_id or f"arbatch-{uuid.uuid4().hex}",
+            prompt_ids=prompt_ids,
+            max_tokens=response_max,
+            sampler=sampler,
+            seed=generation_seed,
+            stop_token_ids=_default_stop_tokens(state.runtime.tokenizer),
+            token_callback=kwargs.get("token_callback"),
+            prefill_callback=kwargs.get("prefill_callback"),
+            request_observability=request_observability,
+            mtp_disabled_reason=mtp_disabled_reason,
+            generation_limits=generation_limits,
+            cancel_event=kwargs.get("cancel_event"),
+            session_id=kwargs.get("session_id"),
+            session_bank=kwargs.get("session_bank"),
+            session_restore_mode=str(kwargs.get("session_restore_mode") or "cold"),
+            session_template_hash=kwargs.get("session_template_hash"),
+            session_draft_head_identity=kwargs.get("session_draft_head_identity"),
+            session_policy_fingerprint=kwargs.get("session_policy_fingerprint"),
+        )
+        ar_request_id = response_id or job.request_id
+        smart_fan_lease = _begin_smart_fan_request(
+            state,
+            request_id=_smart_fan_request_id(ar_request_id, "arbatch"),
+            request_observability=request_observability,
+        )
+        state.begin_foreground()
+        try:
+            future = state.ar_batch_service.submit(job)
+            generated = future.result()
+        finally:
+            state.end_foreground()
+            _end_smart_fan_request(state, smart_fan_lease)
+        ar_stats = dict(generated.get("stats") or {})
+        ar_session_cache_hit = bool(ar_stats.get("session_cache_hit") or False)
+        ar_cache_miss_reason = ar_stats.get("cache_miss_reason")
+        if ar_session_cache_hit:
+            ar_cache_miss_reason = None
+        elif ar_cache_miss_reason is None:
+            ar_cache_miss_reason = kwargs.get("cache_miss_reason")
+        return _finalize_batched_ar_generation(
+            state,
+            prompt_ids,
+            generated,
+            session_id=kwargs.get("session_id"),
+            session_cache_hit=ar_session_cache_hit,
+            cache_miss_reason=ar_cache_miss_reason,
+            session_restore_mode=str(
+                ar_stats.get("session_restore_mode")
+                or kwargs.get("session_restore_mode")
+                or "ar_batch"
+            ),
+            request_observability=request_observability,
+        )
+
+    def run() -> dict[str, Any]:
+        return _run_generation(state, prompt_ids, **kwargs)
+
+    scheduler = getattr(state, "model_scheduler", None)
+    if scheduler is not None and hasattr(scheduler, "is_owner_thread") and scheduler.is_owner_thread():
+        return run()
+    return _submit_foreground_model_work(
+        state,
+        run,
+        batch_key=batch_key,
+    ).result()
+
+
 def _run_generation(
     state: ServerState,
     prompt_ids: list[int],
@@ -5632,8 +13901,10 @@ def _run_generation(
     top_p: float | None,
     top_k: int | None,
     seed: int | None,
+    draft_sampler: SamplerConfig | None = None,
     generation_mode: str | None = None,
     depth: int | None = None,
+    resolved_mtp_depth: int | None = None,
     token_callback: Callable[[list[int]], None] | None = None,
     session_id: str | None = None,
     session_cache_hit: bool = False,
@@ -5648,6 +13919,9 @@ def _run_generation(
     commit_prompt_prefix_to_bank: bool = False,
     session_keep_live_ref: bool = True,
     request_observability: dict[str, Any] | None = None,
+    prefill_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: Event | None = None,
+    streaming_response: bool | None = None,
 ) -> dict[str, Any]:
     response_max, sampler, generation_limits = _generation_params(
         state,
@@ -5657,15 +13931,27 @@ def _run_generation(
         top_p=top_p,
         top_k=top_k,
     )
+    uncapped_repetition_stop = _uncapped_repetition_stop_enabled(generation_limits)
+    generation_limits["uncapped_repetition_stop_enabled"] = bool(
+        uncapped_repetition_stop
+    )
+    effective_draft_sampler = draft_sampler if draft_sampler is not None else state.draft_sampler
     effective_mode = _normalize_generation_mode(
         generation_mode,
         default=getattr(state.args, "generation_mode", "mtp"),
     )
-    effective_depth = (
+    requested_depth = (
         0
         if effective_mode == "ar"
         else int(depth if depth is not None else getattr(state.args, "depth", 3))
     )
+    effective_depth = requested_depth
+    if (
+        effective_mode != "ar"
+        and resolved_mtp_depth is not None
+        and requested_depth > 0
+    ):
+        effective_depth = max(1, min(int(resolved_mtp_depth), int(requested_depth)))
     started = time.perf_counter()
     token_times: list[float] = []
     lock_wait_time_s = 0.0
@@ -5677,8 +13963,12 @@ def _run_generation(
             token_callback(new_tokens)
 
     blank_retry_budget = max(0, int(state.args.blank_retry_attempts))
-    streaming_response = token_callback is not None
-    max_attempts = 1 if streaming_response else 1 + blank_retry_budget
+    response_is_streaming = (
+        token_callback is not None
+        if streaming_response is None
+        else bool(streaming_response)
+    )
+    max_attempts = 1 if response_is_streaming else 1 + blank_retry_budget
     last: dict[str, Any] | None = None
     trace_preview = (
         str((request_observability or {}).get("request_last_user_preview") or "")
@@ -5701,6 +13991,7 @@ def _run_generation(
     for attempt in range(max_attempts):
         generation_seed, seed_is_explicit = _resolve_seed(state, seed)
         lock_started = time.perf_counter()
+        smart_fan_lease: str | None = None
         if background_request:
             if state.has_foreground() or state.lock.locked():
                 raise HTTPException(
@@ -5716,16 +14007,30 @@ def _run_generation(
                     headers={"Retry-After": "1"},
                 )
         else:
+            smart_request_id = str((request_observability or {}).get("request_id") or "")
+            smart_fan_lease = _begin_smart_fan_request(
+                state,
+                request_id=_smart_fan_request_id(
+                    smart_request_id or session_id,
+                    "generation",
+                ),
+                request_observability=request_observability,
+            )
             state.begin_foreground()
             state.lock.acquire()
         lock_wait_time_s += time.perf_counter() - lock_started
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _StreamCancelled("request cancelled before generation")
             dynamic_kv_reservation = _dynamic_paged_kv_reservation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,
                 mtp_depth=effective_depth,
             )
-            with _temporary_env(dynamic_kv_reservation["env"]):
+            prefill_chunk_tokens = getattr(state.args, "prefill_chunk_tokens", None)
+            with _temporary_env(
+                dynamic_kv_reservation["env"]
+            ), prefill_chunk_size_override(prefill_chunk_tokens):
                 if effective_mode == "ar":
                     out = generate_ar(
                         state.runtime,
@@ -5736,6 +14041,8 @@ def _run_generation(
                         token_callback=record_tokens,
                         trace_label=trace_label,
                         trace_metadata=trace_metadata,
+                        prefill_callback=prefill_callback,
+                        repetition_stop=uncapped_repetition_stop,
                     )
                 else:
                     adaptive_policy = _make_adaptive_policy(
@@ -5746,7 +14053,7 @@ def _run_generation(
                         prompt_ids,
                         max_tokens=response_max,
                         sampler=sampler,
-                        draft_sampler=state.draft_sampler,
+                        draft_sampler=effective_draft_sampler,
                         speculative_depth=effective_depth,
                         seed=generation_seed,
                         mtp_hidden_variant="post_norm",
@@ -5769,10 +14076,15 @@ def _run_generation(
                             and session_bank is not None
                             and session_id is not None
                         ),
-                        commit_prompt_state_keep_live_ref=session_keep_live_ref,
+                        # Prompt-prefix commits happen before decode mutates
+                        # the same KV/MTP cache objects. They must snapshot or
+                        # skip, not live-lease the mutable prompt cache.
+                        commit_prompt_state_keep_live_ref=False,
                         trace_label=trace_label,
                         trace_metadata=trace_metadata,
+                        prefill_callback=prefill_callback,
                         adaptive_policy=adaptive_policy,
+                        repetition_stop=uncapped_repetition_stop,
                         online_correction_cache=bool(
                             state.args.online_correction_cache
                         ),
@@ -5808,6 +14120,7 @@ def _run_generation(
             state.lock.release()
             if not background_request:
                 state.end_foreground()
+                _end_smart_fan_request(state, smart_fan_lease)
         elapsed_s = time.perf_counter() - started
         completion_tokens = _effective_completion_tokens(
             generated_tokens=list(out.tokens),
@@ -5819,6 +14132,8 @@ def _run_generation(
             completion_tokens=completion_tokens,
             elapsed_s=elapsed_s,
         )
+        if effective_mode == "mtp":
+            stats["requested_speculative_depth"] = int(requested_depth)
         if session_bank is not None:
             cache_miss_reason = stats.get("cache_miss_reason") or cache_miss_reason
             session_cache_hit = bool(stats.get("session_cache_hit") or False)
@@ -5859,6 +14174,7 @@ def _run_generation(
                 mtp_snapshot_epoch=len(final_token_ids)
                 if mtp_snapshot is not None
                 else None,
+                extra_state=getattr(final_state, "extra_state", None),
             )
             stats["sessionbank_snapshot_bytes"] = int(
                 getattr(session_bank, "last_put_nbytes", 0) or 0
@@ -5873,7 +14189,7 @@ def _run_generation(
         )
         requested_mtp_depth = int(
             stats.get("requested_speculative_depth")
-            or (effective_depth if effective_mode == "mtp" else 0)
+            or (requested_depth if effective_mode == "mtp" else 0)
             or 0
         )
         envelope = _metrics_envelope(
@@ -5894,7 +14210,45 @@ def _run_generation(
         envelope["dynamic_paged_kv"] = {
             key: value for key, value in dynamic_kv_reservation.items() if key != "env"
         }
-        envelope.update(_mlx_allocator_public_stats())
+        for key in (
+            "paged_kv_capacity_tokens",
+            "paged_kv_num_blocks",
+            "paged_active_array_calls",
+            "paged_active_array_time_s",
+            "paged_turboquant",
+            "paged_turboquant_k_quant",
+            "paged_turboquant_v_quant",
+            "paged_turboquant_attention_calls",
+            "paged_kv_quant",
+            "paged_kv_quant_mode",
+            "paged_kv_quant_attention_calls",
+            "paged_kv_quant_dequant_calls",
+            "paged_kv_quant_dequant_time_s",
+            "paged_kv_quant_dequant_tokens",
+            "paged_gqa_sdpa_calls",
+            "paged_gqa_sdpa_calls_by_route",
+            "paged_gqa_sdpa_calls_by_phase",
+            "paged_gqa_sdpa_route_misses_by_phase_reason",
+            "paged_gqa_sdpa_route_misses_by_q_len",
+            "paged_gqa_sdpa_last_route_miss",
+            "attention_dense_fallback_calls",
+            "prefill_dense_fallback_calls",
+            "decode_dense_fallback_calls",
+            "ar_dense_fallback_calls",
+            "postcommit_dense_fallback_calls",
+            "paged_attention_bailouts_by_phase_reason",
+            "paged_attention_large_q_path",
+            "large_q_split_sdpa_fallback_calls",
+            "large_q_split_sdpa_fallback_calls_by_phase",
+            "prefill_large_q_split_sdpa_fallback_calls",
+            "decode_large_q_split_sdpa_fallback_calls",
+            "partitioned_paged_calls",
+            "partitioned_paged_calls_by_phase",
+            "prefill_partitioned_paged_calls",
+            "decode_partitioned_paged_calls",
+        ):
+            if key in stats:
+                envelope[key] = stats[key]
         envelope["generation_mode"] = effective_mode
         envelope["requested_mtp_depth"] = (
             requested_mtp_depth if effective_mode == "mtp" else 0
@@ -5909,18 +14263,87 @@ def _run_generation(
             envelope["requested_mtp_depth"] = 0
             envelope["long_context_mtp_depth_policy"] = {}
             envelope["verify_calls"] = 0
-            envelope["verify_time_s"] = 0.0
+            for key in (
+                "verify_time_s",
+                "verify_forward_time_s",
+                "verify_eval_time_s",
+                "verify_logits_eval_time_s",
+                "verify_hidden_eval_time_s",
+                "verify_joint_eval_time_s",
+                "verify_target_distribution_time_s",
+                "target_distribution_materialized_rows",
+                "target_distribution_materialized_windows",
+                "target_distribution_share",
+                "lazy_bonus_verify_calls",
+                "lazy_bonus_commit_time_s",
+                "verify_eval_unattributed_time_s",
+            ):
+                envelope[key] = 0 if key.endswith(("rows", "windows", "calls")) else 0.0
             envelope["accepted_by_depth"] = []
             envelope["draft_time_s"] = 0.0
         if request_observability:
             envelope.update(request_observability)
+            if request_observability.get("live_frontier_result_turn"):
+                frontier_hit = bool(session_cache_hit)
+                envelope["live_frontier_hit"] = frontier_hit
+                envelope["live_frontier_restore_mode"] = session_restore_mode
+                envelope["live_frontier_miss_reason"] = (
+                    None
+                    if frontier_hit
+                    else _live_frontier_miss_reason_from_counts(
+                        assistant_tool_call_count=int(
+                            request_observability.get(
+                                "live_frontier_assistant_tool_call_count"
+                            )
+                            or 0
+                        ),
+                        tool_result_count=int(
+                            request_observability.get("live_frontier_tool_result_count")
+                            or 0
+                        ),
+                        unknown_tool_result_count=int(
+                            request_observability.get(
+                                "live_frontier_unknown_tool_result_count"
+                            )
+                            or 0
+                        ),
+                        cache_miss_reason=cache_miss_reason,
+                        session_source=str(
+                            request_observability.get("request_session_source") or ""
+                        ),
+                        session_keep_live_ref=session_keep_live_ref,
+                    )
+                )
+        cleanup = _auto_clear_mlx_cache_after_completed_request(
+            state,
+            session_id=session_id,
+            request_observability=request_observability,
+        )
+        if cleanup is not None:
+            envelope["mlx_cache_cleanup"] = cleanup
+        envelope.update(_mlx_allocator_public_stats())
         stats["generation_mode"] = effective_mode
         stats.update(envelope)
         stats.update(_generation_truth_stats(state, effective_mode))
         if effective_mode == "ar":
             stats["mtp_depth"] = 0
             stats["verify_calls"] = 0
-            stats["verify_time_s"] = 0.0
+            for key in (
+                "verify_time_s",
+                "verify_forward_time_s",
+                "verify_eval_time_s",
+                "verify_logits_eval_time_s",
+                "verify_hidden_eval_time_s",
+                "verify_joint_eval_time_s",
+                "verify_target_distribution_time_s",
+                "target_distribution_materialized_rows",
+                "target_distribution_materialized_windows",
+                "target_distribution_share",
+                "lazy_bonus_verify_calls",
+                "lazy_bonus_commit_time_s",
+                "verify_eval_unattributed_time_s",
+            ):
+                stats[key] = 0 if key.endswith(("rows", "windows", "calls")) else 0.0
             stats["accepted_by_depth"] = []
             stats["drafted_by_depth"] = []
             stats["mean_accept_probability_by_depth"] = []
@@ -5931,12 +14354,13 @@ def _run_generation(
         stats["server_attempts"] = attempt + 1
         stats["server_blank_retries"] = attempt
         stats["server_blank_retry_suppressed"] = bool(
-            streaming_response and blank_retry_budget
+            response_is_streaming and blank_retry_budget
         )
         state.last_metrics.append(dict(envelope))
         state.last_metrics = state.last_metrics[-100:]
         state.last_request_at = time.time()
         state.requests_completed += 1
+        _dashboard_record_completion(state, envelope=envelope, stats=stats)
         last = {
             "text": out.text,
             "tokens": out.tokens,
@@ -5957,7 +14381,7 @@ def _run_generation(
     if not bool(
         (request_observability or {}).get("warmup")
     ) and not _server_console_enabled(state):
-        print(
+        _safe_stdout_print(
             json.dumps(
                 {
                     "event": "mtplx_openai_generation",
@@ -5972,8 +14396,7 @@ def _run_generation(
                     "text_preview": str(last["text"])[:120],
                 },
                 ensure_ascii=False,
-            ),
-            flush=True,
+            )
         )
     return last
 
@@ -6039,14 +14462,6 @@ def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
     return status
 
 
-def _chunk_text(text: str, chunk_chars: int = 24) -> list[str]:
-    if not text:
-        return [""]
-    return [
-        text[index : index + chunk_chars] for index in range(0, len(text), chunk_chars)
-    ]
-
-
 def _decode_timing(stats: dict[str, Any]) -> tuple[float, float]:
     generated_tokens = int(stats.get("generated_tokens") or 0)
     elapsed_s = float(stats.get("elapsed_s") or 0.0)
@@ -6059,7 +14474,11 @@ def _decode_timing(stats: dict[str, Any]) -> tuple[float, float]:
         prompt_eval_time_s = max(
             0.0, target_forward_time_s - verify_time_s - repair_time_s
         )
-    decode_elapsed_s = max(0.0, elapsed_s - prompt_eval_time_s)
+    cache_restore_time_s = max(
+        float(stats.get("cache_restore_time_s") or 0.0),
+        float(stats.get("ssd_restore_s") or 0.0),
+    )
+    decode_elapsed_s = max(0.0, elapsed_s - prompt_eval_time_s - cache_restore_time_s)
     if decode_elapsed_s <= 0.0:
         return 0.0, 0.0
     return generated_tokens / decode_elapsed_s, decode_elapsed_s
@@ -6085,9 +14504,23 @@ def _usage_payload(generated: dict[str, Any]) -> dict[str, int]:
     }
 
 
+def _strip_generated_chat_template_sentinels(text: str) -> str:
+    if not text:
+        return ""
+    return CHAT_TEMPLATE_SENTINEL_RE.sub("", text)
+
+
+def _clean_generated_assistant_text(text: str) -> str:
+    cleaned = strip_qwen_style_reasoning_control_markup(text)
+    cleaned = _REASONING_CONTROL_TAG_RE.sub("", cleaned)
+    return _strip_generated_chat_template_sentinels(cleaned)
+
+
 def _split_thinking_segments(text: str, *, thinking_enabled: bool) -> tuple[str, str]:
     if not thinking_enabled:
-        return "", text
+        return "", strip_qwen_style_reasoning_from_content(
+            _strip_generated_chat_template_sentinels(text)
+        )
     reasoning_parts: list[str] = []
     content_parts: list[str] = []
 
@@ -6106,35 +14539,27 @@ def _split_thinking_segments(text: str, *, thinking_enabled: bool) -> tuple[str,
     inside_thinking = True
     while position < len(text):
         if inside_thinking:
-            close_index = text.find(THINK_CLOSE, position)
-            if close_index < 0:
-                segment = (
-                    text[position:].replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
-                )
+            close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(text, position)
+            if close_match is None:
+                segment = _clean_generated_assistant_text(text[position:])
                 append_reasoning(segment)
                 break
-            segment = (
-                text[position:close_index]
-                .replace(THINK_OPEN, "")
-                .replace(THINK_CLOSE, "")
-            )
+            segment = _clean_generated_assistant_text(text[position : close_match.start()])
             append_reasoning(segment)
-            position = close_index + len(THINK_CLOSE)
+            position = close_match.end()
             inside_thinking = False
             continue
 
-        open_index = text.find(THINK_OPEN, position)
-        if open_index < 0:
-            segment = text[position:].replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
+        open_match = QWEN_STYLE_REASONING_OPEN_RE.search(text, position)
+        if open_match is None:
+            segment = _clean_generated_assistant_text(text[position:])
             if segment:
                 content_parts.append(segment)
             break
-        segment = (
-            text[position:open_index].replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
-        )
+        segment = _clean_generated_assistant_text(text[position : open_match.start()])
         if segment:
             content_parts.append(segment)
-        position = open_index + len(THINK_OPEN)
+        position = open_match.end()
         inside_thinking = True
     return "".join(reasoning_parts).strip(), "".join(content_parts).strip()
 
@@ -6157,6 +14582,54 @@ def _normalize_thinking_tags(text: str, *, thinking_enabled: bool) -> str:
     if content:
         pieces.append(content)
     return "\n\n".join(pieces)
+
+
+def _normalize_reasoning_tags_for_state(
+    state: ServerState,
+    text: str,
+    *,
+    thinking_enabled: bool,
+) -> str:
+    return normalize_backend_reasoning_tags(
+        text,
+        parser=_reasoning_parser_for_state(state),
+        thinking_enabled=thinking_enabled,
+    )
+
+
+def _split_backend_reasoning_for_state(
+    state: ServerState,
+    text: str,
+    *,
+    thinking_enabled: bool,
+) -> tuple[str, str]:
+    parser = _reasoning_parser_for_state(state)
+    if parser in {"qwen3", "step3p5"}:
+        text = normalize_qwen_thinking_tags(
+            text,
+            thinking_enabled=thinking_enabled,
+        )
+    parts = split_reasoning_text(
+        text,
+        parser=parser,
+        thinking_enabled=thinking_enabled,
+    )
+    return parts.reasoning, parts.content
+
+
+def _tool_extraction_text_parts(
+    state: ServerState,
+    text: str,
+    *,
+    thinking_enabled: bool,
+) -> tuple[str, str]:
+    if _reasoning_parser_for_state(state) == "gemma4":
+        return _split_backend_reasoning_for_state(
+            state,
+            text,
+            thinking_enabled=thinking_enabled,
+        )
+    return omlx_extract_thinking(text)
 
 
 class _IncrementalTokenDecoder:
@@ -6193,9 +14666,9 @@ class _IncrementalTokenDecoder:
             printable = text[self._print_len :]
             self._print_len += len(printable)
             return printable
-        close_index = text.find(THINK_CLOSE, self._print_len)
-        if close_index >= 0:
-            boundary = close_index + len(THINK_CLOSE)
+        close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(text, self._print_len)
+        if close_match is not None:
+            boundary = close_match.end()
             printable = text[self._print_len : boundary]
             self._print_len = boundary
             return printable
@@ -6246,19 +14719,48 @@ class _NonDuplicatingTokenDecoder(_IncrementalTokenDecoder):
         if not self._token_cache:
             return ""
         joined = self._decode(self._token_cache)
-        if THINK_CLOSE in joined:
+        if QWEN_STYLE_REASONING_CLOSE_RE.search(joined):
             return self.finish()
         return ""
 
 
 class _ThinkingContentStreamSplitter:
     _TOOL_CALL_MARKER = "<tool_call"
+    _TOOL_CALL_CLOSE_MARKER = "</tool_call>"
+    _TOOL_CONTROL_MARKERS = (
+        "<tool_call",
+        "<function=",
+        "<parameter=",
+        "</parameter>",
+        "</function>",
+        "</tool_call>",
+        "parameter=",
+        "function=",
+    )
 
-    def __init__(self, *, thinking_enabled: bool) -> None:
+    def __init__(
+        self,
+        *,
+        thinking_enabled: bool,
+        recover_unclosed_reasoning_as_content: bool = True,
+        start_inside_thinking: bool = True,
+    ) -> None:
         self._thinking_enabled = thinking_enabled
-        self._inside_thinking = thinking_enabled
+        self._recover_unclosed_reasoning_as_content = (
+            recover_unclosed_reasoning_as_content
+        )
+        self._inside_thinking = thinking_enabled and start_inside_thinking
+        self._inside_tool_call = False
+        self._tool_call_tail = ""
         self._pending = ""
+        self._disabled_inside_reasoning = False
+        self._disabled_visible_started = False
         self._reentry_count = 0
+        self._reasoning_accumulated: list[str] = []
+        self._content_emitted = False
+        self._content_history_tail = ""
+        self._post_orphan_close_duplicate_tail = ""
+        self._saw_chat_template_sentinel = False
 
     @property
     def reentry_count(self) -> int:
@@ -6271,12 +14773,37 @@ class _ThinkingContentStreamSplitter:
         if not text:
             return []
         if not self._thinking_enabled:
-            return [("content", text)]
+            self._pending += text
+            return self._drain_disabled(final=False)
         self._pending += text
         return self._drain(final=False)
 
-    def finish(self) -> list[tuple[str, str]]:
-        chunks = self._drain(final=True)
+    def finish(
+        self,
+        *,
+        recover_unclosed_reasoning_as_content: bool | None = None,
+    ) -> list[tuple[str, str]]:
+        chunks = (
+            self._drain(final=True)
+            if self._thinking_enabled
+            else self._drain_disabled(final=True)
+        )
+        recover_unclosed_reasoning = (
+            self._recover_unclosed_reasoning_as_content
+            if recover_unclosed_reasoning_as_content is None
+            else recover_unclosed_reasoning_as_content
+        )
+        if (
+            self._thinking_enabled
+            and recover_unclosed_reasoning
+            and not self._content_emitted
+            and self._reasoning_accumulated
+            and not self._saw_chat_template_sentinel
+        ):
+            recovered = "".join(self._reasoning_accumulated).strip()
+            if recovered:
+                self._content_emitted = True
+                chunks.append(("content", recovered))
         self._inside_thinking = False
         return chunks
 
@@ -6286,29 +14813,272 @@ class _ThinkingContentStreamSplitter:
         field: str,
         text: str,
     ) -> None:
-        cleaned = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
+        cleaned = _clean_generated_assistant_text(text)
         if cleaned:
+            if field == "reasoning_content":
+                self._reasoning_accumulated.append(cleaned)
+            elif field == "content":
+                self._content_emitted = True
+                self._content_history_tail = (
+                    self._content_history_tail + cleaned
+                )[-2048:]
             chunks.append((field, cleaned))
+
+    @classmethod
+    def _tool_control_marker_index(cls, text: str) -> int:
+        text_lower = text.lower()
+        indexes = [
+            index
+            for marker in cls._TOOL_CONTROL_MARKERS
+            if (index := text_lower.find(marker)) >= 0
+        ]
+        return min(indexes) if indexes else -1
+
+    @classmethod
+    def _tool_control_marker_has_partial_prefix(cls, text: str) -> bool:
+        text_lower = text.lower()
+        return any(marker.startswith(text_lower) for marker in cls._TOOL_CONTROL_MARKERS)
+
+    @staticmethod
+    def _reasoning_control_marker_has_partial_prefix(text: str) -> bool:
+        text_lower = text.lower()
+        if not text_lower.startswith("<"):
+            return False
+        markers: list[str] = []
+        for name in QWEN_STYLE_REASONING_TAG_NAMES:
+            markers.append(f"<{name}")
+            markers.append(f"</{name}")
+        return any(marker.startswith(text_lower) for marker in markers)
+
+    @staticmethod
+    def _partial_marker_tail_len(text: str, markers: Iterable[str]) -> int:
+        text_lower = text.lower()
+        keep = 0
+        for marker in markers:
+            marker_lower = marker.lower()
+            max_len = min(len(text_lower), len(marker_lower) - 1)
+            for n in range(max_len, 0, -1):
+                if text_lower.endswith(marker_lower[:n]):
+                    keep = max(keep, n)
+                    break
+        return min(keep, 128)
+
+    @classmethod
+    def _disabled_reasoning_tail_len(cls, text: str) -> int:
+        markers: list[str] = list(CHAT_TEMPLATE_SENTINEL_MARKERS)
+        for name in QWEN_STYLE_REASONING_TAG_NAMES:
+            markers.extend((f"<{name}", f"<{name}>", f"</{name}", f"</{name}>"))
+        return cls._partial_marker_tail_len(text, markers)
+
+    @classmethod
+    def _disabled_reasoning_close_tail_len(cls, text: str) -> int:
+        markers: list[str] = []
+        for name in QWEN_STYLE_REASONING_TAG_NAMES:
+            markers.extend((f"</{name}", f"</{name}>"))
+        return cls._partial_marker_tail_len(text, markers)
+
+    def _drop_duplicate_after_orphan_close(self, text: str) -> str:
+        cleaned = _clean_generated_assistant_text(text).lstrip()
+        if not cleaned:
+            return ""
+        emitted = self._content_history_tail.strip()
+        candidate = cleaned.strip()
+        if not emitted or not candidate:
+            return cleaned
+        if emitted.endswith(candidate):
+            return ""
+        if candidate.startswith(emitted):
+            return candidate[len(emitted) :].lstrip()
+        return cleaned
+
+    def _consume_post_orphan_close_duplicate_prefix(self) -> bool:
+        target = self._post_orphan_close_duplicate_tail
+        if not target or not self._pending:
+            return False
+        changed = False
+        while self._pending and target:
+            if self._pending[0].isspace() and not target.startswith(self._pending[0]):
+                self._pending = self._pending[1:]
+                changed = True
+                continue
+            if target.startswith(self._pending):
+                self._post_orphan_close_duplicate_tail = target[len(self._pending) :]
+                self._pending = ""
+                return True
+            if self._pending.startswith(target):
+                self._pending = self._pending[len(target) :].lstrip()
+                self._post_orphan_close_duplicate_tail = ""
+                return True
+            common = 0
+            max_common = min(len(self._pending), len(target))
+            while (
+                common < max_common
+                and self._pending[common] == target[common]
+            ):
+                common += 1
+            if common:
+                self._pending = self._pending[common:]
+                self._post_orphan_close_duplicate_tail = target[common:]
+                changed = True
+                continue
+            self._post_orphan_close_duplicate_tail = ""
+            return changed
+        return changed
+
+    def _strip_stream_sentinels_from_pending(self) -> bool:
+        sentinel_cleaned = _strip_generated_chat_template_sentinels(self._pending)
+        if sentinel_cleaned == self._pending:
+            return False
+        turn_sentinel_cleaned = CHAT_TEMPLATE_TURN_SENTINEL_RE.sub("", self._pending)
+        if turn_sentinel_cleaned != self._pending:
+            self._saw_chat_template_sentinel = True
+        self._pending = sentinel_cleaned
+        return True
+
+    def _drain_disabled(self, *, final: bool) -> list[tuple[str, str]]:
+        chunks: list[tuple[str, str]] = []
+        while self._pending:
+            pending_lower = self._pending.lower()
+            if not final and any(
+                marker.lower().startswith(pending_lower)
+                for marker in CHAT_TEMPLATE_SENTINEL_MARKERS
+            ):
+                break
+            if self._strip_stream_sentinels_from_pending():
+                if not self._pending:
+                    break
+                continue
+            if self._consume_post_orphan_close_duplicate_prefix():
+                if not self._pending:
+                    break
+                continue
+            if self._disabled_inside_reasoning:
+                close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(self._pending)
+                if close_match is None:
+                    if final:
+                        self._pending = ""
+                    else:
+                        hold = self._disabled_reasoning_close_tail_len(self._pending)
+                        self._pending = self._pending[-hold:] if hold else ""
+                    break
+                self._pending = self._pending[close_match.end() :].lstrip()
+                self._disabled_inside_reasoning = False
+                self._disabled_visible_started = True
+                continue
+            block_cleaned = QWEN_STYLE_REASONING_BLOCK_RE.sub("", self._pending)
+            if block_cleaned != self._pending:
+                self._pending = block_cleaned
+                if not self._pending:
+                    break
+                continue
+            close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(self._pending)
+            open_match = QWEN_STYLE_REASONING_OPEN_RE.search(self._pending)
+            if close_match is not None and (
+                open_match is None or close_match.start() <= open_match.start()
+            ):
+                after_close = self._pending[close_match.end() :].lstrip()
+                if self._disabled_visible_started:
+                    after_close = self._drop_duplicate_after_orphan_close(after_close)
+                    if not after_close and self._content_history_tail.strip():
+                        self._post_orphan_close_duplicate_tail = (
+                            self._content_history_tail.strip()
+                        )
+                self._pending = after_close
+                self._disabled_visible_started = True
+                continue
+            if open_match is not None:
+                before = self._pending[: open_match.start()]
+                if before:
+                    self._append_chunk(chunks, "content", before)
+                self._pending = self._pending[open_match.end() :]
+                self._disabled_inside_reasoning = True
+                self._reentry_count += 1
+                continue
+            if (
+                not final
+                and not self._disabled_visible_started
+                and (
+                    not (stripped := self._pending.lstrip())
+                    or (
+                        stripped.startswith("<")
+                        and self._disabled_reasoning_tail_len(stripped)
+                        >= len(stripped)
+                    )
+                )
+            ):
+                break
+            if final:
+                emit_len = len(self._pending)
+            else:
+                hold = self._disabled_reasoning_tail_len(self._pending)
+                emit_len = len(self._pending) - hold
+            if emit_len <= 0:
+                break
+            self._append_chunk(chunks, "content", self._pending[:emit_len])
+            self._disabled_visible_started = True
+            self._pending = self._pending[emit_len:]
+            break
+        return chunks
 
     def _drain(self, *, final: bool) -> list[tuple[str, str]]:
         chunks: list[tuple[str, str]] = []
-        keep = max(len(THINK_OPEN), len(THINK_CLOSE)) - 1
+        sentinel_keep = max(
+            len(marker) + len("assistant") + 2
+            for marker in CHAT_TEMPLATE_SENTINEL_MARKERS
+        )
+        tag_keep = max(len(name) for name in QWEN_STYLE_REASONING_TAG_NAMES) + len("</>")
+        keep = max(
+            tag_keep,
+            sentinel_keep,
+        )
         while self._pending:
+            pending_lower = self._pending.lower()
+            if not final and any(
+                marker.lower().startswith(pending_lower)
+                for marker in CHAT_TEMPLATE_SENTINEL_MARKERS
+            ):
+                break
+            if self._strip_stream_sentinels_from_pending():
+                if not self._pending:
+                    break
+                continue
             if self._inside_thinking:
                 pending_lower = self._pending.lower()
-                if pending_lower.startswith(self._TOOL_CALL_MARKER):
+                close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(self._pending)
+                close_index = -1 if close_match is None else close_match.start()
+                tool_control_index = self._tool_control_marker_index(self._pending)
+                if tool_control_index >= 0 and (
+                    close_index < 0 or tool_control_index < close_index
+                ):
+                    if tool_control_index > 0:
+                        self._append_chunk(
+                            chunks,
+                            "reasoning_content",
+                            self._pending[:tool_control_index],
+                        )
+                        self._pending = self._pending[tool_control_index:]
+                        continue
                     self._inside_thinking = False
+                    self._inside_tool_call = True
+                    self._tool_call_tail = ""
                     continue
-                if not final and self._TOOL_CALL_MARKER.startswith(pending_lower):
+                if (
+                    not final
+                    and pending_lower
+                    and self._tool_control_marker_has_partial_prefix(pending_lower)
+                ):
                     break
-                if self._pending.startswith(THINK_OPEN):
-                    self._pending = self._pending[len(THINK_OPEN) :]
+                open_match_at_start = QWEN_STYLE_REASONING_OPEN_RE.match(self._pending)
+                if open_match_at_start is not None:
+                    self._pending = self._pending[open_match_at_start.end() :]
                     self._reentry_count += 1
                     continue
-                if not final and THINK_OPEN.startswith(self._pending):
+                if (
+                    not final
+                    and self._reasoning_control_marker_has_partial_prefix(self._pending)
+                ):
                     break
-                close_index = self._pending.find(THINK_CLOSE)
-                if close_index < 0:
+                if close_match is None:
                     emit_len = (
                         len(self._pending)
                         if final
@@ -6324,22 +15094,45 @@ class _ThinkingContentStreamSplitter:
                 self._append_chunk(
                     chunks, "reasoning_content", self._pending[:close_index]
                 )
-                self._pending = self._pending[close_index + len(THINK_CLOSE) :].lstrip()
+                self._pending = self._pending[close_match.end() :].lstrip()
                 self._inside_thinking = False
                 continue
 
-            open_index = self._pending.find(THINK_OPEN)
-            if open_index < 0:
+            open_match = QWEN_STYLE_REASONING_OPEN_RE.search(self._pending)
+            if open_match is None:
+                pending_lower = self._pending.lower()
+                tool_close_index = pending_lower.find(self._TOOL_CALL_CLOSE_MARKER)
+                tool_passthrough = (
+                    self._inside_tool_call
+                    or self._TOOL_CALL_MARKER in pending_lower
+                )
                 emit_len = (
-                    len(self._pending) if final else max(0, len(self._pending) - keep)
+                    len(self._pending)
+                    if final or tool_passthrough
+                    else (
+                        tool_close_index + len(self._TOOL_CALL_CLOSE_MARKER)
+                        if tool_close_index >= 0
+                        else max(0, len(self._pending) - keep)
+                    )
                 )
                 if emit_len <= 0:
                     break
-                self._append_chunk(chunks, "content", self._pending[:emit_len])
+                emitted = self._pending[:emit_len]
+                if tool_passthrough:
+                    self._tool_call_tail = (
+                        self._tool_call_tail + emitted.lower()
+                    )[-len(self._TOOL_CALL_CLOSE_MARKER) :]
+                if self._TOOL_CALL_CLOSE_MARKER in emitted.lower() or (
+                    tool_passthrough
+                    and self._tool_call_tail.endswith(self._TOOL_CALL_CLOSE_MARKER)
+                ):
+                    self._inside_tool_call = False
+                    self._tool_call_tail = ""
+                self._append_chunk(chunks, "content", emitted)
                 self._pending = self._pending[emit_len:]
                 break
-            self._append_chunk(chunks, "content", self._pending[:open_index])
-            self._pending = self._pending[open_index + len(THINK_OPEN) :]
+            self._append_chunk(chunks, "content", self._pending[: open_match.start()])
+            self._pending = self._pending[open_match.end() :]
             self._inside_thinking = True
             self._reentry_count += 1
         return chunks
@@ -6358,6 +15151,72 @@ class _ThinkingContentStreamNormalizer(_ThinkingContentStreamSplitter):
         return [chunk for _, chunk in super().finish()]
 
 
+def _stream_splitter_for_state(
+    state: ServerState,
+    *,
+    thinking_enabled: bool,
+    recover_unclosed_reasoning_as_content: bool = True,
+    start_inside_thinking: bool = True,
+) -> Any:
+    parser = _reasoning_parser_for_state(state)
+    if parser == "gemma4":
+        return stream_splitter_for_parser(parser, thinking_enabled=thinking_enabled)
+    return _ThinkingContentStreamSplitter(
+        thinking_enabled=thinking_enabled,
+        recover_unclosed_reasoning_as_content=recover_unclosed_reasoning_as_content,
+        start_inside_thinking=start_inside_thinking,
+    )
+
+
+def _finish_stream_splitter(splitter: Any, *, recover_unclosed_reasoning: bool) -> list[tuple[str, str]]:
+    try:
+        return splitter.finish(
+            recover_unclosed_reasoning_as_content=recover_unclosed_reasoning
+        )
+    except TypeError:
+        return splitter.finish()
+
+
+def _reasoning_completion_repair_needed(
+    *,
+    thinking_enabled: bool,
+    reasoning_text: str,
+    answer_text: str,
+    assistant_tool_calls: list[dict[str, Any]] | None,
+) -> bool:
+    """Return true when a Qwen thinking turn ended before producing an answer.
+
+    This is a protocol-completion check, not a content guardrail. Qwen's
+    template opens ``<think>`` in the prompt, so a valid assistant turn must
+    eventually produce answer content or a tool call after the thinking block.
+    A stop token while only reasoning has streamed leaves OpenAI clients with
+    an empty assistant message.
+    """
+    if not thinking_enabled:
+        return False
+    if assistant_tool_calls:
+        return False
+    return bool(reasoning_text.strip()) and not bool(answer_text.strip())
+
+
+def _reasoning_completion_repair_prompt_ids(
+    tokenizer: Any,
+    prompt_ids: list[int],
+    generated_tokens: list[int],
+) -> list[int]:
+    stop_token_ids = _default_stop_tokens(tokenizer)
+    generated_without_stop = _strip_terminal_stop(generated_tokens, stop_token_ids)
+    generated_text = tokenizer.decode(generated_without_stop)
+    repair_suffix = "\n\n"
+    if THINK_CLOSE not in generated_text:
+        repair_suffix = f"\n{THINK_CLOSE}\n\n"
+    return [
+        *[int(token) for token in prompt_ids],
+        *[int(token) for token in generated_without_stop],
+        *_encode_rendered_chat_text(tokenizer, repair_suffix),
+    ]
+
+
 def _display_text(
     state: ServerState,
     generated: dict[str, Any],
@@ -6366,7 +15225,8 @@ def _display_text(
 ) -> str:
     raw_text = str(generated["text"])
     text = (
-        _normalize_thinking_tags(
+        _normalize_reasoning_tags_for_state(
+            state,
             raw_text,
             thinking_enabled=thinking_enabled,
         )
@@ -6380,6 +15240,104 @@ def _display_text(
     return f"{text}{separator}{footer}"
 
 
+def _nonstream_chat_message_parts(
+    state: ServerState,
+    generated: dict[str, Any],
+    *,
+    thinking_enabled: bool,
+    suppress_visible_reasoning: bool = False,
+) -> tuple[str, str]:
+    raw_text = _strip_generated_chat_template_sentinels(
+        str(generated.get("text") or "")
+    )
+    reasoning_text = ""
+    display_text = raw_text
+    parser = _reasoning_parser_for_state(state)
+    parser_enabled = parser != "none"
+    has_qwen_style_reasoning_marker = bool(
+        QWEN_STYLE_REASONING_CONTROL_RE.search(raw_text)
+    )
+    # Qwen opens <think> in the prompt, so non-stream generations often begin
+    # inside hidden reasoning and only emit the closing tag. If a thinking tag
+    # is present anywhere in the final text, route it like the streaming path:
+    # reasoning_content is reasoning, message.content is the visible answer.
+    if parser_enabled and parser == "gemma4":
+        reasoning_text, display_text = _split_backend_reasoning_for_state(
+            state,
+            raw_text,
+            thinking_enabled=thinking_enabled,
+        )
+        stats = generated.setdefault("stats", {})
+        stats["reasoning_tokens"] = _count_text_tokens(
+            state.runtime.tokenizer,
+            reasoning_text,
+        )
+        stats["answer_tokens"] = _count_text_tokens(
+            state.runtime.tokenizer,
+            display_text,
+        )
+        stats["nonstream_reasoning_content_routed"] = bool(reasoning_text)
+        stats["visible_reasoning_stripped"] = bool(
+            reasoning_text and display_text != raw_text
+        )
+    elif parser_enabled and parser in {"qwen3", "step3p5"}:
+        if thinking_enabled and has_qwen_style_reasoning_marker:
+            reasoning_text, display_text = _split_backend_reasoning_for_state(
+                state,
+                raw_text,
+                thinking_enabled=True,
+            )
+        elif not thinking_enabled:
+            reasoning_text = ""
+            display_text = strip_qwen_style_reasoning_from_content(raw_text)
+        stats = generated.setdefault("stats", {})
+        if reasoning_text or display_text != raw_text:
+            stats["reasoning_tokens"] = _count_text_tokens(
+                state.runtime.tokenizer,
+                reasoning_text,
+            )
+            stats["answer_tokens"] = _count_text_tokens(
+                state.runtime.tokenizer,
+                display_text,
+            )
+            stats["nonstream_reasoning_content_routed"] = bool(reasoning_text)
+            stats["visible_reasoning_stripped"] = bool(display_text != raw_text)
+    elif thinking_enabled and parser_enabled and (THINK_OPEN in raw_text or THINK_CLOSE in raw_text):
+        reasoning_text, display_text = _split_thinking_segments(
+            raw_text,
+            thinking_enabled=True,
+        )
+        stats = generated.setdefault("stats", {})
+        stats["reasoning_tokens"] = _count_text_tokens(
+            state.runtime.tokenizer,
+            reasoning_text,
+        )
+        stats["answer_tokens"] = _count_text_tokens(
+            state.runtime.tokenizer,
+            display_text,
+        )
+        stats["nonstream_reasoning_content_routed"] = bool(reasoning_text)
+        stats["visible_reasoning_stripped"] = bool(
+            reasoning_text and display_text != raw_text
+        )
+    elif getattr(state.args, "normalize_thinking_tags", False):
+        display_text = _normalize_reasoning_tags_for_state(
+            state,
+            raw_text,
+            thinking_enabled=thinking_enabled,
+        )
+
+    display_text = _strip_mtplx_internal_continuation_markers(display_text)
+    if suppress_visible_reasoning:
+        reasoning_text = ""
+    if not getattr(state.args, "stats_footer", False):
+        return display_text, reasoning_text
+    footer = _stats_footer_text(state, generated)
+    if not footer:
+        return display_text, reasoning_text
+    return f"{display_text}\n\n{footer}", reasoning_text
+
+
 def _chat_ui_html(
     *,
     model_id: str,
@@ -6388,7 +15346,8 @@ def _chat_ui_html(
     default_settings: dict[str, Any],
 ) -> str:
     api_note = "API key required" if api_key_required else "local · no API key"
-    default_depth = max(1, min(3, int(default_settings.get("depth", 3))))
+    depth_max = max(1, int(default_settings.get("depth_max", 3) or 3))
+    default_depth = max(1, min(depth_max, int(default_settings.get("depth", 3))))
     default_settings = {
         "mtp_enabled": bool(default_settings.get("mtp_enabled", True)),
         "temperature": float(default_settings.get("temperature", 0.6)),
@@ -6922,7 +15881,7 @@ def _chat_ui_html(
         <div class="turn turn-assistant turn-greeting">
           <div class="avatar">M</div>
           <div class="turn-body">
-            <div class="answer"><p>Ready when you are. Settings on the left persist between sessions.</p></div>
+            <div class="answer"><p>Ready when you are. Settings mirror the running MTPLX app.</p></div>
           </div>
         </div>
       </div>
@@ -6974,7 +15933,8 @@ def _chat_ui_html(
     const SVG_STOP = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
 
     // ---------- settings ------------------------------------------------------
-    const SETTINGS_KEY = "mtplx.chat.settings.v4";
+    const SETTINGS_KEY = "mtplx.chat.settings.v5:" + MODEL_ID;
+    const LEGACY_SETTINGS_KEY = "mtplx.chat.settings.v4";
     const DEFAULTS = __DEFAULT_SETTINGS_JSON__;
     // RANGES is mutable so we can rewrite max_tokens.max after we discover
     // the model's real context window via /health. Hardcoding a 32768 cap
@@ -7064,36 +16024,160 @@ def _chat_ui_html(
       depth: document.getElementById("val-depth"),
       max_tokens: document.getElementById("val-max-tokens")
     };
-    function loadSettings() {
+    function loadStoredSystemPrompt() {
       try {
         const raw = window.localStorage.getItem(SETTINGS_KEY);
-        if (!raw) return Object.assign({}, DEFAULTS);
-        const parsed = JSON.parse(raw);
-        return Object.assign({}, DEFAULTS, parsed && typeof parsed === "object" ? parsed : {});
+        const fallback = window.localStorage.getItem(LEGACY_SETTINGS_KEY);
+        const parsed = JSON.parse(raw || fallback || "{}");
+        return parsed && typeof parsed.system === "string" ? parsed.system : "";
       } catch (err) {
-        console.warn("settings load failed", err);
-        return Object.assign({}, DEFAULTS);
+        console.warn("settings prompt load failed", err);
+        return "";
       }
     }
+    function loadSettings() {
+      return Object.assign({}, DEFAULTS, {system: loadStoredSystemPrompt()});
+    }
+    function settingsFromDaemonPayload(payload) {
+      payload = payload || {};
+      const rawMode = payload.generation_mode == null ? "" : String(payload.generation_mode);
+      const mode = rawMode.toLowerCase();
+      if (payload.depth_max) {
+        RANGES.depth.max = Math.max(1, parseInt(payload.depth_max, 10) || RANGES.depth.max);
+        if (ctlEls.depth) ctlEls.depth.max = String(RANGES.depth.max);
+      }
+      return Object.assign({}, DEFAULTS, {
+        temperature: payload.temperature,
+        top_p: payload.top_p,
+        top_k: payload.top_k,
+        mtp_enabled: mode ? mode === "mtp" : DEFAULTS.mtp_enabled,
+        depth: payload.depth,
+        max_tokens: payload.max_response_tokens == null ? DEFAULTS.max_tokens : payload.max_response_tokens,
+        reasoning: payload.reasoning || DEFAULTS.reasoning,
+        system: loadStoredSystemPrompt()
+      });
+    }
+    function daemonSettingsPayload(s) {
+      const normalized = normalizeSettings(s || {});
+      return {
+        temperature: normalized.temperature,
+        top_p: normalized.top_p,
+        top_k: normalized.top_k,
+        generation_mode: normalized.mtp_enabled ? "mtp" : "ar",
+        depth: normalized.depth,
+        max_response_tokens: normalized.max_tokens,
+        reasoning: normalized.reasoning
+      };
+    }
+    function daemonSettingsSignature(s) {
+      return JSON.stringify(daemonSettingsPayload(s));
+    }
+    async function fetchDaemonSettings() {
+      const res = await fetch("/v1/mtplx/settings", {cache: "no-store"});
+      if (!res.ok) throw new Error("settings " + res.status);
+      const payload = await res.json();
+      return settingsFromDaemonPayload(payload);
+    }
     function saveSettings(s) {
-      try { window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch (_e) { /* ignore quota */ }
+      try {
+        window.localStorage.setItem(
+          SETTINGS_KEY,
+          JSON.stringify({system: String((s && s.system) || "")})
+        );
+      } catch (_e) { /* ignore quota */ }
     }
     function clamp(value, min, max, fallback, isInt) {
       const n = isInt ? parseInt(value, 10) : parseFloat(value);
       if (!Number.isFinite(n)) return fallback;
       return Math.min(max, Math.max(min, n));
     }
+    function normalizeSettings(s) {
+      s = s || {};
+      return {
+        temperature: clamp(s.temperature, RANGES.temperature.min, RANGES.temperature.max, DEFAULTS.temperature, false),
+        top_p: clamp(s.top_p, RANGES.top_p.min, RANGES.top_p.max, DEFAULTS.top_p, false),
+        top_k: clamp(s.top_k, RANGES.top_k.min, RANGES.top_k.max, DEFAULTS.top_k, true),
+        mtp_enabled: s.mtp_enabled == null ? DEFAULTS.mtp_enabled !== false : s.mtp_enabled !== false,
+        depth: clamp(s.depth, RANGES.depth.min, RANGES.depth.max, DEFAULTS.depth, true),
+        max_tokens: clamp(s.max_tokens, RANGES.max_tokens.min, RANGES.max_tokens.max, DEFAULTS.max_tokens, true),
+        reasoning: ["auto", "on", "off"].includes(String(s.reasoning || "")) ? String(s.reasoning) : DEFAULTS.reasoning,
+        system: String(s.system || "")
+      };
+    }
     function applySettingsToUI(s) {
-      ctlEls.temperature.value = clamp(s.temperature, RANGES.temperature.min, RANGES.temperature.max, DEFAULTS.temperature, false);
-      ctlEls.top_p.value = clamp(s.top_p, RANGES.top_p.min, RANGES.top_p.max, DEFAULTS.top_p, false);
-      ctlEls.top_k.value = clamp(s.top_k, RANGES.top_k.min, RANGES.top_k.max, DEFAULTS.top_k, true);
-      ctlEls.mtp_enabled.checked = s.mtp_enabled !== false;
-      ctlEls.depth.value = clamp(s.depth, RANGES.depth.min, RANGES.depth.max, DEFAULTS.depth, true);
-      ctlEls.max_tokens.value = clamp(s.max_tokens, RANGES.max_tokens.min, RANGES.max_tokens.max, DEFAULTS.max_tokens, true);
-      ctlEls.reasoning.value = String(s.reasoning || "auto");
-      ctlEls.system.value = String(s.system || "");
+      const normalized = normalizeSettings(s);
+      ctlEls.temperature.value = normalized.temperature;
+      ctlEls.top_p.value = normalized.top_p;
+      ctlEls.top_k.value = normalized.top_k;
+      ctlEls.mtp_enabled.checked = normalized.mtp_enabled;
+      ctlEls.depth.value = normalized.depth;
+      ctlEls.max_tokens.value = normalized.max_tokens;
+      ctlEls.reasoning.value = normalized.reasoning;
+      ctlEls.system.value = normalized.system;
       refreshLabels();
       refreshSliderFills();
+    }
+    let lastSyncedSettingsSignature = "";
+    let settingsSyncTimer = null;
+    let settingsSyncSeq = 0;
+    let lastLocalSettingsEditAt = 0;
+    async function refreshDaemonSettings(options) {
+      const opts = options || {};
+      if (!opts.force) {
+        const recentlyEdited = performance.now() - lastLocalSettingsEditAt < 700;
+        if (activeAbort || settingsSyncTimer || recentlyEdited) return;
+      }
+      try {
+        const serverSettings = normalizeSettings(await fetchDaemonSettings());
+        settings = Object.assign({}, serverSettings, {system: loadStoredSystemPrompt()});
+        lastSyncedSettingsSignature = daemonSettingsSignature(settings);
+        applySettingsToUI(settings);
+        saveSettings(settings);
+      } catch (err) {
+        console.warn("daemon settings refresh failed", err);
+      }
+    }
+    async function syncDaemonSettings(nextSettings, options) {
+      const opts = options || {};
+      const signature = daemonSettingsSignature(nextSettings);
+      if (!opts.force && signature === lastSyncedSettingsSignature) return normalizeSettings(nextSettings);
+      const seq = ++settingsSyncSeq;
+      const response = await fetch("/v1/mtplx/settings", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(daemonSettingsPayload(nextSettings))
+      });
+      if (!response.ok) {
+        let detail = "settings update failed: " + response.status;
+        try {
+          const errBody = await response.json();
+          if (errBody?.error?.message) detail = errBody.error.message;
+        } catch (_e) { /* ignore */ }
+        throw new Error(detail);
+      }
+      const payload = await response.json();
+      if (seq !== settingsSyncSeq) return normalizeSettings(nextSettings);
+      const serverSettings = normalizeSettings(settingsFromDaemonPayload(payload));
+      lastSyncedSettingsSignature = daemonSettingsSignature(serverSettings);
+      return serverSettings;
+    }
+    function scheduleDaemonSettingsSync(nextSettings, options) {
+      const opts = options || {};
+      if (settingsSyncTimer) {
+        clearTimeout(settingsSyncTimer);
+        settingsSyncTimer = null;
+      }
+      settingsSyncTimer = setTimeout(() => {
+        settingsSyncTimer = null;
+        syncDaemonSettings(nextSettings).then((serverSettings) => {
+          settings = Object.assign({}, serverSettings, {system: nextSettings.system});
+          applySettingsToUI(settings);
+          saveSettings(settings);
+        }).catch((err) => {
+          console.warn("daemon settings sync failed", err);
+          setStatus("Settings update failed", "error");
+        });
+      }, opts.immediate ? 0 : 180);
     }
     function refreshLabels() {
       valEls.temperature.textContent = Number(ctlEls.temperature.value).toFixed(2);
@@ -7139,19 +16223,44 @@ def _chat_ui_html(
     }
     let settings = loadSettings();
     applySettingsToUI(settings);
-    discoverServerLimits().then(() => {
+    fetchDaemonSettings().catch((err) => {
+      console.warn("daemon settings hydrate failed", err);
+      return loadSettings();
+    }).then((serverSettings) => {
+      settings = normalizeSettings(serverSettings);
+      lastSyncedSettingsSignature = daemonSettingsSignature(settings);
+      applySettingsToUI(settings);
+      saveSettings(settings);
+      return discoverServerLimits();
+    }).then(() => {
       // Re-clamp + redraw after the real context window arrives so users
       // who reload the page don't see "8k" sitting under a fresh 256k cap.
       settings = readSettings();
       saveSettings(settings);
     });
+    window.setInterval(() => refreshDaemonSettings(), 1500);
+    window.addEventListener("focus", () => refreshDaemonSettings({force: true}));
+    function handleSettingsControlEdit(key) {
+      return () => {
+        lastLocalSettingsEditAt = performance.now();
+        settings = readSettings();
+        saveSettings(settings);
+        if (key !== "system") {
+          scheduleDaemonSettingsSync(settings, {immediate: key === "mtp_enabled" || key === "reasoning"});
+        }
+      };
+    }
     for (const key of Object.keys(ctlEls)) {
-      ctlEls[key].addEventListener("input", () => { settings = readSettings(); saveSettings(settings); });
+      const handler = handleSettingsControlEdit(key);
+      ctlEls[key].addEventListener("input", handler);
+      ctlEls[key].addEventListener("change", handler);
     }
     document.getElementById("reset-defaults").addEventListener("click", () => {
       settings = Object.assign({}, DEFAULTS);
+      lastLocalSettingsEditAt = performance.now();
       applySettingsToUI(settings);
       saveSettings(settings);
+      scheduleDaemonSettingsSync(settings, {immediate: true});
     });
     sidebarToggleBtn.addEventListener("click", () => sidebarEl.classList.toggle("open"));
 
@@ -7412,24 +16521,6 @@ def _chat_ui_html(
       promptEl.disabled = false;
       setStatus("Thinking", "streaming");
 
-      const settingsNow = readSettings();
-      const messages = settingsNow.system
-        ? [{role: "system", content: settingsNow.system}, ...history]
-        : history.slice();
-      const requestBody = {
-        model: MODEL_ID,
-        messages,
-        stream: true,
-        temperature: settingsNow.temperature,
-        top_p: settingsNow.top_p,
-        generation_mode: settingsNow.mtp_enabled ? "mtp" : "ar",
-        depth: settingsNow.depth,
-        max_tokens: settingsNow.max_tokens
-      };
-      if (settingsNow.top_k > 0) requestBody.top_k = settingsNow.top_k;
-      if (settingsNow.reasoning === "on") requestBody.enable_thinking = true;
-      else if (settingsNow.reasoning === "off") requestBody.enable_thinking = false;
-
       activeAbort = new AbortController();
       let assistantText = "";
       let reasoningText = "";
@@ -7461,10 +16552,41 @@ def _chat_ui_html(
         if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
       }
       try {
+        let settingsNow = readSettings();
+        if (settingsSyncTimer) {
+          clearTimeout(settingsSyncTimer);
+          settingsSyncTimer = null;
+        }
+        const serverSettings = await syncDaemonSettings(settingsNow);
+        settingsNow = Object.assign({}, serverSettings, {system: settingsNow.system});
+        settings = settingsNow;
+        applySettingsToUI(settings);
+        saveSettings(settings);
+        const messages = settingsNow.system
+          ? [{role: "system", content: settingsNow.system}, ...history]
+          : history.slice();
+        const requestBody = {
+          model: MODEL_ID,
+          messages,
+          stream: true,
+          temperature: settingsNow.temperature,
+          top_p: settingsNow.top_p,
+          generation_mode: settingsNow.mtp_enabled ? "mtp" : "ar",
+          depth: settingsNow.depth,
+          max_tokens: settingsNow.max_tokens
+        };
+        if (settingsNow.top_k > 0) requestBody.top_k = settingsNow.top_k;
+        if (settingsNow.reasoning === "on") requestBody.enable_thinking = true;
+        else if (settingsNow.reasoning === "off") requestBody.enable_thinking = false;
+
         armStallWatchdog();
         const response = await fetch("/v1/chat/completions", {
           method: "POST",
-          headers: {"Content-Type": "application/json"},
+          headers: {
+            "Content-Type": "application/json",
+            "X-MTPLX-Client": "mtplx_browser",
+            "X-MTPLX-Allow-Client-Controls": "1"
+          },
           body: JSON.stringify(requestBody),
           signal: activeAbort.signal
         });
@@ -7635,21 +16757,71 @@ def _chat_ui_html(
             "__DEFAULT_SETTINGS_JSON__", json.dumps(default_settings, sort_keys=True)
         )
         .replace("__DEPTH_VALUE__", str(default_depth))
-        .replace("__DEPTH_MAX__", str(default_depth))
+        .replace("__DEPTH_MAX__", str(depth_max))
     )
 
 
 def _thinking_enabled_for_request(
     state: ServerState,
     request: ChatCompletionRequest,
+    *,
+    allow_client_controls: bool = True,
 ) -> bool:
-    if state.args.reasoning_parser == "none":
+    if _reasoning_parser_for_state(state) == "none":
         return False
     return (
         state.args.enable_thinking
-        if request.enable_thinking is None
+        if request.enable_thinking is None or not allow_client_controls
         else bool(request.enable_thinking)
     )
+
+
+def _normalize_reasoning_effort(value: Any, *, default: str = "auto") -> str:
+    effort = str(value or default).strip().lower()
+    if effort not in {"auto", "low", "medium", "high"}:
+        raise ValueError("reasoning_effort must be one of: auto, low, medium, high")
+    return effort
+
+
+def _reasoning_effort_for_state(
+    state: ServerState,
+    *,
+    thinking_enabled: bool,
+    request_effort: str | None = None,
+    allow_client_controls: bool = True,
+) -> str | None:
+    if not thinking_enabled:
+        return None
+    backend = _backend_descriptor(state)
+    levels = set(backend.reasoning_codec.effort_levels)
+    if not levels:
+        return None
+    raw = (
+        request_effort
+        if request_effort is not None and allow_client_controls
+        else getattr(state.args, "reasoning_effort", None)
+    )
+    effort = _normalize_reasoning_effort(
+        raw,
+        default=backend.reasoning_codec.default_effort or "auto",
+    )
+    if effort == "auto":
+        effort = backend.reasoning_codec.default_effort or "low"
+    return effort if effort in levels else backend.reasoning_codec.default_effort
+
+
+def _aime_visible_working_for_request(metadata: Mapping[str, Any]) -> bool:
+    if not isinstance(metadata, Mapping):
+        return False
+    client = str(metadata.get("client") or "").strip().lower()
+    if client != "aime":
+        return False
+    raw = metadata.get("aime_visible_working")
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _normalize_reasoning_mode(value: Any, *, default: str = "auto") -> str:
@@ -7687,7 +16859,7 @@ def _server_settings_payload(state: ServerState) -> dict[str, Any]:
         reasoning = (
             "on" if bool(getattr(state.args, "enable_thinking", True)) else "off"
         )
-    return {
+    payload = {
         "ok": True,
         "reasoning": reasoning,
         "enable_thinking": bool(getattr(state.args, "enable_thinking", True)),
@@ -7703,6 +16875,8 @@ def _server_settings_payload(state: ServerState) -> dict[str, Any]:
             {"applied": False, "reason": "unavailable"},
         ),
     }
+    payload.update(_mtplx_current_settings(state))
+    return payload
 
 
 def _server_console_help() -> str:
@@ -7800,9 +16974,28 @@ def _start_server_console(state: ServerState) -> None:
 def create_app(state: ServerState) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # Bind the running asyncio loop to the dashboard bus so generation
+        # workers (sync threads) can publish via call_soon_threadsafe without
+        # needing to grab the loop themselves.
+        dashboard = getattr(state, "dashboard", None)
+        if dashboard is not None:
+            dashboard.bus.attach_loop(asyncio.get_running_loop())
+        bg_tasks: list[asyncio.Task[Any]] = []
+        if dashboard is not None and bool(getattr(state.args, "enable_thermal_poll", False)):
+            bg_tasks.append(asyncio.create_task(_thermal_poll_loop(state)))
         try:
             yield
         finally:
+            # Cancel any in-flight AIME benchmark runs so the daemon
+            # doesn't leak runner asyncio tasks past shutdown.
+            try:
+                from mtplx.benchmarks.runners import aime as _aime_runner
+
+                await _aime_runner.stop_runs()
+            except Exception:
+                pass
+            for task in bg_tasks:
+                task.cancel()
             scheduler = getattr(state, "model_scheduler", None)
             if scheduler is not None:
                 scheduler.shutdown(wait=False, cancel_futures=True)
@@ -7828,7 +17021,9 @@ def create_app(state: ServerState) -> FastAPI:
     async def api_key_and_rate_limit(
         request: Request, call_next: Callable[[Request], Any]
     ) -> Any:
-        if not _request_is_authorized(request, state.args.api_key):
+        if not _request_is_authorized(
+            request, state.args.api_key
+        ) and not _request_is_browser_auth_bootstrap(request, state.args.api_key):
             return JSONResponse(
                 status_code=401,
                 content={
@@ -7853,6 +17048,36 @@ def create_app(state: ServerState) -> FastAPI:
             )
         return await call_next(request)
 
+    @app.get(_BROWSER_AUTH_PATH)
+    def browser_auth(request: Request) -> Response:
+        configured_api_key = getattr(state.args, "api_key", None)
+        if configured_api_key and not _request_is_browser_auth_bootstrap(
+            request, configured_api_key
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": {
+                        "message": "missing or invalid API key",
+                        "type": "authentication_error",
+                    }
+                },
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        next_path = _safe_browser_auth_next_path(request.query_params.get("next"))
+        response = RedirectResponse(url=next_path, status_code=303)
+        if configured_api_key:
+            response.set_cookie(
+                _BROWSER_AUTH_COOKIE,
+                configured_api_key,
+                max_age=_BROWSER_AUTH_COOKIE_MAX_AGE_SECONDS,
+                httponly=True,
+                samesite="lax",
+                secure=False,
+                path="/",
+            )
+        return response
+
     @app.get("/", response_class=HTMLResponse)
     def root(request: Request) -> HTMLResponse:
         server_url = str(request.base_url).rstrip("/")
@@ -7866,6 +17091,7 @@ def create_app(state: ServerState) -> FastAPI:
                     "top_p": float(state.args.top_p),
                     "top_k": int(state.args.top_k),
                     "depth": int(state.args.depth),
+                    "depth_max": int(_backend_descriptor(state).draft_semantics.maximum),
                     "mtp_enabled": str(getattr(state.args, "generation_mode", "mtp"))
                     == "mtp",
                     "max_tokens": int(state.args.max_response_tokens or 16384),
@@ -7906,31 +17132,72 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, Any]:
+        runtime = getattr(state, "runtime", None)
         if hasattr(state, "foreground_count"):
             foreground_active = int(state.foreground_count())
         else:
             foreground_active = int(getattr(state, "foreground_active", 0) or 0)
-        fan_mode = str(os.environ.get("MTPLX_FAN_MODE") or "auto").lower()
-        fan_boost_active = fan_mode == "max"
+        dashboard_active = _dashboard_in_flight_count(state)
+        scheduler_state = _mtplx_scheduler_state(state)
+        scheduler_active = int(scheduler_state.get("active_requests") or 0)
+        active_requests = max(foreground_active, dashboard_active, scheduler_active)
+        fan_mode = _server_fan_mode(state)
+        smart_status = _smart_fan_status(state)
+        fan_boost_active = fan_mode == FAN_MODE_MAX or (
+            fan_mode == FAN_MODE_SMART
+            and bool(smart_status.get("commanded_max") or smart_status.get("active"))
+        )
         runtime_mode = _health_runtime_mode_label(
             state.profile.name,
             state.args.generation_mode,
             fan_boost_active=fan_boost_active,
         )
+        profile_payload = state.profile.to_dict()
+        profile_default_model_id = profile_payload.get("model_id")
+        if profile_default_model_id != state.model_id:
+            profile_payload["profile_default_model_id"] = profile_default_model_id
+            profile_payload["model_id"] = state.model_id
+        active_sampler = {
+            "temperature": float(state.args.temperature),
+            "top_p": float(state.args.top_p),
+            "top_k": int(state.args.top_k),
+        }
+        profile_default_sampler = profile_payload.get("sampler")
+        if profile_default_sampler != active_sampler:
+            profile_payload["profile_default_sampler"] = profile_default_sampler
+            profile_payload["sampler"] = active_sampler
         return {
             "ok": True,
             "model": state.model_id,
-            "model_path": str(state.runtime.model_path),
+            "model_path": str(
+                getattr(runtime, "model_path", None)
+                or getattr(state.args, "model", "")
+            ),
             "generation_mode": state.args.generation_mode,
             "default_generation_mode": state.args.generation_mode,
             "runtime_mode": runtime_mode,
+            "parent_runtime_released_for_aime": bool(
+                getattr(state, "aime_parent_runtime_released", False)
+            ),
             "fan_mode": fan_mode,
             "fan_boost_active": fan_boost_active,
+            "smart_fan_active_count": int(smart_status.get("active_count") or 0),
+            "smart_fan_last_transition_at": smart_status.get("last_transition_at"),
+            "smart_fan_last_error": smart_status.get("last_error"),
+            "startup": _startup_health_payload(state),
+            "thermal": _thermal_health_payload(
+                fan_mode=fan_mode,
+                smart_status=smart_status,
+            ),
             "available_generation_modes": ["mtp", "ar"],
             "load_mtp": bool(state.args.load_mtp),
-            "mtp_enabled": bool(state.runtime.mtp_enabled),
+            "mtp_enabled": bool(
+                getattr(runtime, "mtp_enabled", False)
+                if runtime is not None
+                else getattr(state.args, "load_mtp", False)
+            ),
             "depth": state.args.depth,
-            "profile": state.profile.to_dict(),
+            "profile": profile_payload,
             "adaptive": _adaptive_config(state.args),
             "proposal_cache": _proposal_cache_config(state.args),
             "online_hidden": _online_hidden_config(state.args),
@@ -7947,13 +17214,31 @@ def create_app(state: ServerState) -> FastAPI:
             "context_window": state.context_window,
             "max_response_tokens": state.args.max_response_tokens,
             "api_key_required": bool(state.args.api_key),
+            "api_key_source": str(
+                getattr(state.args, "api_key_source", "none") or "none"
+            ),
+            "paged_kv_quantization": _effective_paged_kv_quantization(),
             "rate_limit_per_minute": int(state.args.rate_limit),
             "stream_interval": int(state.args.stream_interval),
             "warmup": state.warmup_status,
             "foreground_active": foreground_active,
-            "active_requests": foreground_active,
+            "dashboard_active_requests": dashboard_active,
+            "active_requests": active_requests,
+            "scheduler": scheduler_state,
+            "session_bank": (
+                state.sessions.bank.to_dict()
+                if hasattr(getattr(state, "sessions", None), "bank")
+                and hasattr(state.sessions.bank, "to_dict")
+                else {}
+            ),
+            "ssd_session_cache": (
+                state.session_bank_cold_tier.stats()
+                if getattr(state, "session_bank_cold_tier", None) is not None
+                else {"enabled": False}
+            ),
             "last_request_started_at": getattr(state, "last_request_started_at", 0.0),
             "requests_completed": getattr(state, "requests_completed", 0),
+            "requests_cancelled": getattr(state, "requests_cancelled", 0),
             "last_request_at": getattr(state, "last_request_at", 0.0),
             "idle_seconds": (
                 time.time() - getattr(state, "last_request_at", 0.0)
@@ -7961,7 +17246,7 @@ def create_app(state: ServerState) -> FastAPI:
                 else None
             ),
             "reasoning_parser": state.args.reasoning_parser,
-            "load_time_s": state.load_time_s,
+            "load_time_s": getattr(state, "load_time_s", None),
             "draft_lm_head": state.draft_lm_head,
             "draft_sampler": (
                 asdict(getattr(state, "draft_sampler", None))
@@ -8011,6 +17296,12 @@ def create_app(state: ServerState) -> FastAPI:
                 "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"
             ),
             "long_context_mtp_depth": os.environ.get("MTPLX_LONG_CONTEXT_MTP_DEPTH"),
+            "opencode_short_context_depth_policy": {
+                "active": False,
+                "reason": "disabled_depth_preservation",
+                "default_depth": int(getattr(state.args, "depth", 3)),
+            },
+            "opencode_short_context_depth2_tokens": None,
             "mtp_position_mode": os.environ.get("MTPLX_MTP_POSITION_MODE"),
             "mtp_position_cap": os.environ.get("MTPLX_MTP_POSITION_CAP"),
             "mtp_position_period": os.environ.get("MTPLX_MTP_POSITION_PERIOD"),
@@ -8094,6 +17385,9 @@ def create_app(state: ServerState) -> FastAPI:
             "vllm_metal_paged_turboquant_v_quant": os.environ.get(
                 "MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT"
             ),
+            "vllm_metal_paged_kv_quant": os.environ.get(
+                "MTPLX_VLLM_METAL_PAGED_KV_QUANT"
+            ),
             "native_mlp_rowwise": os.environ.get("MTPLX_NATIVE_MLP_ROWWISE"),
             "native_mlp_min_m": os.environ.get("MTPLX_NATIVE_MLP_MIN_M"),
             "native_mlp_max_m": os.environ.get("MTPLX_NATIVE_MLP_MAX_M"),
@@ -8108,6 +17402,7 @@ def create_app(state: ServerState) -> FastAPI:
             ),
             "live_output_detach": os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS"),
             "live_output_detach_mode": os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS_MODE"),
+            "aime_process_isolation": os.environ.get("MTPLX_AIME_PROCESS_ISOLATION"),
             "metal_memory_caps": getattr(
                 state,
                 "metal_memory_caps",
@@ -8115,6 +17410,9 @@ def create_app(state: ServerState) -> FastAPI:
             ),
             "mlx_cache_limit": state.mlx_cache_limit_status,
             "mlx_fork": state.mlx_fork_status,
+            # Hardware fields surfaced for the dashboard's HardwareBanner
+            # and MemoryStackedBar. Cached after the first lookup.
+            **_machine_info(),
         }
 
     @app.get("/v1/mtplx/settings")
@@ -8125,12 +17423,823 @@ def create_app(state: ServerState) -> FastAPI:
     @app.post("/v1/mtplx/settings")
     @app.post("/mtplx/settings")
     def update_mtplx_settings(update: MTPLXSettingsUpdate) -> dict[str, Any]:
-        if update.reasoning is not None:
+        # `update.model_dump(exclude_none=True)` keeps the public contract
+        # unchanged: omitting a field leaves the existing server value alone.
+        payload = update.model_dump(exclude_none=True)
+        applied = _mtplx_apply_settings_payload(state, payload) if payload else {}
+        result = _server_settings_payload(state)
+        if applied:
+            result["applied"] = applied
+        return result
+
+    @app.get("/v1/mtplx/snapshot")
+    def mtplx_snapshot() -> dict[str, Any]:
+        return _mtplx_dashboard_snapshot(state)
+
+    @app.get("/v1/mtplx/prefill_history")
+    def mtplx_prefill_history() -> dict[str, Any]:
+        return {
+            "capacity": state.dashboard.prefill_history.capacity(),
+            "history": state.dashboard.prefill_history.snapshot(),
+        }
+
+    @app.post("/v1/mtplx/cancel/{request_id}")
+    def mtplx_cancel(request_id: str) -> dict[str, Any]:
+        handle = state.dashboard.in_flight.get(request_id)
+        cancelled = state.dashboard.in_flight.cancel(request_id)
+        if cancelled:
+            scheduler = getattr(state, "model_scheduler", None)
+            if scheduler is not None and hasattr(scheduler, "record_request_cancelled"):
+                latency_s = (
+                    max(0.0, time.time() - float(handle.started_s))
+                    if handle is not None
+                    else None
+                )
+                scheduler.record_request_cancelled(latency_s=latency_s)
+        return {
+            "ok": cancelled,
+            "request_id": request_id,
+            "cancelled": cancelled,
+            "active_requests": state.dashboard.in_flight.count(),
+        }
+
+    @app.get("/v1/mtplx/app/capabilities")
+    def mtplx_app_capabilities() -> dict[str, Any]:
+        return _mtplx_app_capabilities()
+
+    @app.post("/v1/mtplx/thermal/fan_mode")
+    @app.post("/mtplx/thermal/fan_mode")
+    def mtplx_thermal_fan_mode(request: FanModeRequest) -> dict[str, Any]:
+        """Set fan mode to ``max``, ``smart``, or ``default``.
+
+        Thin HTTP wrapper around ``mtplx.thermal``'s verified helpers.
+        Returns the verified result plus a fresh ``fan_summary`` so the
+        UI can render the new ramp state immediately.
+        """
+
+        from mtplx.thermal import (
+            fan_summary as _fan_summary,
+            restore_thermal_profile_verified,
+            set_thermal_profile_verified,
+        )
+
+        try:
+            mode = normalize_fan_mode(request.mode)
+            if mode == FAN_MODE_MAX:
+                if getattr(state, "smart_fans", None) is not None:
+                    state.smart_fans.restore_now(wait=False)
+                kwargs: dict[str, Any] = {
+                    "require_actual_ramp": bool(request.require_actual_ramp)
+                }
+                if request.timeout_s is not None:
+                    kwargs["actual_ramp_timeout_s"] = float(request.timeout_s)
+                result = set_thermal_profile_verified("performance", **kwargs)
+                if result.get("ok"):
+                    state.fan_mode = FAN_MODE_MAX
+                    state.args.fan_mode = FAN_MODE_MAX
+            elif mode == FAN_MODE_SMART:
+                state.fan_mode = FAN_MODE_SMART
+                state.args.fan_mode = FAN_MODE_SMART
+                smart_status = (
+                    state.smart_fans.restore_now(wait=False)
+                    if getattr(state, "smart_fans", None) is not None
+                    else {}
+                )
+                result = {
+                    "ok": True,
+                    "profile": FAN_MODE_SMART,
+                    "message": "smart fan mode enabled",
+                    "smart": smart_status,
+                }
+            else:
+                result = restore_thermal_profile_verified()
+                if getattr(state, "smart_fans", None) is not None:
+                    state.smart_fans.restore_now(wait=False)
+                if result.get("ok"):
+                    state.fan_mode = FAN_MODE_DEFAULT
+                    state.args.fan_mode = FAN_MODE_DEFAULT
+        except Exception as exc:
+            return {
+                "verified": False,
+                "current_mode": None,
+                "error": f"{type(exc).__name__}: {exc}",
+                "fan_summary": _fan_summary(),
+            }
+
+        return {
+            "verified": bool(result.get("ok")),
+            "current_mode": mode if result.get("ok") else None,
+            "result": result,
+            "smart": _smart_fan_status(state),
+            "fan_summary": _fan_summary(),
+        }
+
+    @app.get("/v1/mtplx/thermal/status")
+    @app.get("/mtplx/thermal/status")
+    def mtplx_thermal_status_endpoint() -> dict[str, Any]:
+        """Snapshot of fan-control detection and current readings.
+
+        Returns ``ok=False`` (not HTTP 500) when ``thermalforge`` isn't
+        installed so the UI can render an unavailable state cleanly.
+        """
+
+        from mtplx.thermal import (
+            detect_thermal_control,
+            fan_summary as _fan_summary,
+            thermal_status as _thermal_status,
+        )
+
+        try:
+            detection = detect_thermal_control()
+            status = _thermal_status()
+            summary = _fan_summary()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "detection": None,
+                "current_mode": None,
+                "fan_summary": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        return {
+            "ok": bool(status.get("ok", False) or detection.get("available", False)),
+            "detection": detection,
+            "current_mode": _server_fan_mode(state),
+            "smart": _smart_fan_status(state),
+            "thermal_status": status,
+            "fan_summary": summary,
+        }
+
+    # ----- AIME 2026 benchmark endpoints -----------------------------------
+    # See mtplx/benchmarks/runners/aime.py for runner semantics and
+    # mtplx/benchmarks/prompts/aime_2026.jsonl for the problem dataset.
+    # SwiftUI BenchmarkOverlay in apps/MTPLXApp/.../Benchmark/ consumes
+    # this surface; the in-browser chat-UI launcher is intentionally NOT
+    # wired (the SwiftUI app is the V1 product).
+
+    def _free_loopback_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            return int(sock.getsockname()[1])
+
+    def _aime_process_isolation_mode(body: "_AIMEStartBody | None") -> str:
+        raw = None
+        if body is not None:
+            raw = getattr(body, "question_process_isolation", None)
+        if raw is None:
+            raw = os.environ.get("MTPLX_AIME_PROCESS_ISOLATION")
+        mode = str(raw or "off").strip().lower()
+        if mode in {"1", "true", "yes", "on", "per-question", "per_question"}:
+            return "per_question"
+        return "off"
+
+    def _aime_clear_cache_every() -> int:
+        aime_raw = os.environ.get("MTPLX_AIME_CLEAR_CACHE_EVERY")
+        inherited_raw = os.environ.get("MTPLX_CLEAR_CACHE_EVERY")
+        raw = aime_raw if aime_raw is not None else inherited_raw
+        normalized = str(raw or "").strip().lower()
+        if not normalized or normalized == "auto":
+            return 512
+        if normalized in {"off", "false", "no"}:
+            return 0
+        try:
+            return max(0, int(normalized))
+        except ValueError:
+            return 512
+
+    def _aime_worker_drain_s() -> float:
+        raw = str(os.environ.get("MTPLX_AIME_WORKER_DRAIN_S") or "0.75").strip()
+        try:
+            return max(0.0, min(5.0, float(raw)))
+        except ValueError:
+            return 0.75
+
+    def _aime_release_parent_runtime_enabled(body: "_AIMEStartBody | None") -> bool:
+        if _aime_process_isolation_mode(body) != "per_question":
+            return False
+        raw = str(
+            os.environ.get("MTPLX_AIME_RELEASE_PARENT_RUNTIME") or "auto"
+        ).strip().lower()
+        return raw not in {"0", "false", "no", "off", "never"}
+
+    def _release_parent_runtime_for_aime() -> dict[str, Any]:
+        if getattr(state, "aime_parent_runtime_released", False):
+            return {
+                "released": False,
+                "reason": "already_released",
+                "allocator_after": _mlx_allocator_public_stats(),
+            }
+        runtime = getattr(state, "runtime", None)
+        if runtime is None:
+            state.aime_parent_runtime_released = True
+            return {
+                "released": False,
+                "reason": "runtime_missing",
+                "allocator_after": _mlx_allocator_public_stats(),
+            }
+        started = time.perf_counter()
+        model_path = str(getattr(runtime, "model_path", getattr(state.args, "model", "")))
+        mtp_enabled = bool(getattr(runtime, "mtp_enabled", False))
+        lock = getattr(state, "lock", None)
+        acquired = False
+        if lock is not None and hasattr(lock, "acquire"):
+            acquired = bool(lock.acquire(blocking=False))
+            if not acquired:
+                return {
+                    "released": False,
+                    "reason": "model_lock_busy",
+                    "allocator_after": _mlx_allocator_public_stats(),
+                }
+        try:
+            state.runtime = None
+            state.draft_lm_head = {
+                "installed": False,
+                "reason": "aime_parent_runtime_released",
+            }
+            state.draft_head_identity = None
+            state.template_hash = None
+            state.aime_parent_runtime_released = True
+            gc.collect()
+            cleanup = _clear_mlx_cache_after_request(
+                state,
+                reason="aime_parent_runtime_release",
+            )
+            return {
+                "released": True,
+                "model_path": model_path,
+                "mtp_enabled": mtp_enabled,
+                "duration_ms": int(round((time.perf_counter() - started) * 1000.0)),
+                "mlx_cache_cleanup": cleanup,
+                "allocator_after": _mlx_allocator_public_stats(),
+            }
+        finally:
+            if acquired:
+                lock.release()
+
+    def _aime_worker_argv(*, port: int, app_launch_id: str) -> list[str]:
+        raw_args = list(getattr(state.args, "_raw_args", sys.argv[1:]))
+        skip_value_flags = {
+            "--host",
+            "--port",
+            "--app-launch-id",
+            "--clear-cache-every",
+        }
+        drop_flags = {
+            "--open-browser",
+            "--open-dashboard",
+            "--launch-pi",
+            "--launch-opencode",
+            "--server-console",
+        }
+        child_args: list[str] = []
+        skip_next = False
+        for arg in raw_args:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in drop_flags:
+                continue
+            if arg in skip_value_flags:
+                skip_next = True
+                continue
+            if any(arg.startswith(flag + "=") for flag in skip_value_flags):
+                continue
+            child_args.append(arg)
+        child_args.extend(
+            [
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--app-launch-id",
+                app_launch_id,
+                "--clear-cache-every",
+                str(_aime_clear_cache_every()),
+            ]
+        )
+        return child_args
+
+    async def _wait_for_aime_worker_health(
+        proc: subprocess.Popen[Any],
+        *,
+        base_url: str,
+        api_key: str | None,
+        timeout_s: float = 180.0,
+    ) -> dict[str, Any]:
+        import httpx
+
+        deadline = time.monotonic() + timeout_s
+        headers: dict[str, str] = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        last_error: str | None = None
+        async with httpx.AsyncClient(timeout=httpx.Timeout(2.0)) as client:
+            while time.monotonic() < deadline:
+                returncode = proc.poll()
+                if returncode is not None:
+                    raise RuntimeError(
+                        f"AIME worker exited before health check: returncode={returncode}"
+                    )
+                try:
+                    response = await client.get(base_url.rstrip("/") + "/health", headers=headers)
+                    if response.status_code == 200:
+                        payload = response.json()
+                        if isinstance(payload, dict) and payload.get("ok"):
+                            return payload
+                        last_error = f"unhealthy payload: {payload!r}"
+                    else:
+                        last_error = f"HTTP {response.status_code}"
+                except Exception as exc:  # noqa: BLE001 - startup polls are best effort
+                    last_error = f"{type(exc).__name__}: {exc}"
+                await asyncio.sleep(0.25)
+        raise RuntimeError(
+            "AIME worker did not become healthy"
+            + (f": {last_error}" if last_error else "")
+        )
+
+    def _aime_worker_log_tail(path: Path, *, max_bytes: int = 4000) -> str:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return ""
+        return data[-max_bytes:].decode("utf-8", errors="replace").strip()
+
+    async def _stop_aime_worker(proc: subprocess.Popen[Any]) -> dict[str, Any]:
+        started = time.monotonic()
+        if proc.poll() is None:
+            proc.terminate()
             try:
-                _set_server_reasoning_mode(state, update.reasoning)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _server_settings_payload(state)
+                await asyncio.to_thread(proc.wait, timeout=12.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                await asyncio.to_thread(proc.wait, timeout=12.0)
+        returncode = proc.poll()
+        drain_s = _aime_worker_drain_s()
+        if drain_s > 0:
+            await asyncio.sleep(drain_s)
+        return {
+            "ok": returncode is not None,
+            "pid": proc.pid,
+            "returncode": returncode,
+            "post_exit_drain_ms": int(round(drain_s * 1000.0)),
+            "duration_ms": int(round((time.monotonic() - started) * 1000.0)),
+        }
+
+    async def _aime_question_process_runtime_factory(
+        runner: Any,
+        problem: Any,
+    ) -> Any:
+        from mtplx.benchmarks.runners.aime import AIMEQuestionRuntime
+
+        port = _free_loopback_port()
+        idx = int(getattr(runner, "current_idx", None) or getattr(problem, "index", 0) or 0)
+        attempt = int(getattr(runner, "current_attempt", None) or 1)
+        parent_launch_id = (
+            str(getattr(state.args, "app_launch_id", None) or "").strip()
+            or "mtplx"
+        )
+        app_launch_id = (
+            f"{parent_launch_id}-aime-q{idx}-a{attempt}-{uuid.uuid4().hex[:6]}"
+        )
+        child_args = _aime_worker_argv(port=port, app_launch_id=app_launch_id)
+        env = dict(os.environ)
+        env["MTPLX_AIME_PROCESS_ISOLATION"] = "off"
+        env["MTPLX_APP_LAUNCH_ID"] = app_launch_id
+        env["MTPLX_AIME_PARENT_PID"] = str(os.getpid())
+        base_url = f"http://127.0.0.1:{port}"
+        log_dir = Path.home() / ".mtplx" / "benchmarks" / "aime" / "worker-logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{app_launch_id}.log"
+        log_file = log_path.open("ab", buffering=0)
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "mtplx.server.openai", *child_args],
+            cwd=str(ROOT),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            health = await _wait_for_aime_worker_health(
+                proc,
+                base_url=base_url,
+                api_key=getattr(state.args, "api_key", None),
+            )
+        except Exception as exc:
+            await _stop_aime_worker(proc)
+            log_file.close()
+            log_tail = _aime_worker_log_tail(log_path)
+            if log_tail:
+                raise RuntimeError(
+                    f"{exc}; AIME worker log {log_path}: {log_tail}"
+                ) from exc
+            raise
+
+        async def cleanup() -> dict[str, Any]:
+            try:
+                return await _stop_aime_worker(proc)
+            finally:
+                log_file.close()
+
+        return AIMEQuestionRuntime(
+            base_url=base_url,
+            cleanup=cleanup,
+            metadata={
+                "mode": "per_question_process",
+                "pid": proc.pid,
+                "port": port,
+                "app_launch_id": app_launch_id,
+                "log_path": str(log_path),
+                "model": health.get("model"),
+                "profile_name": (health.get("profile") or {}).get("name")
+                if isinstance(health.get("profile"), dict)
+                else None,
+                "generation_mode": health.get("generation_mode"),
+                "clear_cache_every": health.get("clear_cache_every")
+                or env.get("MTPLX_CLEAR_CACHE_EVERY"),
+            },
+        )
+
+    class _AIMEStartBody(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        year: int = 2026
+        # Sampler overrides; omit any to inherit the daemon's preset
+        # default (matches commit 25ae0fe "Restore product sampler
+        # defaults for launch QA").
+        temperature: float | None = None
+        top_p: float | None = None
+        top_k: int | None = None
+        max_tokens: int | None = None
+        enable_thinking: bool | None = None
+        answer_verification: str | None = None
+        answer_verification_attempts: int | None = None
+        cap_recovery: str | None = None
+        visible_submission_max_tokens: int | None = None
+        question_process_isolation: str | None = None
+        question_limit: int | None = None
+
+    async def _aime_question_isolation_cleanup(
+        _runner: Any,
+        _result: Any,
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Hard isolation boundary between native AIME questions.
+
+        AIME rows are intentionally stateless. The OpenAI bridge already
+        bypasses SessionBank for AIME requests and clears idle MLX cache after
+        natural completion; this boundary also catches handoff/cancel paths and
+        clears app-owned session state before the next question starts.
+        """
+
+        sessions_cleared: Any = None
+        try:
+            sessions_cleared = state.sessions.clear_all()
+        except Exception as exc:  # noqa: BLE001 - keep the benchmark alive
+            sessions_cleared = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        cleanup_started_s = time.perf_counter()
+        cleanup_attempts: list[dict[str, Any]] = []
+        cleanup: dict[str, Any] = {}
+        for _ in range(20):
+            cleanup = _clear_mlx_cache_after_request(
+                state,
+                reason="aime_question_boundary",
+            )
+            cleanup_attempts.append(cleanup)
+            if cleanup.get("reason") != "model_lock_busy":
+                break
+            await asyncio.sleep(0.05)
+        if len(cleanup_attempts) > 1:
+            cleanup = dict(cleanup)
+            cleanup["attempts"] = len(cleanup_attempts)
+            cleanup["waited_s"] = round(time.perf_counter() - cleanup_started_s, 3)
+            cleanup["attempt_reasons"] = [
+                str(attempt.get("reason") or "") for attempt in cleanup_attempts
+            ]
+        return {
+            "ok": bool(cleanup.get("cleared")),
+            "request_id": request_id,
+            "session_cache_clear": sessions_cleared,
+            "mlx_cache_cleanup": cleanup,
+            "allocator_after": _mlx_allocator_public_stats(),
+        }
+
+    def _aime_runner_kwargs(body: "_AIMEStartBody | None") -> dict[str, Any]:
+        decode_profile = getattr(state.args, "profile", None) or "sustained"
+        mtp_enabled: bool | None
+        try:
+            mtp_enabled = bool(
+                getattr(state, "mtp_enabled", None)
+                if getattr(state, "mtp_enabled", None) is not None
+                else not bool(getattr(state.args, "no_mtp", False))
+            )
+        except Exception:
+            mtp_enabled = None
+        try:
+            depth_raw = int(
+                getattr(state, "depth", 0) or getattr(state.args, "depth", 0)
+            )
+        except Exception:
+            depth_raw = 0
+        kwargs: dict[str, Any] = {
+            "decode_profile": decode_profile,
+            "mtp_enabled": mtp_enabled,
+            "depth": depth_raw if depth_raw > 0 else None,
+            "model_id": state.model_id,
+            "base_url": _startup_server_url(state.args),
+            "api_key": getattr(state.args, "api_key", None),
+            "question_isolation_factory": _aime_question_isolation_cleanup,
+        }
+        if _aime_process_isolation_mode(body) == "per_question":
+            kwargs["question_runtime_factory"] = (
+                _aime_question_process_runtime_factory
+            )
+        if body is not None:
+            if body.temperature is not None:
+                kwargs["temperature"] = body.temperature
+            if body.top_p is not None:
+                kwargs["top_p"] = body.top_p
+            if body.top_k is not None:
+                kwargs["top_k"] = body.top_k
+            if body.max_tokens is not None:
+                kwargs["max_tokens"] = body.max_tokens
+            if body.enable_thinking is not None:
+                kwargs["enable_thinking"] = body.enable_thinking
+            else:
+                kwargs["enable_thinking"] = bool(
+                    getattr(state.args, "enable_thinking", True)
+                )
+            if body.answer_verification is not None:
+                kwargs["answer_verification"] = body.answer_verification
+            if body.answer_verification_attempts is not None:
+                kwargs["answer_verification_attempts"] = (
+                    body.answer_verification_attempts
+                )
+            if body.cap_recovery is not None:
+                kwargs["cap_recovery"] = body.cap_recovery
+            if body.visible_submission_max_tokens is not None:
+                kwargs["visible_submission_max_tokens"] = (
+                    body.visible_submission_max_tokens
+                )
+        return kwargs
+
+    @app.post("/v1/mtplx/benchmarks/aime/start")
+    async def aime_start(
+        body: dict[str, Any] | None = Body(default=None),
+    ) -> JSONResponse:
+        from mtplx.benchmarks.runners import aime as aime_runner
+
+        parsed_body = _AIMEStartBody.model_validate(body or {})
+        year = int(parsed_body.year) if parsed_body.year else 2026
+        if year != 2026:
+            raise HTTPException(
+                status_code=400,
+                detail=f"only AIME 2026 is shipped (got year={year})",
+            )
+        kwargs = _aime_runner_kwargs(parsed_body)
+        if parsed_body.question_limit is not None:
+            question_limit = int(parsed_body.question_limit)
+            if question_limit < 1 or question_limit > 30:
+                raise HTTPException(
+                    status_code=400,
+                    detail="question_limit must be between 1 and 30",
+                )
+            kwargs["problems"] = aime_runner.load_dataset()[:question_limit]
+        parent_runtime_release: dict[str, Any] | None = None
+        if _aime_release_parent_runtime_enabled(parsed_body):
+            parent_runtime_release = _release_parent_runtime_for_aime()
+            if parent_runtime_release.get("reason") == "model_lock_busy":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "aime_parent_runtime_release_busy",
+                        "release": parent_runtime_release,
+                    },
+                )
+        try:
+            runner = await aime_runner.start_run(year=year, **kwargs)
+        except aime_runner.ConcurrentRunError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "run_in_progress",
+                    "active_run_id": exc.active_run_id,
+                },
+            )
+        snapshot = runner.snapshot()
+        return JSONResponse(
+            status_code=200,
+            content={
+                "run_id": runner.run_id,
+                "total": runner.total,
+                "model": runner.model_id,
+                "year": runner.year,
+                "started_at": snapshot.get("started_at"),
+                "state": runner.state.value,
+                "parent_runtime_release": parent_runtime_release,
+            },
+        )
+
+    @app.get("/v1/mtplx/benchmarks/aime/active")
+    def aime_active() -> dict[str, Any]:
+        from mtplx.benchmarks.runners import aime as aime_runner
+
+        return {"active_run_id": aime_runner.list_active_run_id()}
+
+    @app.get("/v1/mtplx/benchmarks/aime/history")
+    def aime_history(limit: int = 5) -> dict[str, Any]:
+        """Return summary lines of the most recent N AIME runs.
+
+        Reads JSONL files in `~/.mtplx/benchmarks/aime/` and returns the
+        last-line `summary` entry from each (in mtime-descending order).
+        """
+        from mtplx.benchmarks.runners import aime as aime_runner
+
+        directory = aime_runner.DEFAULT_PERSIST_DIR
+        if not directory.is_dir():
+            return {"runs": []}
+        files = sorted(
+            (p for p in directory.glob("*.jsonl") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        runs: list[dict[str, Any]] = []
+        capped = max(1, min(int(limit or 5), 50))
+        for path in files[:capped]:
+            try:
+                with path.open(encoding="utf-8") as handle:
+                    last_summary: dict[str, Any] | None = None
+                    for raw in handle:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            obj = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(obj, dict) and "summary" in obj:
+                            last_summary = obj["summary"]
+                if last_summary is not None:
+                    runs.append({"run_id": path.stem, "path": str(path), **last_summary})
+            except OSError:
+                continue
+        return {"runs": runs}
+
+    @app.get("/v1/mtplx/benchmarks/aime/{run_id}")
+    def aime_snapshot(run_id: str) -> dict[str, Any]:
+        from mtplx.benchmarks.runners import aime as aime_runner
+
+        run = aime_runner.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"unknown run_id {run_id}")
+        return run.snapshot()
+
+    @app.post("/v1/mtplx/benchmarks/aime/{run_id}/pause")
+    async def aime_pause(run_id: str) -> dict[str, Any]:
+        from mtplx.benchmarks.runners import aime as aime_runner
+
+        run = aime_runner.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"unknown run_id {run_id}")
+        await run.pause()
+        return run.snapshot()
+
+    @app.post("/v1/mtplx/benchmarks/aime/{run_id}/resume")
+    async def aime_resume(run_id: str) -> dict[str, Any]:
+        from mtplx.benchmarks.runners import aime as aime_runner
+
+        run = aime_runner.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"unknown run_id {run_id}")
+        await run.resume()
+        return run.snapshot()
+
+    @app.post("/v1/mtplx/benchmarks/aime/{run_id}/skip")
+    async def aime_skip(run_id: str) -> dict[str, Any]:
+        from mtplx.benchmarks.runners import aime as aime_runner
+
+        run = aime_runner.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"unknown run_id {run_id}")
+        await run.skip_current()
+        return run.snapshot()
+
+    @app.post("/v1/mtplx/benchmarks/aime/{run_id}/cancel")
+    async def aime_cancel(run_id: str) -> dict[str, Any]:
+        from mtplx.benchmarks.runners import aime as aime_runner
+
+        run = aime_runner.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"unknown run_id {run_id}")
+        await run.cancel()
+        return run.snapshot()
+
+    @app.get("/v1/mtplx/benchmarks/aime/{run_id}/stream")
+    async def aime_stream(run_id: str) -> StreamingResponse:
+        from mtplx.benchmarks.runners import aime as aime_runner
+
+        run = aime_runner.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"unknown run_id {run_id}")
+
+        terminal_kinds = {"run_done", "run_cancelled", "error"}
+        queue, replay = run.subscribe()
+
+        async def event_stream():
+            saw_terminal = False
+            try:
+                for ev in replay:
+                    yield (
+                        f"event: {ev.get('event', 'message')}\n"
+                        f"data: {json.dumps(_json_safe(ev))}\n\n"
+                    )
+                    if ev.get("event") in terminal_kinds:
+                        saw_terminal = True
+                if saw_terminal:
+                    return
+                while True:
+                    try:
+                        ev = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
+                    yield (
+                        f"event: {ev.get('event', 'message')}\n"
+                        f"data: {json.dumps(_json_safe(ev))}\n\n"
+                    )
+                    if ev.get("event") in terminal_kinds:
+                        break
+            except asyncio.CancelledError:
+                raise
+            finally:
+                run.unsubscribe(queue)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.get("/v1/mtplx/metrics/stream")
+    async def mtplx_metrics_stream(
+        snapshot_interval_ms: int | None = None,
+    ) -> StreamingResponse:
+        bus = state.dashboard.bus
+        queue = bus.subscribe()
+        snapshot_interval_s = _dashboard_snapshot_interval_s(snapshot_interval_ms)
+
+        async def event_stream():
+            try:
+                snapshot = _mtplx_dashboard_snapshot(state)
+                yield (
+                    "event: snapshot\n"
+                    f"data: {json.dumps(_json_safe(snapshot))}\n\n"
+                )
+                last_snapshot_s = time.perf_counter()
+                while True:
+                    timeout_s = max(
+                        0.01,
+                        snapshot_interval_s
+                        - (time.perf_counter() - last_snapshot_s),
+                    )
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=timeout_s)
+                        yield (
+                            f"event: {event.get('kind', 'event')}\n"
+                            f"data: {json.dumps(_json_safe(event))}\n\n"
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    if (
+                        time.perf_counter() - last_snapshot_s
+                    ) >= snapshot_interval_s:
+                        snapshot = _mtplx_dashboard_snapshot(state)
+                        yield (
+                            "event: snapshot\n"
+                            f"data: {json.dumps(_json_safe(snapshot))}\n\n"
+                        )
+                        last_snapshot_s = time.perf_counter()
+            except asyncio.CancelledError:
+                raise
+            finally:
+                bus.unsubscribe(queue)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get("/metrics")
     def metrics() -> dict[str, Any]:
@@ -8167,6 +18276,19 @@ def create_app(state: ServerState) -> FastAPI:
             ),
         }
 
+    @app.get("/admin/cache/ssd")
+    def admin_ssd_cache() -> dict[str, Any]:
+        tier = getattr(state, "session_bank_cold_tier", None)
+        if tier is None or not hasattr(tier, "stats"):
+            return {"enabled": False}
+        return tier.stats()
+
+    @app.post("/admin/cache/ssd/archive")
+    def admin_archive_ssd_cache() -> dict[str, Any]:
+        archived = state.sessions.archive_cold_tier()
+        archived["ram_cache_unchanged"] = True
+        return archived
+
     @app.get("/v1/models")
     def list_models() -> dict[str, Any]:
         now = int(time.time())
@@ -8194,8 +18316,13 @@ def create_app(state: ServerState) -> FastAPI:
         headers = dict(raw_request.headers)
         metadata = _request_metadata(request)
         request_max_tokens = _request_max_tokens(request)
-        model = request.model or state.model_id
-        response_id = f"chatcmpl-{uuid.uuid4().hex}"
+        requested_model = request.model
+        model = state.model_id
+        response_id = _response_id_from_client_hint(
+            prefix="chatcmpl",
+            headers=headers,
+            metadata=metadata,
+        )
         created = int(time.time())
         if _is_opencode_title_request(request):
             return _opencode_title_response(
@@ -8215,13 +18342,131 @@ def create_app(state: ServerState) -> FastAPI:
             "stateless",
             "off",
         }
+        opencode_client = _is_opencode_client(headers=headers, metadata=metadata)
+        requested_tool_specs = _normalize_tool_specs(request.tools)
         tool_specs = _filter_tool_specs_for_request(
-            _normalize_tool_specs(request.tools),
+            requested_tool_specs,
             request.messages,
+            tool_choice=request.tool_choice,
         )
         tools_active = _tools_active_for_request(tool_specs, request.tool_choice)
+        raw_tool_result_history_present = any(
+            str(message.role).lower() == "tool" for message in request.messages
+        )
+        agent_transcript_tools_active = bool(
+            tools_active
+            or (
+                requested_tool_specs
+                and raw_tool_result_history_present
+                and _is_read_only_inspection_request(_last_user_text(request.messages))
+            )
+        )
+        read_only_force_answer_contract_active = (
+            _request_should_force_answer_for_read_only_inspection(request.messages)
+        )
+        if read_only_force_answer_contract_active:
+            if (
+                _tool_result_message_count(request.messages) > 0
+                and _request_explicit_single_tool_then_answer(request.messages)
+            ):
+                # Explicit "use one tool then answer": the forced final turn
+                # generates tool-free, and turn-level tool state/observability
+                # must agree (zero remaining tools, read_only_force_answer:v1
+                # policy version).
+                tool_specs = []
+                tools_active = False
+            else:
+                # Read-budget force answer: keep the read-only inspection
+                # toolset so cited evidence stays greppable, instead of
+                # returning zero tools.
+                tool_specs = [
+                    tool
+                    for tool in requested_tool_specs
+                    if (_tool_spec_name(tool) or "").strip().lower()
+                    in _READ_ONLY_FORCE_ANSWER_TOOL_NAMES
+                ]
+                tools_active = _tools_active_for_request(
+                    tool_specs, request.tool_choice
+                )
+        no_tools_contract_active = bool(
+            not read_only_force_answer_contract_active
+            and _should_add_no_tool_contract(
+                requested_tools=requested_tool_specs,
+                tools_active=tools_active,
+                messages=request.messages,
+            )
+        )
+        client_controls_allowed = _client_controls_allowed(headers, metadata)
+        pi_convergence_contract_active = bool(
+            not read_only_force_answer_contract_active
+            and not no_tools_contract_active
+            and _request_should_add_pi_convergence_contract(
+                request.messages,
+                headers=headers,
+                metadata=metadata,
+                tools_active=agent_transcript_tools_active,
+            )
+        )
+        opencode_prompt_contract_profile = _opencode_prompt_contract_profile(
+            request.messages,
+            headers=headers,
+            metadata=metadata,
+            tool_choice=request.tool_choice,
+        )
+        opencode_prompt_contract_system_prompt = (
+            _opencode_prompt_contract_system_prompt(opencode_prompt_contract_profile)
+        )
+        opencode_simple_chat_contract_active = False
+        messages_for_generation, transcript_stats = _canonicalize_agent_transcript(
+            request.messages,
+            tools_active=agent_transcript_tools_active,
+            replace_simple_chitchat_system_prompt=False,
+            initial_client_system_prompt=opencode_prompt_contract_system_prompt,
+            strip_tool_call_preamble_text=opencode_client,
+        )
+        messages_for_generation, backend_chat_policy_active = _with_backend_chat_policy(
+            state,
+            messages_for_generation,
+        )
+        if read_only_force_answer_contract_active:
+            messages_for_generation = _with_mtplx_read_only_force_answer_contract(
+                messages_for_generation
+            )
+        elif no_tools_contract_active:
+            messages_for_generation = _with_mtplx_no_tool_contract(
+                messages_for_generation
+            )
+        elif pi_convergence_contract_active:
+            messages_for_generation = _with_mtplx_pi_convergence_contract(
+                messages_for_generation
+            )
+        read_only_inspection_request = _is_read_only_inspection_request(
+            _last_user_text(messages_for_generation)
+        )
+        tool_result_history_present = any(
+            str(message.role).lower() == "tool" for message in messages_for_generation
+        )
+        raw_messages_for_postcommit = (
+            list(request.messages)
+            if read_only_force_answer_contract_active
+            else (
+                list(messages_for_generation)
+                if (
+                    no_tools_contract_active
+                    or pi_convergence_contract_active
+                    or opencode_prompt_contract_profile is not None
+                    or backend_chat_policy_active
+                )
+                else list(request.messages)
+            )
+        )
+        postcommit_tool_specs = (
+            tool_specs
+            if tools_active
+            else (requested_tool_specs if agent_transcript_tools_active else None)
+        )
         background = is_background_request(
-            messages=request.messages,
+            messages=messages_for_generation,
             max_tokens=request_max_tokens,
             headers=headers,
             metadata=metadata,
@@ -8247,25 +18492,104 @@ def create_app(state: ServerState) -> FastAPI:
                     },
                 },
             )
-        thinking_enabled = _thinking_enabled_for_request(state, request)
+        thinking_enabled = _thinking_enabled_for_request(
+            state,
+            request,
+            allow_client_controls=client_controls_allowed,
+        )
+        reasoning_effort = _reasoning_effort_for_state(
+            state,
+            thinking_enabled=thinking_enabled,
+            request_effort=request.reasoning_effort,
+            allow_client_controls=client_controls_allowed,
+        )
+        if (
+            read_only_force_answer_contract_active
+            and _reasoning_parser_for_state(state) == "gemma4"
+        ):
+            thinking_enabled = False
+        aime_visible_working = (
+            _aime_visible_working_for_request(metadata)
+            and thinking_enabled
+            and _reasoning_parser_for_state(state) in {"qwen3", "step3p5"}
+        )
+        tool_prompt_mode, tool_prompt_mode_resolution = _tool_prompt_mode_for_request(
+            state.args,
+            headers=headers,
+            metadata=metadata,
+            tools_active=tools_active,
+        )
+        template_tool_prompt_mode = tool_prompt_mode
+        if read_only_force_answer_contract_active and tools_active:
+            # Read-budget force-answer turns keep the read-only toolset with
+            # real schemas in the template; the compact schema-free contract
+            # would strip them and defeat the evidence-citing final turn.
+            # Only the template/observability lane switches to hybrid — the
+            # policy fingerprints keep the resolved launch/client mode so
+            # SessionBank restore still matches postcommit.
+            template_tool_prompt_mode = _TOOL_PROMPT_MODE_HYBRID
+            tool_prompt_mode_resolution = {
+                **tool_prompt_mode_resolution,
+                "tool_prompt_mode_source": "read_only_force_answer",
+            }
+        postcommit_tool_prompt_mode = tool_prompt_mode
+        if postcommit_tool_specs and not tools_active:
+            postcommit_tool_prompt_mode, _ = _tool_prompt_mode_for_request(
+                state.args,
+                headers=headers,
+                metadata=metadata,
+                tools_active=True,
+            )
         request_generation_mode = _request_generation_mode_for_generation(
-            state, request
+            state,
+            request,
+            allow_client_controls=client_controls_allowed,
         )
         request_depth = _request_depth_for_generation(
             state,
             request,
             generation_mode=request_generation_mode,
+            allow_client_controls=client_controls_allowed,
         )
         template_observability: dict[str, Any] = {}
         prompt_ids = _encode_messages(
             state.runtime.tokenizer,
-            request.messages,
+            messages_for_generation,
             enable_thinking=thinking_enabled,
+            reasoning_effort=reasoning_effort,
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
             tools=tool_specs if tools_active else None,
+            tool_choice=request.tool_choice,
+            tool_prompt_mode=template_tool_prompt_mode,
             template_observability=template_observability,
         )
-        current_system_hash = system_prompt_hash(request.messages)
+        if aime_visible_working:
+            prompt_ids = [
+                *prompt_ids,
+                *_encode_rendered_chat_text(
+                    state.runtime.tokenizer,
+                    f"{THINK_CLOSE}\n",
+                ),
+            ]
+            template_observability["aime_visible_working"] = True
+            template_observability["aime_visible_working_prompt_close"] = True
+        request_depth, short_depth_policy = _opencode_short_context_depth_policy(
+            request,
+            headers=headers,
+            metadata=metadata,
+            generation_mode=request_generation_mode,
+            request_depth=request_depth,
+            prompt_tokens=len(prompt_ids),
+        )
+        effective_request_depth, long_context_depth_policy = (
+            _long_context_mtp_depth_policy_for_request(
+                state,
+                generation_mode=request_generation_mode,
+                request_depth=request_depth,
+                prompt_tokens=len(prompt_ids),
+            )
+        )
+        current_system_hash = system_prompt_hash(messages_for_generation)
         if current_system_hash is not None and not background:
             state.main_system_prompt_hash = current_system_hash
         session_id: str | None = None
@@ -8277,20 +18601,101 @@ def create_app(state: ServerState) -> FastAPI:
             else CacheMissReason.NEW_SESSION.value
         )
         session_restore_mode = "background_bypass" if background else "cold"
+        session_cache_scope = _session_cache_scope_for_request(
+            state,
+            headers=headers,
+            metadata=metadata,
+        )
         policy_fingerprint = _policy_fingerprint(
             state,
             thinking_enabled=thinking_enabled,
             generation_mode=request_generation_mode,
-            depth=request_depth,
+            depth=effective_request_depth,
+            tools_active=tools_active,
+            tool_prompt_mode=tool_prompt_mode,
+            tool_choice=request.tool_choice,
+            no_tools_contract_active=no_tools_contract_active,
+            read_only_force_answer_contract_active=read_only_force_answer_contract_active,
+            pi_convergence_contract_active=pi_convergence_contract_active,
+            simple_chat_contract_active=opencode_simple_chat_contract_active,
+            opencode_prompt_contract_profile=opencode_prompt_contract_profile,
+            cache_scope=session_cache_scope,
+        )
+        postcommit_policy_fingerprint = policy_fingerprint
+        if read_only_force_answer_contract_active:
+            postcommit_policy_fingerprint = _policy_fingerprint(
+                state,
+                thinking_enabled=thinking_enabled,
+                generation_mode=request_generation_mode,
+                depth=effective_request_depth,
+                tools_active=bool(postcommit_tool_specs),
+                tool_prompt_mode=postcommit_tool_prompt_mode,
+                tool_choice=request.tool_choice,
+                no_tools_contract_active=False,
+                read_only_force_answer_contract_active=False,
+                pi_convergence_contract_active=False,
+                simple_chat_contract_active=opencode_simple_chat_contract_active,
+                opencode_prompt_contract_profile=opencode_prompt_contract_profile,
+                cache_scope=session_cache_scope,
+            )
+        session_restore_policy_fingerprint = (
+            postcommit_policy_fingerprint
+            if read_only_force_answer_contract_active
+            else policy_fingerprint
+        )
+        request_observability = _request_observability(
+            request,
+            headers=headers,
+            metadata=metadata,
+            session_source=session_source,
+            request_generation_mode=request_generation_mode,
+            request_depth=request_depth,
+        )
+        if read_only_force_answer_contract_active:
+            request_observability["request_session_restore_policy"] = (
+                "stable_without_transient_force_answer"
+            )
+            request_observability[
+                "request_session_restore_policy_matches_postcommit"
+            ] = bool(session_restore_policy_fingerprint == postcommit_policy_fingerprint)
+        opencode_tool_history_policy = (
+            _opencode_tool_history_restore_policy(
+                headers=headers,
+                metadata=metadata,
+                tool_result_history_present=tool_result_history_present,
+            )
+            if not background and not cache_bypass
+            else {
+                "eligible": False,
+                "cache_bypass": False,
+                "live_frontier_restore": False,
+                "force_clone_restore": False,
+            }
+        )
+        opencode_tool_history_cache_bypass = bool(
+            opencode_tool_history_policy["cache_bypass"]
+        )
+        opencode_tool_history_live_frontier_restore = bool(
+            opencode_tool_history_policy["live_frontier_restore"]
+        )
+        opencode_tool_history_force_clone_restore = bool(
+            opencode_tool_history_policy["force_clone_restore"]
         )
         if not background and not cache_bypass:
             requested_restore_mode = headers.get(
                 "x-mtplx-restore-mode", "reference_lease"
             )
             requested_restore_mode = requested_restore_mode.replace("-", "_")
+            if opencode_tool_history_live_frontier_restore:
+                requested_restore_mode = "reference_lease"
+            elif opencode_tool_history_force_clone_restore:
+                requested_restore_mode = "clone"
             session_restore_mode = (
                 "clone" if requested_restore_mode == "clone" else "reference_lease"
             )
+            if opencode_tool_history_cache_bypass:
+                cache_miss_reason = "opencode_tool_history_cache_bypass"
+                session_restore_mode = "opencode_tool_history_bypass"
             session_id, session_source = state.sessions.resolve_session_id(
                 headers=headers,
                 metadata=metadata,
@@ -8302,14 +18707,149 @@ def create_app(state: ServerState) -> FastAPI:
             session = state.sessions.get_or_create(session_id)
             session.last_cache_miss_reason = cache_miss_reason
             session.last_restore_mode = session_restore_mode
-        request_observability = _request_observability(
-            request,
-            headers=headers,
-            metadata=metadata,
-            session_source=session_source,
-            request_generation_mode=request_generation_mode,
-            request_depth=request_depth,
+        if requested_model:
+            request_observability["request_model"] = requested_model
+            request_observability["served_model_id"] = state.model_id
+            request_observability["request_model_matches_served_model"] = (
+                requested_model == state.model_id
+            )
+        server_reasoning_mode = getattr(state.args, "reasoning", None)
+        if server_reasoning_mode not in {"auto", "on", "off"}:
+            server_reasoning_mode = (
+                "on" if bool(getattr(state.args, "enable_thinking", True)) else "off"
+            )
+        request_observability["request_effective_mtp_depth"] = int(
+            effective_request_depth
         )
+        if not client_controls_allowed:
+            request_reasoning_mode = (
+                "off" if not thinking_enabled else server_reasoning_mode
+            )
+        elif request.enable_thinking is False:
+            request_reasoning_mode = "off"
+        elif request.enable_thinking is True and server_reasoning_mode == "auto":
+            request_reasoning_mode = "on"
+        else:
+            request_reasoning_mode = server_reasoning_mode
+        request_observability["request_reasoning_mode"] = request_reasoning_mode
+        request_observability["request_enable_thinking"] = bool(thinking_enabled)
+        request_observability["request_reasoning_effort"] = reasoning_effort
+        request_observability["request_enable_thinking_override"] = (
+            request.enable_thinking is not None and client_controls_allowed
+        )
+        request_observability["mtplx_control_owner"] = (
+            "client" if client_controls_allowed else "server"
+        )
+        request_observability["client_controls_allowed"] = bool(
+            client_controls_allowed
+        )
+        if not client_controls_allowed:
+            ignored_fields = _ignored_client_control_fields(request)
+            if ignored_fields:
+                request_observability["client_control_fields_ignored"] = (
+                    ignored_fields
+                )
+        request_observability["request_reasoning_parser"] = (
+            _reasoning_parser_for_state(state)
+        )
+        request_observability["request_read_only_inspection_force_answer"] = bool(
+            read_only_force_answer_contract_active
+        )
+        request_observability["request_read_only_inspection_tool_result_count"] = (
+            _tool_result_message_count(request.messages)
+        )
+        request_observability[
+            "request_read_only_inspection_force_answer_after_tools"
+        ] = _read_only_inspection_force_answer_after_tools()
+        request_observability["request_pi_convergence_contract"] = bool(
+            pi_convergence_contract_active
+        )
+        request_observability["request_pi_convergence_tool_result_count"] = (
+            _tool_result_message_count(request.messages)
+        )
+        request_observability["request_pi_convergence_after_tools"] = (
+            _pi_convergence_after_tools()
+        )
+        request_observability["opencode_simple_chat_contract_active"] = bool(
+            opencode_simple_chat_contract_active
+        )
+        request_observability["opencode_prompt_contract_profile"] = (
+            opencode_prompt_contract_profile or "none"
+        )
+        request_observability["backend_chat_policy_active"] = bool(
+            backend_chat_policy_active
+        )
+        request_observability["request_effective_message_count"] = len(
+            messages_for_generation
+        )
+        request_observability["request_effective_message_roles"] = [
+            message.role for message in messages_for_generation
+        ]
+        request_observability["request_effective_message_chars"] = [
+            len(_content_to_text(message.content))
+            for message in messages_for_generation
+        ]
+        request_observability["preserve_thinking"] = getattr(
+            state.args, "preserve_thinking", "auto"
+        )
+        request_observability["preserve_thinking_effective"] = (
+            _preserve_thinking_effective(state.args)
+        )
+        request_observability["strip_assistant_reasoning_history"] = bool(
+            state.args.strip_assistant_reasoning_history
+        )
+        request_observability["long_context_mtp_depth_policy"] = (
+            long_context_depth_policy
+        )
+        request_observability.update(
+            _bridge_policy_observability(
+                tools_active=tools_active,
+                tool_prompt_mode=template_tool_prompt_mode,
+                no_tools_contract_active=no_tools_contract_active,
+                read_only_force_answer_contract_active=read_only_force_answer_contract_active,
+                pi_convergence_contract_active=pi_convergence_contract_active,
+            )
+        )
+        request_observability.update(tool_prompt_mode_resolution)
+        request_observability["session_cache_scope"] = session_cache_scope
+        request_observability["opencode_tool_history_cache_bypass"] = bool(
+            opencode_tool_history_cache_bypass
+        )
+        request_observability["opencode_tool_history_force_clone_restore"] = bool(
+            opencode_tool_history_force_clone_restore
+        )
+        request_observability["opencode_tool_history_live_frontier_restore"] = bool(
+            opencode_tool_history_live_frontier_restore
+        )
+        requested_tool_names = list(request_observability.get("request_tool_names") or [])
+        filtered_tool_names = _tool_names(tool_specs) if tools_active else []
+        hidden_tool_names = [
+            name for name in requested_tool_names if name not in filtered_tool_names
+        ]
+        request_observability.update(
+            {
+                "request_filtered_tool_count": len(filtered_tool_names),
+                "request_filtered_tool_names": filtered_tool_names,
+                "request_hidden_tool_names": hidden_tool_names,
+                "request_tools_hidden_by_bridge": bool(hidden_tool_names),
+            }
+        )
+        chat_template_report = getattr(state, "chat_template_report", {}) or {}
+        request_observability.update(
+            {
+                "chat_template_profile": str(
+                    chat_template_report.get("profile")
+                    or getattr(state, "chat_template_profile", _CHAT_TEMPLATE_PROFILE_LOCAL)
+                ),
+                "chat_template_source": chat_template_report.get("source"),
+                "chat_template_path": chat_template_report.get("path"),
+                "chat_template_hash": state.template_hash,
+            }
+        )
+        request_observability["opencode_short_context_depth_policy"] = (
+            short_depth_policy
+        )
+        request_observability.update(transcript_stats.to_metrics())
         request_observability.update(template_observability)
         if template_observability.get("tool_template_fallback"):
             _record_tool_parse_event(state, event="tool_template_fallback")
@@ -8325,58 +18865,274 @@ def create_app(state: ServerState) -> FastAPI:
             session_id=session_id,
             tool_names=_tool_names(tool_specs) if tools_active else None,
         )
+        live_frontier_policy = "none"
+        if agent_transcript_tools_active:
+            live_frontier_policy = (
+                "live_reference_lease"
+                if session_keep_live_ref
+                else "snapshot_only"
+            )
+        if (
+            _is_opencode_client(headers=headers, metadata=metadata)
+            and agent_transcript_tools_active
+        ):
+            if _opencode_tool_history_live_frontier_enabled():
+                session_keep_live_ref = True
+                live_frontier_policy = "opencode_live_reference_lease"
+                request_observability["request_session_keep_live_ref_reason"] = (
+                    "opencode_tool_live_frontier"
+                )
+            else:
+                session_keep_live_ref = False
+                live_frontier_policy = "opencode_snapshot_only"
+                request_observability["request_session_keep_live_ref_reason"] = (
+                    "opencode_tool_snapshot_only"
+                )
         request_observability["request_session_keep_live_ref"] = bool(
             session_keep_live_ref
         )
+        request_observability["live_frontier_candidate"] = bool(
+            agent_transcript_tools_active
+        )
+        request_observability["live_frontier_result_turn"] = bool(
+            agent_transcript_tools_active and tool_result_history_present
+        )
+        request_observability["live_frontier_policy"] = live_frontier_policy
+        if agent_transcript_tools_active:
+            live_frontier_tool_call_ids = _tool_call_ids_from_messages(request.messages)
+            live_frontier_tool_result_ids = _tool_result_ids_from_messages(
+                request.messages
+            )
+            request_observability["live_frontier_assistant_tool_call_count"] = len(
+                live_frontier_tool_call_ids
+            )
+            request_observability["live_frontier_tool_result_count"] = len(
+                live_frontier_tool_result_ids
+            )
+            request_observability["live_frontier_unknown_tool_result_count"] = len(
+                live_frontier_tool_result_ids - live_frontier_tool_call_ids
+            )
+        session_bank_for_generation = (
+            None
+            if background or cache_bypass or opencode_tool_history_cache_bypass
+            else state.sessions.bank
+        )
+        request_observability["request_session_bank_bypass"] = (
+            session_bank_for_generation is None
+        )
+        commit_prompt_prefix = _commit_prompt_prefix_for_request(
+            state,
+            prompt_ids=prompt_ids,
+            tools_active=tools_active,
+        )
+        if read_only_force_answer_contract_active:
+            # The forced-answer contract is a transient generation aid. OpenCode
+            # will not echo it on the next turn, so caching it as a session
+            # prefix turns a real follow-up into a low-boundary cache hit.
+            commit_prompt_prefix = False
+        request_observability["request_commit_prompt_prefix"] = bool(
+            commit_prompt_prefix
+        )
+        sampler_temperature = request.temperature if client_controls_allowed else None
+        sampler_top_p = request.top_p if client_controls_allowed else None
+        sampler_top_k = request.top_k if client_controls_allowed else None
+        request_observability["request_temperature"] = request.temperature
+        request_observability["request_top_p"] = request.top_p
+        request_observability["request_top_k"] = request.top_k
+        ignored_sampler_fields = [
+            name
+            for name, value in (
+                ("temperature", request.temperature),
+                ("top_p", request.top_p),
+                ("top_k", request.top_k),
+            )
+            if value is not None and not client_controls_allowed
+        ]
+        if ignored_sampler_fields:
+            request_observability["client_sampler_fields_ignored"] = (
+                ignored_sampler_fields
+            )
+        request_draft_sampler = _opencode_default_sampler_override(
+            messages=messages_for_generation,
+            tools_active=tools_active,
+            request_temperature=request.temperature,
+            request_top_p=request.top_p,
+            request_top_k=request.top_k,
+            request_observability=request_observability,
+            default_temperature=getattr(state.args, "temperature", 0.6),
+            default_top_p=getattr(state.args, "top_p", 0.95),
+            default_top_k=getattr(state.args, "top_k", 20),
+        )
+        if request_draft_sampler is not None:
+            target_sampler_override = request_draft_sampler
+            sampler_temperature = target_sampler_override.temperature
+            sampler_top_p = target_sampler_override.top_p
+            sampler_top_k = target_sampler_override.top_k
+            launch_draft_sampler = _opencode_default_draft_sampler_for_request(
+                state,
+                request_observability,
+            )
+            request_draft_sampler = launch_draft_sampler or target_sampler_override
+            request_observability["draft_sampler_override"] = asdict(
+                request_draft_sampler
+            )
+        if sampler_temperature is None:
+            default_temperature = getattr(state.args, "temperature", None)
+            sampler_temperature = (
+                0.6 if default_temperature is None else default_temperature
+            )
+        if sampler_top_p is None:
+            default_top_p = getattr(state.args, "top_p", None)
+            sampler_top_p = 0.95 if default_top_p is None else default_top_p
+        if sampler_top_k is None:
+            default_top_k = getattr(state.args, "top_k", None)
+            sampler_top_k = 20 if default_top_k is None else default_top_k
+        request_observability["effective_temperature"] = float(sampler_temperature)
+        request_observability["effective_top_p"] = float(sampler_top_p)
+        request_observability["effective_top_k"] = int(sampler_top_k)
+        suppress_visible_reasoning = False
+        stop_sequences = _normalize_stop_sequences(request.stop)
+
+        def _nonstream_on_prefill(progress: dict[str, Any]) -> None:
+            _dashboard_publish_prefill(
+                state,
+                request_id=response_id,
+                session_id=session_id,
+                payload=progress,
+            )
+
+        nonstream_cancel_event = Event()
+        nonstream_completion_tokens = 0
+        nonstream_cancel_reason = "request_cancelled"
+        nonstream_client_disconnected = False
+        # Stop sequences are detected on the visible content channel as it
+        # decodes, so a match aborts generation immediately instead of
+        # burning tokens until EOS/max_tokens. Reasoning text never matches:
+        # OpenAI clients only ever receive content, so stop strings only
+        # apply there.
+        nonstream_stop_monitor: _StopSequenceStreamMonitor | None = None
+        nonstream_stop_decoder: _IncrementalTokenDecoder | None = None
+        nonstream_stop_splitter: Any = None
+        nonstream_stop_reasoning_chunks: list[str] = []
+        if stop_sequences and not request.stream:
+            nonstream_stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
+            nonstream_stop_decoder = _IncrementalTokenDecoder(
+                state.runtime.tokenizer
+            )
+            nonstream_stop_splitter = _stream_splitter_for_state(
+                state,
+                thinking_enabled=thinking_enabled,
+                recover_unclosed_reasoning_as_content=False,
+                start_inside_thinking=not aime_visible_working,
+            )
+
+        def attach_response_observability(generated: dict[str, Any]) -> dict[str, Any]:
+            stats = generated.setdefault("stats", {})
+            for key in (
+                "request_model",
+                "served_model_id",
+                "request_model_matches_served_model",
+            ):
+                if key in request_observability:
+                    stats.setdefault(key, request_observability[key])
+            return generated
+
+        def _nonstream_on_tokens(new_tokens: list[int]) -> None:
+            nonlocal nonstream_completion_tokens
+            nonstream_completion_tokens += len(new_tokens)
+            cancel_message = (
+                "client disconnected"
+                if nonstream_client_disconnected
+                else "request cancelled"
+            )
+            _raise_if_stream_cancelled(
+                nonstream_cancel_event, cancel_message
+            )
+            if nonstream_stop_monitor is not None:
+                delta = nonstream_stop_decoder.feed(
+                    [int(token) for token in new_tokens]
+                )
+                if not delta:
+                    return
+                for field, text in nonstream_stop_splitter.feed(delta):
+                    if not text:
+                        continue
+                    if field == "reasoning_content":
+                        nonstream_stop_reasoning_chunks.append(text)
+                        continue
+                    if field != "content":
+                        continue
+                    nonstream_stop_monitor.feed(text)
+                    if nonstream_stop_monitor.stopped:
+                        raise _StopSequenceHit(
+                            nonstream_stop_monitor.matched_stop or ""
+                        )
 
         def run_generation_for_response() -> dict[str, Any]:
             if session is None:
-                return _run_generation(
-                    state,
-                    prompt_ids,
-                    max_tokens=request_max_tokens,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    top_k=request.top_k,
-                    seed=request.seed,
-                    generation_mode=request_generation_mode,
-                    depth=request_depth,
-                    session_id=session_id,
-                    cache_miss_reason=cache_miss_reason,
-                    session_restore_mode=session_restore_mode,
-                    session_bank=None
-                    if background or cache_bypass
-                    else state.sessions.bank,
-                    session_template_hash=state.template_hash,
-                    session_draft_head_identity=state.draft_head_identity,
-                    session_policy_fingerprint=policy_fingerprint,
-                    background_request=background,
-                    commit_prompt_prefix_to_bank=tools_active,
-                    session_keep_live_ref=session_keep_live_ref,
-                    request_observability=request_observability,
+                return attach_response_observability(
+                    _run_generation_dispatched(
+                        state,
+                        prompt_ids,
+                        batch_key="chat.nonstream",
+                        response_id=response_id,
+                        max_tokens=request_max_tokens,
+                        temperature=sampler_temperature,
+                        top_p=sampler_top_p,
+                        top_k=sampler_top_k,
+                        seed=request.seed,
+                        draft_sampler=request_draft_sampler,
+                        generation_mode=request_generation_mode,
+                        depth=request_depth,
+                        resolved_mtp_depth=effective_request_depth,
+                        session_id=session_id,
+                        cache_miss_reason=cache_miss_reason,
+                        session_restore_mode=session_restore_mode,
+                        session_bank=session_bank_for_generation,
+                        session_template_hash=state.template_hash,
+                        session_draft_head_identity=state.draft_head_identity,
+                        session_policy_fingerprint=session_restore_policy_fingerprint,
+                        background_request=background,
+                        commit_prompt_prefix_to_bank=commit_prompt_prefix,
+                        session_keep_live_ref=session_keep_live_ref,
+                        request_observability=request_observability,
+                        token_callback=_nonstream_on_tokens,
+                        prefill_callback=_nonstream_on_prefill,
+                        cancel_event=nonstream_cancel_event,
+                        streaming_response=False,
+                    )
                 )
             with session.in_flight_generation():
-                generated_result = _run_generation(
+                generated_result = _run_generation_dispatched(
                     state,
                     prompt_ids,
+                    batch_key="chat.nonstream",
+                    response_id=response_id,
                     max_tokens=request_max_tokens,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    top_k=request.top_k,
+                    temperature=sampler_temperature,
+                    top_p=sampler_top_p,
+                    top_k=sampler_top_k,
                     seed=request.seed,
+                    draft_sampler=request_draft_sampler,
                     generation_mode=request_generation_mode,
                     depth=request_depth,
+                    resolved_mtp_depth=effective_request_depth,
                     session_id=session_id,
                     cache_miss_reason=cache_miss_reason,
                     session_restore_mode=session_restore_mode,
-                    session_bank=state.sessions.bank,
+                    session_bank=session_bank_for_generation,
                     session_template_hash=state.template_hash,
                     session_draft_head_identity=state.draft_head_identity,
-                    session_policy_fingerprint=policy_fingerprint,
-                    commit_prompt_prefix_to_bank=tools_active,
+                    session_policy_fingerprint=session_restore_policy_fingerprint,
+                    commit_prompt_prefix_to_bank=commit_prompt_prefix,
                     session_keep_live_ref=session_keep_live_ref,
                     request_observability=request_observability,
+                    token_callback=_nonstream_on_tokens,
+                    prefill_callback=_nonstream_on_prefill,
+                    cancel_event=nonstream_cancel_event,
+                    streaming_response=False,
                 )
+                generated_result = attach_response_observability(generated_result)
                 session.commit(
                     prompt_ids=prompt_ids,
                     generated_ids=generated_result["tokens"],
@@ -8398,11 +19154,13 @@ def create_app(state: ServerState) -> FastAPI:
                 state,
                 prompt_ids=prompt_ids,
                 generated=generated,
-                messages=request.messages,
+                messages=raw_messages_for_postcommit,
                 assistant_content=assistant_content,
                 assistant_tool_calls=assistant_tool_calls,
                 thinking_enabled=thinking_enabled,
-                tool_specs=tool_specs if tools_active else None,
+                tool_specs=postcommit_tool_specs,
+                tool_prompt_mode=postcommit_tool_prompt_mode,
+                strip_tool_call_preamble_text=opencode_client,
             )
             if compatibility.get("safe"):
                 generated["stats"]["session_postcommit_snapshot"] = {
@@ -8421,6 +19179,7 @@ def create_app(state: ServerState) -> FastAPI:
                 generated.get("stats", {}).get("generation_mode") or ""
             )
             skipped = _skipped_idle_postcommit_snapshot(
+                state=state,
                 unsafe_reason=unsafe_reason,
                 assistant_tool_calls=assistant_tool_calls,
                 prompt_prefix_len=len(prompt_ids),
@@ -8430,25 +19189,23 @@ def create_app(state: ServerState) -> FastAPI:
                     _attach_skipped_postcommit_cleanup(state, skipped)
                 )
                 return
-            if (
-                stream_response
-                and state.args.session_postcommit_mode == "async"
-                and generated_mode != "ar"
-            ):
+            if state.args.session_postcommit_mode == "async" and generated_mode != "ar":
                 generated["stats"]["session_postcommit_snapshot"] = (
                     _schedule_idle_postcommit_snapshot(
                         state,
                         session_id=session_id,
-                        messages=request.messages,
+                        messages=raw_messages_for_postcommit,
                         assistant_content=assistant_content,
                         assistant_tool_calls=assistant_tool_calls,
                         thinking_enabled=thinking_enabled,
-                        policy_fingerprint=policy_fingerprint,
+                        policy_fingerprint=postcommit_policy_fingerprint,
                         unsafe_reason=unsafe_reason,
-                        tool_specs=tool_specs if tools_active else None,
+                        tool_specs=postcommit_tool_specs,
                         session=session,
                         expected_session_revision=getattr(session, "revision", None),
                         keep_live_ref=session_keep_live_ref,
+                        tool_prompt_mode=postcommit_tool_prompt_mode,
+                        strip_tool_call_preamble_text=opencode_client,
                     )
                 )
                 return
@@ -8458,13 +19215,15 @@ def create_app(state: ServerState) -> FastAPI:
                     lambda: _store_retokenized_history_snapshot(
                         state,
                         session_id=session_id,
-                        messages=request.messages,
+                        messages=raw_messages_for_postcommit,
                         assistant_content=assistant_content,
                         assistant_tool_calls=assistant_tool_calls,
                         thinking_enabled=thinking_enabled,
-                        policy_fingerprint=policy_fingerprint,
-                        tool_specs=tool_specs if tools_active else None,
+                        policy_fingerprint=postcommit_policy_fingerprint,
+                        tool_specs=postcommit_tool_specs,
                         keep_live_ref=session_keep_live_ref,
+                        tool_prompt_mode=postcommit_tool_prompt_mode,
+                        strip_tool_call_preamble_text=opencode_client,
                     ),
                     batch_key=f"postcommit.inline:{session_id or 'stateless'}",
                 ),
@@ -8489,7 +19248,7 @@ def create_app(state: ServerState) -> FastAPI:
                 and not _server_console_enabled(state)
             ):
                 try:
-                    print(
+                    _safe_stdout_print(
                         "[mtplx] postcommit-wait "
                         + json.dumps(
                             {
@@ -8498,8 +19257,7 @@ def create_app(state: ServerState) -> FastAPI:
                             },
                             sort_keys=True,
                             default=str,
-                        ),
-                        flush=True,
+                        )
                     )
                 except BaseException:
                     pass
@@ -8534,16 +19292,84 @@ def create_app(state: ServerState) -> FastAPI:
 
                 queue: Queue[tuple[str, Any]] = Queue()
                 cancel_event = Event()
+                # Register this request in the dashboard's in-flight registry
+                # so external cancel (`POST /v1/mtplx/cancel/{id}`) can flip
+                # the same per-request cancel_event the worker already checks.
+                # Deregistered in the stream's `finally`.
+                in_flight_handle = InFlightHandle(
+                    request_id=response_id,
+                    cancel_event=cancel_event,
+                    started_s=time.time(),
+                    session_id=session_id,
+                    model=model,
+                    prompt_preview=_dashboard_prompt_preview(
+                        request, state.runtime.tokenizer
+                    ),
+                    prompt_tokens=len(prompt_ids),
+                )
+                state.dashboard.in_flight.register(in_flight_handle)
                 decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
-                splitter = _ThinkingContentStreamSplitter(
-                    thinking_enabled=thinking_enabled
+                splitter = _stream_splitter_for_state(
+                    state,
+                    thinking_enabled=thinking_enabled,
+                    recover_unclosed_reasoning_as_content=False,
+                    start_inside_thinking=not aime_visible_working,
                 )
+                # Client stop sequences gate the visible content channel.
+                # Forced final-answer turns own their visibility through the
+                # buffered marker path, so they bypass stop monitoring (the
+                # combination is an internal agent contract, not a client
+                # completion surface).
+                stop_monitor: _StopSequenceStreamMonitor | None = (
+                    _StopSequenceStreamMonitor(stop_sequences)
+                    if stop_sequences
+                    and not read_only_force_answer_contract_active
+                    else None
+                )
+                stop_sequence_cancel_fired = False
+
+                def fire_stop_sequence_cancel() -> None:
+                    nonlocal stop_sequence_cancel_fired
+                    if stop_sequence_cancel_fired:
+                        return
+                    stop_sequence_cancel_fired = True
+                    _cancel_stream_generation(cancel_event, generation_future)
+
                 stream_interval = max(1, int(state.args.stream_interval))
-                tool_stream = _ToolAwareContentStreamTranslator(
-                    tools=tool_specs if tools_active else [],
-                    argument_chunk_chars=stream_interval,
-                    tokenizer=state.runtime.tokenizer,
+                content_tool_translator = (
+                    _ToolAwareContentStreamTranslator(
+                        tools=tool_specs,
+                        argument_chunk_chars=stream_interval,
+                        tokenizer=state.runtime.tokenizer,
+                        repair_unclosed_complete=(
+                            str(raw_request.url.path or "") != "/v1/messages"
+                        ),
+                    )
+                    # Forced final-answer turns stream sanitized visible text
+                    # through the buffered marker path; the tool-call
+                    # translator must not interleave with that buffer even
+                    # when read-only tools remain active for the template.
+                    if tools_active and not read_only_force_answer_contract_active
+                    else None
                 )
+                stream_client_hint = str(
+                    request_observability.get("request_client_hint") or ""
+                ).lower()
+                single_tool_call_stream = (
+                    "pi" in stream_client_hint
+                    or (
+                        "opencode" in stream_client_hint
+                        and _request_explicit_single_tool_then_answer(
+                            messages_for_generation
+                        )
+                    )
+                )
+                orphan_stream_guard_enabled = bool(
+                    tools_active and tool_result_history_present
+                )
+                orphan_reasoning_stream_guard = _InitialOrphanToolControlStreamGuard()
+                orphan_content_stream_guard = _InitialOrphanToolControlStreamGuard()
+                stream_orphan_tool_markup_suppressed = False
                 pending_stream_tokens: list[int] = []
                 commit_event = Event()
                 commit_state = {
@@ -8556,70 +19382,806 @@ def create_app(state: ServerState) -> FastAPI:
 
                 def on_tokens(new_tokens: list[int]) -> None:
                     _raise_if_stream_cancelled(cancel_event)
+                    int_tokens = [int(token) for token in new_tokens]
                     queue.put(
                         (
                             "tokens",
                             {
-                                "tokens": list(new_tokens),
+                                "tokens": list(int_tokens),
                                 "timestamp_s": time.perf_counter(),
                             },
                         )
                     )
                     _raise_if_stream_cancelled(cancel_event)
 
+                def on_prefill(progress: dict[str, Any]) -> None:
+                    # Runs on the generation thread. Safe to call from any
+                    # thread because _dashboard_publish_prefill uses the
+                    # bus's loop.call_soon_threadsafe delivery.
+                    _dashboard_publish_prefill(
+                        state,
+                        request_id=response_id,
+                        session_id=session_id,
+                        payload=progress,
+                    )
+
+                def maybe_retry_degenerate_read_only_inspection(
+                    generated: dict[str, Any],
+                ) -> dict[str, Any]:
+                    if (
+                        not tools_active
+                        or not read_only_inspection_request
+                        or not tool_result_history_present
+                        or request.seed is not None
+                    ):
+                        return generated
+                    first_text = _strip_generated_chat_template_sentinels(
+                        str(generated.get("text") or "")
+                    )
+                    if first_text.strip():
+                        return generated
+                    first_completion_tokens = int(
+                        generated.get("completion_tokens") or 0
+                    )
+                    if first_completion_tokens > 4:
+                        return generated
+                    first_stats = dict(generated.get("stats") or {})
+                    retry_observability = dict(request_observability)
+                    retry_observability.update(
+                        {
+                            "inspection_empty_retry_attempted": True,
+                            "inspection_empty_retry_reason": (
+                                "empty_tool_fed_read_only_inspection"
+                            ),
+                            "inspection_empty_retry_first_completion_tokens": (
+                                first_completion_tokens
+                            ),
+                            "inspection_empty_retry_first_decode_tok_s": first_stats.get(
+                                "decode_tok_s"
+                            ),
+                        }
+                    )
+                    retry_generated = _run_generation_dispatched(
+                        state,
+                        prompt_ids,
+                        batch_key="chat.stream.inspection_empty_retry",
+                        response_id=response_id,
+                        max_tokens=request_max_tokens,
+                        temperature=sampler_temperature,
+                        top_p=sampler_top_p,
+                        top_k=sampler_top_k,
+                        seed=None,
+                        draft_sampler=request_draft_sampler,
+                        generation_mode=request_generation_mode,
+                        depth=request_depth,
+                        resolved_mtp_depth=effective_request_depth,
+                        token_callback=on_tokens,
+                        session_id=session_id,
+                        cache_miss_reason=cache_miss_reason,
+                        session_restore_mode=session_restore_mode,
+                        session_bank=session_bank_for_generation,
+                        session_template_hash=state.template_hash,
+                        session_draft_head_identity=state.draft_head_identity,
+                        session_policy_fingerprint=session_restore_policy_fingerprint,
+                        background_request=background,
+                        commit_final_state_to_bank=False,
+                        commit_prompt_prefix_to_bank=commit_prompt_prefix,
+                        session_keep_live_ref=session_keep_live_ref,
+                        request_observability=retry_observability,
+                        prefill_callback=on_prefill,
+                        cancel_event=cancel_event,
+                    )
+                    retry_text = _strip_generated_chat_template_sentinels(
+                        str(retry_generated.get("text") or "")
+                    )
+                    retry_stats = retry_generated.setdefault("stats", {})
+                    retry_stats.update(retry_observability)
+                    retry_succeeded = bool(retry_text.strip())
+                    retry_stats["inspection_empty_retry_succeeded"] = retry_succeeded
+                    if state.last_metrics:
+                        state.last_metrics[-1].update(
+                            {
+                                "inspection_empty_retry_attempted": True,
+                                "inspection_empty_retry_succeeded": retry_succeeded,
+                                "inspection_empty_retry_reason": (
+                                    "empty_tool_fed_read_only_inspection"
+                                ),
+                                "inspection_empty_retry_first_completion_tokens": (
+                                    first_completion_tokens
+                                ),
+                                "inspection_empty_retry_first_decode_tok_s": (
+                                    first_stats.get("decode_tok_s")
+                                ),
+                            }
+                        )
+                    return retry_generated
+
+                def maybe_retry_degenerate_tool_fed_empty_completion(
+                    generated: dict[str, Any],
+                ) -> dict[str, Any]:
+                    if (
+                        not tools_active
+                        or read_only_inspection_request
+                        or not tool_result_history_present
+                        or request.seed is not None
+                    ):
+                        return generated
+                    first_text = _strip_mtplx_internal_continuation_markers(
+                        _strip_generated_chat_template_sentinels(
+                            str(generated.get("text") or "")
+                        )
+                    )
+                    retry_reason = _tool_fed_degenerate_completion_reason(first_text)
+                    if retry_reason is None:
+                        return generated
+                    first_stats = dict(generated.get("stats") or {})
+                    repair_messages = list(messages_for_generation)
+                    repair_messages.append(
+                        ChatMessage(
+                            role="user",
+                            content=(
+                                "Complete the active coding task now. Your previous "
+                                "assistant turn ended with an empty or orphaned "
+                                "tool-control response after tool results. Answer "
+                                "with concrete final results, including files "
+                                "changed, checks run, and any remaining caveats. "
+                                "If more work is truly needed, emit exactly one "
+                                "declared tool call. Do not return raw tool markup "
+                                "or an empty response."
+                            ),
+                        )
+                    )
+                    repair_observability: dict[str, Any] = {}
+                    repair_prompt_ids = _encode_messages(
+                        state.runtime.tokenizer,
+                        repair_messages,
+                        enable_thinking=thinking_enabled,
+                        reasoning_effort=reasoning_effort,
+                        strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+                        tools=tool_specs,
+                        tool_prompt_mode=tool_prompt_mode,
+                        template_observability=repair_observability,
+                    )
+                    retry_observability = dict(request_observability)
+                    retry_observability.update(
+                        {
+                            "tool_fed_empty_retry_attempted": True,
+                            "tool_fed_empty_retry_reason": retry_reason,
+                            "tool_fed_empty_retry_first_completion_tokens": int(
+                                generated.get("completion_tokens") or 0
+                            ),
+                            "tool_fed_empty_retry_first_decode_tok_s": first_stats.get(
+                                "decode_tok_s"
+                            ),
+                            "tool_fed_empty_retry_prompt_tokens": len(
+                                repair_prompt_ids
+                            ),
+                        }
+                    )
+                    queue.put(("reset_orphan_stream_guards", None))
+                    retry_generated = _run_generation_dispatched(
+                        state,
+                        repair_prompt_ids,
+                        batch_key="chat.stream.tool_fed_empty_retry",
+                        response_id=response_id,
+                        max_tokens=request_max_tokens,
+                        temperature=sampler_temperature,
+                        top_p=sampler_top_p,
+                        top_k=sampler_top_k,
+                        seed=None,
+                        draft_sampler=request_draft_sampler,
+                        generation_mode=request_generation_mode,
+                        depth=request_depth,
+                        resolved_mtp_depth=effective_request_depth,
+                        token_callback=on_tokens,
+                        session_id=session_id,
+                        cache_miss_reason=cache_miss_reason,
+                        session_restore_mode=session_restore_mode,
+                        session_bank=session_bank_for_generation,
+                        session_template_hash=state.template_hash,
+                        session_draft_head_identity=state.draft_head_identity,
+                        session_policy_fingerprint=session_restore_policy_fingerprint,
+                        background_request=background,
+                        commit_final_state_to_bank=False,
+                        commit_prompt_prefix_to_bank=commit_prompt_prefix,
+                        session_keep_live_ref=session_keep_live_ref,
+                        request_observability=retry_observability,
+                        prefill_callback=on_prefill,
+                        cancel_event=cancel_event,
+                    )
+                    retry_text = _strip_mtplx_internal_continuation_markers(
+                        _strip_generated_chat_template_sentinels(
+                            str(retry_generated.get("text") or "")
+                        )
+                    )
+                    retry_stats = retry_generated.setdefault("stats", {})
+                    retry_stats.update(retry_observability)
+                    retry_succeeded = bool(retry_text.strip())
+                    retry_stats["tool_fed_empty_retry_succeeded"] = retry_succeeded
+                    retry_stats["tool_fed_empty_retry_completion_tokens"] = int(
+                        retry_generated.get("completion_tokens") or 0
+                    )
+                    retry_stats["tool_fed_empty_retry_finish_reason"] = str(
+                        retry_generated.get("finish_reason") or "stop"
+                    )
+                    if state.last_metrics:
+                        state.last_metrics[-1].update(
+                            {
+                                "tool_fed_empty_retry_attempted": True,
+                                "tool_fed_empty_retry_succeeded": retry_succeeded,
+                                "tool_fed_empty_retry_reason": retry_reason,
+                                "tool_fed_empty_retry_first_completion_tokens": int(
+                                    generated.get("completion_tokens") or 0
+                                ),
+                                "tool_fed_empty_retry_first_decode_tok_s": first_stats.get(
+                                    "decode_tok_s"
+                                ),
+                                "tool_fed_empty_retry_prompt_tokens": len(
+                                    repair_prompt_ids
+                                ),
+                            }
+                        )
+                    return retry_generated
+
+                def maybe_repair_tool_fed_reasoning_only_completion(
+                    generated: dict[str, Any],
+                ) -> dict[str, Any]:
+                    if (
+                        not tools_active
+                        or not tool_result_history_present
+                        or not thinking_enabled
+                        or request.seed is not None
+                        or _reasoning_parser_for_state(state) not in {"qwen3", "step3p5"}
+                        # Forced final-answer turns intentionally rehearse
+                        # before the visible marker; the buffered marker
+                        # stream owns visibility, so a reasoning-shaped first
+                        # pass is expected and must not trigger a raw retry.
+                        or read_only_force_answer_contract_active
+                    ):
+                        return generated
+                    first_text = _strip_mtplx_internal_continuation_markers(
+                        _strip_generated_chat_template_sentinels(
+                            str(generated.get("text") or "")
+                        )
+                    )
+                    if not first_text.strip():
+                        return generated
+                    raw_reasoning_text, raw_content_text = _tool_extraction_text_parts(
+                        state,
+                        first_text,
+                        thinking_enabled=thinking_enabled,
+                    )
+                    extraction = omlx_extract_tool_calls_with_thinking(
+                        raw_reasoning_text,
+                        raw_content_text,
+                        state.runtime.tokenizer,
+                        tool_specs,
+                    )
+                    if extraction.tool_calls:
+                        return generated
+                    reasoning_text, answer_text = _split_backend_reasoning_for_state(
+                        state,
+                        first_text,
+                        thinking_enabled=thinking_enabled,
+                    )
+                    if not _reasoning_completion_repair_needed(
+                        thinking_enabled=thinking_enabled,
+                        reasoning_text=reasoning_text,
+                        answer_text=answer_text,
+                        assistant_tool_calls=None,
+                    ):
+                        return generated
+                    first_stats = dict(generated.get("stats") or {})
+                    repair_prompt_ids = _reasoning_completion_repair_prompt_ids(
+                        state.runtime.tokenizer,
+                        prompt_ids,
+                        [int(token) for token in generated.get("tokens") or []],
+                    )
+                    retry_observability = dict(request_observability)
+                    retry_observability.update(
+                        {
+                            "reasoning_completion_repair_attempted": True,
+                            "reasoning_completion_repair_reason": (
+                                "tool_fed_reasoning_only_completion"
+                            ),
+                            "reasoning_completion_repair_first_completion_tokens": int(
+                                generated.get("completion_tokens") or 0
+                            ),
+                            "reasoning_completion_repair_first_decode_tok_s": first_stats.get(
+                                "decode_tok_s"
+                            ),
+                            "reasoning_completion_repair_prompt_tokens": len(
+                                repair_prompt_ids
+                            ),
+                        }
+                    )
+                    queue.put(("close_unclosed_reasoning_for_repair", None))
+                    retry_generated = _run_generation_dispatched(
+                        state,
+                        repair_prompt_ids,
+                        batch_key="chat.stream.reasoning_completion_repair",
+                        response_id=response_id,
+                        max_tokens=request_max_tokens,
+                        temperature=sampler_temperature,
+                        top_p=sampler_top_p,
+                        top_k=sampler_top_k,
+                        seed=None,
+                        draft_sampler=request_draft_sampler,
+                        generation_mode=request_generation_mode,
+                        depth=request_depth,
+                        resolved_mtp_depth=effective_request_depth,
+                        token_callback=on_tokens,
+                        session_id=session_id,
+                        cache_miss_reason=cache_miss_reason,
+                        session_restore_mode=session_restore_mode,
+                        session_bank=session_bank_for_generation,
+                        session_template_hash=state.template_hash,
+                        session_draft_head_identity=state.draft_head_identity,
+                        session_policy_fingerprint=session_restore_policy_fingerprint,
+                        background_request=background,
+                        commit_final_state_to_bank=False,
+                        commit_prompt_prefix_to_bank=False,
+                        session_keep_live_ref=session_keep_live_ref,
+                        request_observability=retry_observability,
+                        prefill_callback=on_prefill,
+                        cancel_event=cancel_event,
+                    )
+                    retry_text = _strip_mtplx_internal_continuation_markers(
+                        _strip_generated_chat_template_sentinels(
+                            str(retry_generated.get("text") or "")
+                        )
+                    )
+                    retry_reasoning, retry_content = _tool_extraction_text_parts(
+                        state,
+                        retry_text,
+                        thinking_enabled=thinking_enabled,
+                    )
+                    retry_extraction = omlx_extract_tool_calls_with_thinking(
+                        retry_reasoning,
+                        retry_content,
+                        state.runtime.tokenizer,
+                        tool_specs,
+                    )
+                    retry_visible_text = _clean_generated_assistant_text(
+                        retry_content or retry_text
+                    ).strip()
+                    retry_stats = retry_generated.setdefault("stats", {})
+                    retry_stats.update(retry_observability)
+                    retry_succeeded = bool(
+                        retry_extraction.tool_calls
+                    ) or bool(retry_visible_text)
+                    retry_stats["reasoning_completion_repair_succeeded"] = (
+                        retry_succeeded
+                    )
+                    retry_stats["reasoning_completion_repair_completion_tokens"] = int(
+                        retry_generated.get("completion_tokens") or 0
+                    )
+                    retry_stats["reasoning_completion_repair_finish_reason"] = str(
+                        retry_generated.get("finish_reason") or "stop"
+                    )
+                    retry_stats["reasoning_completion_repair_decode_tok_s"] = (
+                        retry_stats.get("decode_tok_s")
+                    )
+                    if state.last_metrics:
+                        state.last_metrics[-1].update(
+                            {
+                                "reasoning_completion_repair_attempted": True,
+                                "reasoning_completion_repair_succeeded": (
+                                    retry_succeeded
+                                ),
+                                "reasoning_completion_repair_reason": (
+                                    "tool_fed_reasoning_only_completion"
+                                ),
+                                "reasoning_completion_repair_first_completion_tokens": int(
+                                    generated.get("completion_tokens") or 0
+                                ),
+                                "reasoning_completion_repair_first_decode_tok_s": (
+                                    first_stats.get("decode_tok_s")
+                                ),
+                                "reasoning_completion_repair_prompt_tokens": len(
+                                    repair_prompt_ids
+                                ),
+                            }
+                        )
+                    return retry_generated
+
+                def maybe_retry_stalled_agent_tool_promise(
+                    generated: dict[str, Any],
+                ) -> dict[str, Any]:
+                    if (
+                        not tools_active
+                        or not tool_result_history_present
+                        or request.seed is not None
+                    ):
+                        return generated
+                    raw_text = _strip_mtplx_internal_continuation_markers(
+                        _strip_generated_chat_template_sentinels(
+                            str(generated.get("text") or "")
+                        )
+                    )
+                    if not raw_text.strip():
+                        return generated
+                    raw_reasoning_text, raw_content_text = _tool_extraction_text_parts(
+                        state,
+                        raw_text,
+                        thinking_enabled=thinking_enabled,
+                    )
+                    extraction = omlx_extract_tool_calls_with_thinking(
+                        raw_reasoning_text,
+                        raw_content_text,
+                        state.runtime.tokenizer,
+                        tool_specs,
+                    )
+                    if extraction.tool_calls:
+                        return generated
+                    visible_candidate = "\n\n".join(
+                        part.strip()
+                        for part in (raw_reasoning_text, raw_content_text)
+                        if part and part.strip()
+                    ) or raw_text
+                    if not _looks_like_stalled_agent_tool_promise(visible_candidate):
+                        return generated
+
+                    repair_messages = list(messages_for_generation)
+                    repair_messages.append(
+                        ChatMessage(
+                            role="user",
+                            content=(
+                                "Continue the active coding task now. Your previous "
+                                "draft ended by promising to inspect, run, edit, or "
+                                "check more work, but it did not include a tool call. "
+                                "If more work is needed, emit exactly one declared "
+                                "tool call now. If no more tool is needed, answer "
+                                "with concrete final results. Do not say \"let me\" "
+                                "and do not quote MTPLX internal notes."
+                            ),
+                        )
+                    )
+                    repair_observability: dict[str, Any] = {}
+                    repair_prompt_ids = _encode_messages(
+                        state.runtime.tokenizer,
+                        repair_messages,
+                        enable_thinking=thinking_enabled,
+                        reasoning_effort=reasoning_effort,
+                        strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+                        tools=tool_specs,
+                        tool_prompt_mode=tool_prompt_mode,
+                        template_observability=repair_observability,
+                    )
+                    first_stats = dict(generated.get("stats") or {})
+                    retry_observability = dict(request_observability)
+                    retry_observability.update(
+                        {
+                            "stalled_agent_retry_attempted": True,
+                            "stalled_agent_retry_reason": "tool_promise_without_tool_call",
+                            "stalled_agent_retry_first_completion_tokens": int(
+                                generated.get("completion_tokens") or 0
+                            ),
+                            "stalled_agent_retry_first_decode_tok_s": first_stats.get(
+                                "decode_tok_s"
+                            ),
+                            "stalled_agent_retry_prompt_tokens": len(
+                                repair_prompt_ids
+                            ),
+                        }
+                    )
+                    retry_generated = _run_generation_dispatched(
+                        state,
+                        repair_prompt_ids,
+                        batch_key="chat.stream.stalled_agent_retry",
+                        response_id=response_id,
+                        max_tokens=request_max_tokens,
+                        temperature=sampler_temperature,
+                        top_p=sampler_top_p,
+                        top_k=sampler_top_k,
+                        seed=None,
+                        draft_sampler=request_draft_sampler,
+                        generation_mode=request_generation_mode,
+                        depth=request_depth,
+                        resolved_mtp_depth=effective_request_depth,
+                        token_callback=on_tokens,
+                        session_id=session_id,
+                        cache_miss_reason=cache_miss_reason,
+                        session_restore_mode=session_restore_mode,
+                        session_bank=session_bank_for_generation,
+                        session_template_hash=state.template_hash,
+                        session_draft_head_identity=state.draft_head_identity,
+                        session_policy_fingerprint=session_restore_policy_fingerprint,
+                        background_request=background,
+                        commit_final_state_to_bank=False,
+                        commit_prompt_prefix_to_bank=commit_prompt_prefix,
+                        session_keep_live_ref=session_keep_live_ref,
+                        request_observability=retry_observability,
+                        prefill_callback=on_prefill,
+                        cancel_event=cancel_event,
+                    )
+                    retry_text = _strip_mtplx_internal_continuation_markers(
+                        _strip_generated_chat_template_sentinels(
+                            str(retry_generated.get("text") or "")
+                        )
+                    )
+                    retry_reasoning, retry_content = _tool_extraction_text_parts(
+                        state,
+                        retry_text,
+                        thinking_enabled=thinking_enabled,
+                    )
+                    retry_extraction = omlx_extract_tool_calls_with_thinking(
+                        retry_reasoning,
+                        retry_content,
+                        state.runtime.tokenizer,
+                        tool_specs,
+                    )
+                    retry_stats = retry_generated.setdefault("stats", {})
+                    retry_stats.update(retry_observability)
+                    retry_succeeded = bool(
+                        retry_extraction.tool_calls
+                    ) or not _looks_like_stalled_agent_tool_promise(retry_text)
+                    retry_stats["stalled_agent_retry_succeeded"] = retry_succeeded
+                    retry_stats["stalled_agent_retry_completion_tokens"] = int(
+                        retry_generated.get("completion_tokens") or 0
+                    )
+                    retry_stats["stalled_agent_retry_finish_reason"] = str(
+                        retry_generated.get("finish_reason") or "stop"
+                    )
+                    if state.last_metrics:
+                        state.last_metrics[-1].update(
+                            {
+                                "stalled_agent_retry_attempted": True,
+                                "stalled_agent_retry_succeeded": retry_succeeded,
+                                "stalled_agent_retry_reason": (
+                                    "tool_promise_without_tool_call"
+                                ),
+                                "stalled_agent_retry_first_completion_tokens": int(
+                                    generated.get("completion_tokens") or 0
+                                ),
+                                "stalled_agent_retry_first_decode_tok_s": first_stats.get(
+                                    "decode_tok_s"
+                                ),
+                                "stalled_agent_retry_prompt_tokens": len(
+                                    repair_prompt_ids
+                                ),
+                            }
+                        )
+                    return retry_generated
+
+                def maybe_retry_read_only_force_answer(
+                    generated: dict[str, Any],
+                ) -> dict[str, Any]:
+                    if (
+                        not read_only_force_answer_contract_active
+                        or request.seed is not None
+                    ):
+                        return generated
+                    raw_text = _strip_mtplx_internal_continuation_markers(
+                        _strip_generated_chat_template_sentinels(
+                            str(generated.get("text") or "")
+                        )
+                    )
+                    if not raw_text.strip():
+                        return generated
+                    raw_reasoning_text, raw_content_text = _tool_extraction_text_parts(
+                        state,
+                        raw_text,
+                        thinking_enabled=thinking_enabled,
+                    )
+                    visible_candidate = "\n\n".join(
+                        part.strip()
+                        for part in (raw_reasoning_text, raw_content_text)
+                        if part and part.strip()
+                    ) or raw_text
+                    if not _looks_like_read_only_force_answer_failure(
+                        visible_candidate
+                    ):
+                        return generated
+
+                    repair_messages = list(messages_for_generation)
+                    repair_messages.append(
+                        ChatMessage(
+                            role="user",
+                            content=(
+                                "Answer now. Tools are closed for this read-only "
+                                "inspection. Do not read, check, inspect, run, or "
+                                "request more files. Do not emit tool calls, tool "
+                                "names, protocol tags, or filePath/startLine/"
+                                "endingLine markup. Provide the requested final "
+                                "answer from the evidence already gathered, "
+                                "including the requested number of items and marker."
+                            ),
+                        )
+                    )
+                    repair_observability: dict[str, Any] = {}
+                    repair_prompt_ids = _encode_messages(
+                        state.runtime.tokenizer,
+                        repair_messages,
+                        enable_thinking=thinking_enabled,
+                        reasoning_effort=reasoning_effort,
+                        strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+                        tools=None,
+                        tool_prompt_mode=tool_prompt_mode,
+                        template_observability=repair_observability,
+                    )
+                    first_stats = dict(generated.get("stats") or {})
+                    retry_observability = dict(request_observability)
+                    retry_observability.update(
+                        {
+                            "read_only_force_answer_retry_attempted": True,
+                            "read_only_force_answer_retry_reason": (
+                                "toolish_draft_after_tools_closed"
+                            ),
+                            "read_only_force_answer_retry_first_completion_tokens": int(
+                                generated.get("completion_tokens") or 0
+                            ),
+                            "read_only_force_answer_retry_first_decode_tok_s": (
+                                first_stats.get("decode_tok_s")
+                            ),
+                            "read_only_force_answer_retry_prompt_tokens": len(
+                                repair_prompt_ids
+                            ),
+                        }
+                    )
+                    retry_generated = _run_generation_dispatched(
+                        state,
+                        repair_prompt_ids,
+                        batch_key="chat.stream.read_only_force_answer_retry",
+                        response_id=response_id,
+                        max_tokens=request_max_tokens,
+                        temperature=sampler_temperature,
+                        top_p=sampler_top_p,
+                        top_k=sampler_top_k,
+                        seed=None,
+                        draft_sampler=request_draft_sampler,
+                        generation_mode=request_generation_mode,
+                        depth=request_depth,
+                        resolved_mtp_depth=effective_request_depth,
+                        token_callback=on_tokens,
+                        session_id=session_id,
+                        cache_miss_reason=cache_miss_reason,
+                        session_restore_mode=session_restore_mode,
+                        session_bank=session_bank_for_generation,
+                        session_template_hash=state.template_hash,
+                        session_draft_head_identity=state.draft_head_identity,
+                        session_policy_fingerprint=session_restore_policy_fingerprint,
+                        background_request=background,
+                        commit_final_state_to_bank=False,
+                        commit_prompt_prefix_to_bank=commit_prompt_prefix,
+                        session_keep_live_ref=session_keep_live_ref,
+                        request_observability=retry_observability,
+                        prefill_callback=on_prefill,
+                        cancel_event=cancel_event,
+                    )
+                    retry_text = _strip_mtplx_internal_continuation_markers(
+                        _strip_generated_chat_template_sentinels(
+                            str(retry_generated.get("text") or "")
+                        )
+                    )
+                    retry_stats = retry_generated.setdefault("stats", {})
+                    retry_stats.update(retry_observability)
+                    retry_succeeded = not _looks_like_read_only_force_answer_failure(
+                        retry_text
+                    )
+                    retry_stats["read_only_force_answer_retry_succeeded"] = (
+                        retry_succeeded
+                    )
+                    retry_stats["read_only_force_answer_retry_completion_tokens"] = int(
+                        retry_generated.get("completion_tokens") or 0
+                    )
+                    retry_stats["read_only_force_answer_retry_finish_reason"] = str(
+                        retry_generated.get("finish_reason") or "stop"
+                    )
+                    if state.last_metrics:
+                        state.last_metrics[-1].update(
+                            {
+                                "read_only_force_answer_retry_attempted": True,
+                                "read_only_force_answer_retry_succeeded": (
+                                    retry_succeeded
+                                ),
+                                "read_only_force_answer_retry_reason": (
+                                    "toolish_draft_after_tools_closed"
+                                ),
+                                "read_only_force_answer_retry_first_completion_tokens": int(
+                                    generated.get("completion_tokens") or 0
+                                ),
+                                "read_only_force_answer_retry_first_decode_tok_s": (
+                                    first_stats.get("decode_tok_s")
+                                ),
+                                "read_only_force_answer_retry_prompt_tokens": len(
+                                    repair_prompt_ids
+                                ),
+                            }
+                        )
+                    return retry_generated
+
                 def worker() -> None:
                     try:
                         _raise_if_stream_cancelled(cancel_event)
                         if session is None:
-                            generated = _run_generation(
+                            generated = _run_generation_dispatched(
                                 state,
                                 prompt_ids,
+                                batch_key="chat.stream",
+                                response_id=response_id,
                                 max_tokens=request_max_tokens,
-                                temperature=request.temperature,
-                                top_p=request.top_p,
-                                top_k=request.top_k,
+                                temperature=sampler_temperature,
+                                top_p=sampler_top_p,
+                                top_k=sampler_top_k,
                                 seed=request.seed,
+                                draft_sampler=request_draft_sampler,
                                 generation_mode=request_generation_mode,
                                 depth=request_depth,
+                                resolved_mtp_depth=effective_request_depth,
                                 token_callback=on_tokens,
                                 session_id=session_id,
                                 cache_miss_reason=cache_miss_reason,
                                 session_restore_mode=session_restore_mode,
-                                session_bank=None
-                                if background or cache_bypass
-                                else state.sessions.bank,
+                                session_bank=session_bank_for_generation,
                                 session_template_hash=state.template_hash,
                                 session_draft_head_identity=state.draft_head_identity,
-                                session_policy_fingerprint=policy_fingerprint,
+                                session_policy_fingerprint=session_restore_policy_fingerprint,
                                 background_request=background,
-                                commit_prompt_prefix_to_bank=tools_active,
+                                commit_prompt_prefix_to_bank=commit_prompt_prefix,
                                 session_keep_live_ref=session_keep_live_ref,
                                 request_observability=request_observability,
+                                prefill_callback=on_prefill,
+                                cancel_event=cancel_event,
+                            )
+                            generated = maybe_retry_degenerate_read_only_inspection(
+                                generated
+                            )
+                            generated = maybe_retry_degenerate_tool_fed_empty_completion(
+                                generated
+                            )
+                            generated = maybe_repair_tool_fed_reasoning_only_completion(
+                                generated
+                            )
+                            generated = maybe_retry_read_only_force_answer(generated)
+                            generated = maybe_retry_stalled_agent_tool_promise(
+                                generated
                             )
                         else:
                             with session.in_flight_generation():
-                                generated = _run_generation(
+                                generated = _run_generation_dispatched(
                                     state,
                                     prompt_ids,
+                                    batch_key="chat.stream",
+                                    response_id=response_id,
                                     max_tokens=request_max_tokens,
-                                    temperature=request.temperature,
-                                    top_p=request.top_p,
-                                    top_k=request.top_k,
+                                    temperature=sampler_temperature,
+                                    top_p=sampler_top_p,
+                                    top_k=sampler_top_k,
                                     seed=request.seed,
+                                    draft_sampler=request_draft_sampler,
                                     generation_mode=request_generation_mode,
                                     depth=request_depth,
+                                    resolved_mtp_depth=effective_request_depth,
                                     token_callback=on_tokens,
                                     session_id=session_id,
                                     cache_miss_reason=cache_miss_reason,
                                     session_restore_mode=session_restore_mode,
-                                    session_bank=state.sessions.bank,
+                                    session_bank=session_bank_for_generation,
                                     session_template_hash=state.template_hash,
                                     session_draft_head_identity=state.draft_head_identity,
-                                    session_policy_fingerprint=policy_fingerprint,
+                                    session_policy_fingerprint=session_restore_policy_fingerprint,
                                     commit_final_state_to_bank=False,
-                                    commit_prompt_prefix_to_bank=tools_active,
+                                    commit_prompt_prefix_to_bank=commit_prompt_prefix,
                                     session_keep_live_ref=session_keep_live_ref,
                                     request_observability=request_observability,
+                                    prefill_callback=on_prefill,
+                                    cancel_event=cancel_event,
+                                )
+                                generated = maybe_retry_degenerate_read_only_inspection(
+                                    generated
+                                )
+                                generated = maybe_retry_degenerate_tool_fed_empty_completion(
+                                    generated
+                                )
+                                generated = maybe_repair_tool_fed_reasoning_only_completion(
+                                    generated
+                                )
+                                generated = maybe_retry_read_only_force_answer(
+                                    generated
+                                )
+                                generated = maybe_retry_stalled_agent_tool_promise(
+                                    generated
                                 )
                                 queue.put(("done", generated))
                                 commit_event.wait()
@@ -8628,7 +20190,8 @@ def create_app(state: ServerState) -> FastAPI:
                                         commit_state.get("assistant_history_content")
                                         or ""
                                     ) or (
-                                        _normalize_thinking_tags(
+                                        _normalize_reasoning_tags_for_state(
+                                            state,
                                             str(generated["text"]),
                                             thinking_enabled=thinking_enabled,
                                         )
@@ -8639,35 +20202,57 @@ def create_app(state: ServerState) -> FastAPI:
                                         "assistant_tool_calls"
                                     )
                                     if bool(commit_state.get("retokenize_inline")):
-                                        postcommit = _store_retokenized_history_snapshot(
+                                        postcommit = _submit_foreground_model_work(
                                             state,
-                                            session_id=session_id,
-                                            messages=request.messages,
-                                            assistant_content=assistant_history_content,
-                                            assistant_tool_calls=assistant_tool_calls,
-                                            thinking_enabled=thinking_enabled,
-                                            policy_fingerprint=policy_fingerprint,
-                                            tool_specs=tool_specs
-                                            if tools_active
-                                            else None,
-                                            keep_live_ref=session_keep_live_ref,
-                                        )
+                                            lambda: _store_retokenized_history_snapshot(
+                                                state,
+                                                session_id=session_id,
+                                                messages=raw_messages_for_postcommit,
+                                                assistant_content=(
+                                                    assistant_history_content
+                                                ),
+                                                assistant_tool_calls=(
+                                                    assistant_tool_calls
+                                                ),
+                                                thinking_enabled=thinking_enabled,
+                                                policy_fingerprint=postcommit_policy_fingerprint,
+                                                tool_specs=postcommit_tool_specs,
+                                                keep_live_ref=session_keep_live_ref,
+                                                tool_prompt_mode=postcommit_tool_prompt_mode,
+                                                strip_tool_call_preamble_text=opencode_client,
+                                            ),
+                                            batch_key=(
+                                                f"postcommit.stream.inline:"
+                                                f"{session_id or 'stateless'}"
+                                            ),
+                                        ).result()
                                     else:
-                                        postcommit = _store_generation_final_history_snapshot(
+                                        postcommit = _submit_foreground_model_work(
                                             state,
-                                            session_id=session_id,
-                                            prompt_ids=prompt_ids,
-                                            generated=generated,
-                                            messages=request.messages,
-                                            assistant_content=assistant_history_content,
-                                            assistant_tool_calls=assistant_tool_calls,
-                                            thinking_enabled=thinking_enabled,
-                                            policy_fingerprint=policy_fingerprint,
-                                            tool_specs=tool_specs
-                                            if tools_active
-                                            else None,
-                                            keep_live_ref=session_keep_live_ref,
-                                        )
+                                            lambda: _store_generation_final_history_snapshot(
+                                                state,
+                                                session_id=session_id,
+                                                prompt_ids=prompt_ids,
+                                                generated=generated,
+                                                messages=raw_messages_for_postcommit,
+                                                assistant_content=(
+                                                    assistant_history_content
+                                                ),
+                                                assistant_tool_calls=(
+                                                    assistant_tool_calls
+                                                ),
+                                                thinking_enabled=thinking_enabled,
+                                                policy_fingerprint=postcommit_policy_fingerprint,
+                                                tool_specs=postcommit_tool_specs,
+                                                keep_live_ref=session_keep_live_ref,
+                                                tool_prompt_mode=postcommit_tool_prompt_mode,
+                                                strip_tool_call_preamble_text=opencode_client,
+                                            ),
+                                            batch_key=(
+                                                f"postcommit.stream.final:"
+                                                f"{session_id or 'stateless'}"
+                                            ),
+                                        ).result()
                                         if not postcommit.get("stored"):
                                             generated["stats"][
                                                 "session_postcommit_snapshot"
@@ -8698,7 +20283,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     queue.put(("released", None))
                                 return
                     except _StreamCancelled as exc:
-                        queue.put(("cancelled", exc))
+                        queue.put(_stream_cancelled_queue_item(exc))
                     except EngineSessionBusy as exc:
                         queue.put(
                             ("error", HTTPException(status_code=409, detail=str(exc)))
@@ -8709,19 +20294,31 @@ def create_app(state: ServerState) -> FastAPI:
                             and commit_event.is_set()
                             and state.args.session_postcommit_mode == "async"
                         ):
-                            print(
-                                f"[mtplx] async session postcommit failed: {exc!r}",
-                                flush=True,
+                            _safe_stdout_print(
+                                f"[mtplx] async session postcommit failed: {exc!r}"
                             )
                         queue.put(("error", exc))
                     else:
                         queue.put(("done", generated))
 
-                generation_future = _submit_foreground_model_work(
-                    state,
-                    worker,
-                    batch_key="chat.stream",
-                )
+                generation_future: Future = Future()
+
+                def run_worker_thread() -> None:
+                    try:
+                        worker()
+                    except BaseException as exc:
+                        queue.put(("error", exc))
+                        if not generation_future.done():
+                            generation_future.set_exception(exc)
+                    else:
+                        if not generation_future.done():
+                            generation_future.set_result(None)
+
+                Thread(
+                    target=run_worker_thread,
+                    name=f"mtplx-stream-worker-{response_id[-8:]}",
+                    daemon=True,
+                ).start()
 
                 def delta_payload_chunk(delta: dict[str, Any]) -> str:
                     payload = {
@@ -8811,7 +20408,7 @@ def create_app(state: ServerState) -> FastAPI:
                             )
                         except BaseException:
                             pending_postcommit_detail = None
-                    print(
+                    _safe_stdout_print(
                         json.dumps(
                             {
                                 "event": "mtplx_stream_silence",
@@ -8839,16 +20436,28 @@ def create_app(state: ServerState) -> FastAPI:
                                 "pending_postcommit": pending_postcommit_detail,
                             },
                             ensure_ascii=False,
-                        ),
-                        flush=True,
+                        )
                     )
                     next_silence_warn_s = now_s + STREAM_SILENCE_WARN_INTERVAL_S
 
                 generated: dict[str, Any] | None = None
                 history_reasoning_chunks: list[str] = []
                 history_content_chunks: list[str] = []
+                streamed_token_ids: list[int] = []
                 streamed_progress_tokens = 0
                 streamed_decode_started_s: float | None = None
+                streamed_assistant_tool_calls: list[dict[str, Any]] | None = None
+                streamed_tool_deltas_emitted = False
+                early_tool_cancel_used = False
+                pending_tool_cancel_started_s: float | None = None
+                hidden_tool_guard_started_s: float | None = None
+                hidden_tool_guard_started_tokens: int | None = None
+                buffer_read_only_force_answer_stream = bool(
+                    read_only_force_answer_contract_active
+                )
+                read_only_force_answer_stream_buffer = ""
+                read_only_force_answer_stream_started = False
+                read_only_force_answer_stream_marker_stripped_chars = 0
 
                 def remember_stream_delta(delta: dict[str, Any]) -> None:
                     reasoning = delta.get("reasoning_content")
@@ -8858,18 +20467,277 @@ def create_app(state: ServerState) -> FastAPI:
                     if isinstance(content, str) and content:
                         history_content_chunks.append(content)
 
-                def stream_content_delta_chunks(field: str, text: str) -> list[str]:
+                def reset_orphan_stream_guards() -> None:
+                    nonlocal orphan_reasoning_stream_guard
+                    nonlocal orphan_content_stream_guard
+                    orphan_reasoning_stream_guard = (
+                        _InitialOrphanToolControlStreamGuard()
+                    )
+                    orphan_content_stream_guard = (
+                        _InitialOrphanToolControlStreamGuard()
+                    )
+
+                def apply_orphan_stream_guard(field: str, text: str) -> str:
+                    nonlocal stream_orphan_tool_markup_suppressed
+                    if not orphan_stream_guard_enabled:
+                        return text
+                    if field == "reasoning_content":
+                        guard = orphan_reasoning_stream_guard
+                    elif field == "content":
+                        guard = orphan_content_stream_guard
+                    else:
+                        return text
+                    guarded = guard.feed(text)
+                    if guard.suppressed:
+                        stream_orphan_tool_markup_suppressed = True
+                    return guarded
+
+                def stream_content_delta_chunks(
+                    field: str,
+                    text: str,
+                    *,
+                    use_orphan_guard: bool = True,
+                    use_tool_translator: bool = True,
+                    monitor_stop: bool = True,
+                ) -> list[str]:
+                    nonlocal streamed_assistant_tool_calls
+                    nonlocal streamed_tool_deltas_emitted
+                    nonlocal early_tool_cancel_used
+                    nonlocal pending_tool_cancel_started_s
+                    if not text:
+                        return []
+                    if use_orphan_guard:
+                        text = apply_orphan_stream_guard(field, text)
+                        if not text:
+                            return []
+                    if field == "reasoning_content" and suppress_visible_reasoning:
+                        remember_stream_delta({field: text})
+                        return []
+                    if (
+                        field == "content"
+                        and monitor_stop
+                        and stop_monitor is not None
+                    ):
+                        if stop_monitor.stopped:
+                            return []
+                        text = stop_monitor.feed(text)
+                        if stop_monitor.stopped:
+                            fire_stop_sequence_cancel()
+                        if not text:
+                            return []
+                    if (
+                        field == "content"
+                        and content_tool_translator is not None
+                        and use_tool_translator
+                    ):
+                        if early_tool_cancel_used and streamed_assistant_tool_calls:
+                            return []
+                        chunks: list[str] = []
+                        for delta in content_tool_translator.feed(field, text):
+                            if not delta:
+                                continue
+                            if (
+                                single_tool_call_stream
+                                and streamed_assistant_tool_calls
+                                and "tool_calls" in delta
+                            ):
+                                indexes = [
+                                    int(item.get("index") or 0)
+                                    for item in delta.get("tool_calls", [])
+                                    if isinstance(item, dict)
+                                ]
+                                if indexes and all(
+                                    index >= len(streamed_assistant_tool_calls)
+                                    for index in indexes
+                                ):
+                                    continue
+                            if (
+                                early_tool_cancel_used
+                                and streamed_assistant_tool_calls
+                                and "tool_calls" not in delta
+                            ):
+                                continue
+                            if "content" in delta or "reasoning_content" in delta:
+                                remember_stream_delta(delta)
+                            if "tool_calls" in delta:
+                                streamed_tool_deltas_emitted = True
+                                parsed_calls = (
+                                    content_tool_translator.tool_calls
+                                    or streamed_assistant_tool_calls
+                                )
+                                if single_tool_call_stream and parsed_calls:
+                                    parsed_calls = parsed_calls[:1]
+                                streamed_assistant_tool_calls = parsed_calls
+                            chunks.append(delta_payload_chunk(delta))
+                        if (
+                            single_tool_call_stream
+                            and streamed_assistant_tool_calls
+                            and not early_tool_cancel_used
+                        ):
+                            early_tool_cancel_used = True
+                            pending_tool_cancel_started_s = None
+                            _cancel_stream_generation(cancel_event, generation_future)
+                            return chunks
+                        if content_tool_translator.invalid_trailing_after_tool_call:
+                            streamed_assistant_tool_calls = (
+                                content_tool_translator.tool_calls
+                                or streamed_assistant_tool_calls
+                            )
+                            if single_tool_call_stream and streamed_assistant_tool_calls:
+                                streamed_assistant_tool_calls = (
+                                    streamed_assistant_tool_calls[:1]
+                                )
+                            early_tool_cancel_used = True
+                            pending_tool_cancel_started_s = None
+                            _cancel_stream_generation(cancel_event, generation_future)
+                        elif content_tool_translator.ready_to_finish_tool_turn:
+                            streamed_assistant_tool_calls = (
+                                content_tool_translator.tool_calls
+                                or streamed_assistant_tool_calls
+                            )
+                            if single_tool_call_stream and streamed_assistant_tool_calls:
+                                streamed_assistant_tool_calls = (
+                                    streamed_assistant_tool_calls[:1]
+                                )
+                                early_tool_cancel_used = True
+                                pending_tool_cancel_started_s = None
+                                _cancel_stream_generation(
+                                    cancel_event, generation_future
+                                )
+                            elif pending_tool_cancel_started_s is None:
+                                pending_tool_cancel_started_s = time.perf_counter()
+                        else:
+                            pending_tool_cancel_started_s = None
+                        return chunks
+                    delta = {field: text}
+                    remember_stream_delta(delta)
+                    return [delta_payload_chunk(delta)]
+
+                def finish_orphan_stream_guards() -> list[str]:
+                    nonlocal stream_orphan_tool_markup_suppressed
+                    if not orphan_stream_guard_enabled:
+                        return []
                     chunks: list[str] = []
-                    for delta in tool_stream.feed(field, text):
-                        remember_stream_delta(delta)
-                        chunks.append(delta_payload_chunk(delta))
+                    for field, guard in (
+                        ("reasoning_content", orphan_reasoning_stream_guard),
+                        ("content", orphan_content_stream_guard),
+                    ):
+                        flushed = guard.finish()
+                        if guard.suppressed:
+                            stream_orphan_tool_markup_suppressed = True
+                        if not flushed:
+                            continue
+                        chunks.extend(
+                            stream_content_delta_chunks(
+                                field,
+                                flushed,
+                                use_orphan_guard=False,
+                            )
+                        )
+                    return chunks
+
+                def read_only_force_answer_text_slices(
+                    text: str,
+                    *,
+                    max_chars: int = 512,
+                ) -> list[str]:
+                    if not text:
+                        return []
+                    return [
+                        text[index : index + max_chars]
+                        for index in range(0, len(text), max_chars)
+                    ]
+
+                def stream_read_only_force_answer_text(
+                    text: str,
+                    *,
+                    force: bool = False,
+                ) -> list[str]:
+                    nonlocal read_only_force_answer_stream_buffer
+                    nonlocal read_only_force_answer_stream_started
+                    nonlocal read_only_force_answer_stream_marker_stripped_chars
+                    chunks: list[str] = []
+                    emit_text = ""
+                    if read_only_force_answer_stream_started:
+                        emit_text = text
+                    else:
+                        if text:
+                            read_only_force_answer_stream_buffer += text
+                        marked_visible, marker_stripped_chars = (
+                            _read_only_force_answer_after_stream_marker(
+                                read_only_force_answer_stream_buffer
+                            )
+                        )
+                        if marker_stripped_chars:
+                            read_only_force_answer_stream_started = True
+                            read_only_force_answer_stream_marker_stripped_chars = (
+                                marker_stripped_chars
+                            )
+                            emit_text = marked_visible
+                            read_only_force_answer_stream_buffer = ""
+                        elif force and read_only_force_answer_stream_buffer:
+                            visible_text, stripped_chars = (
+                                _read_only_force_answer_visible_text(
+                                    read_only_force_answer_stream_buffer
+                                )
+                            )
+                            read_only_force_answer_stream_started = bool(visible_text)
+                            read_only_force_answer_stream_marker_stripped_chars = int(
+                                stripped_chars
+                            )
+                            emit_text = visible_text
+                            read_only_force_answer_stream_buffer = ""
+                    if not emit_text:
+                        return chunks
+                    for part in read_only_force_answer_text_slices(emit_text):
+                        chunks.extend(
+                            stream_content_delta_chunks(
+                                "content",
+                                part,
+                                use_orphan_guard=False,
+                                use_tool_translator=False,
+                            )
+                        )
+                    return chunks
+
+                def emit_read_only_force_answer_visible_text(text: str) -> list[str]:
+                    nonlocal read_only_force_answer_stream_buffer
+                    nonlocal read_only_force_answer_stream_started
+                    if not text:
+                        return []
+                    read_only_force_answer_stream_buffer = ""
+                    read_only_force_answer_stream_started = True
+                    chunks: list[str] = []
+                    for part in read_only_force_answer_text_slices(text):
+                        chunks.extend(
+                            stream_content_delta_chunks(
+                                "content",
+                                part,
+                                use_orphan_guard=False,
+                                use_tool_translator=False,
+                            )
+                        )
                     return chunks
 
                 def finish_translated_stream_chunks() -> list[str]:
+                    nonlocal streamed_assistant_tool_calls
+                    nonlocal streamed_tool_deltas_emitted
                     chunks: list[str] = []
-                    for delta in tool_stream.finish():
-                        remember_stream_delta(delta)
-                        chunks.append(delta_payload_chunk(delta))
+                    if early_tool_cancel_used and streamed_assistant_tool_calls:
+                        return chunks
+                    if content_tool_translator is not None:
+                        for delta in content_tool_translator.finish():
+                            if not delta:
+                                continue
+                            if "content" in delta or "reasoning_content" in delta:
+                                remember_stream_delta(delta)
+                            if "tool_calls" in delta:
+                                streamed_tool_deltas_emitted = True
+                                streamed_assistant_tool_calls = (
+                                    content_tool_translator.tool_calls
+                                    or streamed_assistant_tool_calls
+                                )
+                            chunks.append(delta_payload_chunk(delta))
                     return chunks
 
                 def drain_stream_tokens(
@@ -8898,14 +20766,14 @@ def create_app(state: ServerState) -> FastAPI:
                 def streamed_history_content() -> str:
                     # Always capture the natural-language portion of the
                     # response. Previously this returned "" whenever
-                    # tool_stream.has_tool_calls, which dropped any preamble
+                    # tool parsing found calls, which dropped any preamble
                     # text (e.g. "Let me check..." before <tool_call>) from
                     # the stored assistant_content. The next turn's lookup
                     # encodes the same assistant message WITH the preamble
                     # (clients echo back content + tool_calls), so the
                     # prefix diverged and every tool-using turn paid a cold
-                    # prefill. tool_call markup itself is captured in
-                    # tool_stream and not in history_content_chunks, so
+                    # prefill. tool_call markup itself is suppressed by the
+                    # bridge filter and not in history_content_chunks, so
                     # this is safe to return for the tool-call case too.
                     #
                     # Deliberately DO NOT fold reasoning_content back into
@@ -8924,6 +20792,7 @@ def create_app(state: ServerState) -> FastAPI:
                     return content
 
                 stream_cancelled_by_client = False
+                cancelled_metric_recorded = False
                 for field, text in splitter.start():
                     if text:
                         for chunk in stream_content_delta_chunks(field, text):
@@ -8934,6 +20803,15 @@ def create_app(state: ServerState) -> FastAPI:
                         try:
                             kind, item = await asyncio.to_thread(queue.get, True, 0.25)
                         except Empty:
+                            if stop_monitor is not None and stop_monitor.stopped:
+                                # Stop-sequence cancel in flight: keep
+                                # draining until the worker acknowledges with
+                                # "cancelled"/"done" so the client still gets
+                                # the terminal finish_reason="stop" chunk.
+                                if await raw_request.is_disconnected():
+                                    stream_cancelled_by_client = True
+                                    return
+                                continue
                             if (
                                 cancel_event.is_set()
                                 or await raw_request.is_disconnected()
@@ -8950,6 +20828,18 @@ def create_app(state: ServerState) -> FastAPI:
                                     )
                                 return
                             now_s = time.perf_counter()
+                            if (
+                                pending_tool_cancel_started_s is not None
+                                and not generation_future.done()
+                                and now_s - pending_tool_cancel_started_s
+                                >= STREAM_TOOL_CALL_FINISH_GRACE_S
+                            ):
+                                early_tool_cancel_used = True
+                                pending_tool_cancel_started_s = None
+                                _cancel_stream_generation(
+                                    cancel_event, generation_future
+                                )
+                                continue
                             if (
                                 not generation_future.done()
                                 and now_s - last_sse_sent_s
@@ -8977,6 +20867,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 stream_tokens = list(item or [])
                                 token_timestamp_s = time.perf_counter()
                             if stream_tokens:
+                                streamed_token_ids.extend(int(t) for t in stream_tokens)
                                 last_token_s = token_timestamp_s
                                 next_silence_warn_s = (
                                     token_timestamp_s + STREAM_SILENCE_WARN_S
@@ -8984,85 +20875,361 @@ def create_app(state: ServerState) -> FastAPI:
                                 if streamed_decode_started_s is None:
                                     streamed_decode_started_s = token_timestamp_s
                                 streamed_progress_tokens += len(stream_tokens)
-                                yield mark_sse_sent(
-                                    progress_chunk(
-                                        _stream_progress_payload(
-                                            completion_tokens=streamed_progress_tokens,
-                                            decode_started_s=streamed_decode_started_s,
-                                            now_s=token_timestamp_s,
-                                        )
-                                    )
+                                progress_payload = _stream_progress_payload(
+                                    completion_tokens=streamed_progress_tokens,
+                                    decode_started_s=streamed_decode_started_s,
+                                    now_s=token_timestamp_s,
                                 )
-                            for field, text in drain_stream_tokens(stream_tokens):
-                                for chunk in stream_content_delta_chunks(field, text):
-                                    yield mark_sse_sent(chunk)
+                                progress_payload["request_id"] = response_id
+                                progress_payload["session_id"] = session_id
+                                published_progress = _dashboard_publish_progress(
+                                    state,
+                                    request_id=response_id,
+                                    payload=progress_payload,
+                                )
+                                if (
+                                    published_progress is not None
+                                    and not buffer_read_only_force_answer_stream
+                                ):
+                                    yield mark_sse_sent(
+                                        progress_chunk(published_progress)
+                                    )
+                            if not buffer_read_only_force_answer_stream:
+                                for field, text in drain_stream_tokens(stream_tokens):
+                                    for chunk in stream_content_delta_chunks(
+                                        field, text
+                                    ):
+                                        yield mark_sse_sent(chunk)
+                            else:
+                                for _field, text in drain_stream_tokens(stream_tokens):
+                                    for chunk in stream_read_only_force_answer_text(
+                                        text
+                                    ):
+                                        yield mark_sse_sent(chunk)
+                            if (
+                                content_tool_translator is not None
+                                and content_tool_translator.buffering_tool_call
+                                and not streamed_tool_deltas_emitted
+                                and not content_tool_translator.tool_argument_in_progress
+                            ):
+                                now_s = time.perf_counter()
+                                if hidden_tool_guard_started_s is None:
+                                    hidden_tool_guard_started_s = now_s
+                                    hidden_tool_guard_started_tokens = (
+                                        streamed_progress_tokens
+                                    )
+                                hidden_tokens = streamed_progress_tokens - int(
+                                    hidden_tool_guard_started_tokens
+                                    or streamed_progress_tokens
+                                )
+                                hidden_elapsed_s = now_s - hidden_tool_guard_started_s
+                                if (
+                                    hidden_tokens >= STREAM_HIDDEN_TOOL_GUARD_TOKENS
+                                    and hidden_elapsed_s >= STREAM_HIDDEN_TOOL_GUARD_S
+                                ):
+                                    for chunk in finish_translated_stream_chunks():
+                                        yield mark_sse_sent(chunk)
+                                    if streamed_assistant_tool_calls:
+                                        early_tool_cancel_used = True
+                                        _cancel_stream_generation(
+                                            cancel_event, generation_future
+                                        )
+                                    else:
+                                        reason = (
+                                            "unterminated tool_call stream suppressed "
+                                            f"{hidden_tokens} tokens for "
+                                            f"{hidden_elapsed_s:.1f}s"
+                                        )
+                                        _record_tool_parse_event(
+                                            state,
+                                            event="unclosed_tool_call",
+                                            reason=reason,
+                                            response_id=response_id,
+                                            stream=True,
+                                        )
+                                        _cancel_stream_generation(
+                                            cancel_event, generation_future
+                                        )
+                                        yield mark_sse_sent(
+                                            error_chunk(
+                                                HTTPException(
+                                                    status_code=422,
+                                                    detail=(
+                                                        "malformed tool_call: "
+                                                        "unterminated stream"
+                                                    ),
+                                                )
+                                            )
+                                        )
+                                        yield mark_sse_sent("data: [DONE]\n\n")
+                                        return
+                            else:
+                                hidden_tool_guard_started_s = None
+                                hidden_tool_guard_started_tokens = None
                         elif kind == "done":
                             generated = item
-                            for field, text in drain_stream_tokens([], force=True):
-                                for chunk in stream_content_delta_chunks(field, text):
-                                    yield mark_sse_sent(chunk)
-                            tail = decoder.finish()
-                            if tail:
-                                for field, text in splitter.feed(tail):
+                            generated = attach_response_observability(generated)
+                            if stop_monitor is not None and stop_monitor.stopped:
+                                # Generation finished before the cancel landed
+                                # (or the match arrived in the final batch).
+                                # The client already received exactly the text
+                                # before the stop string; close out with the
+                                # OpenAI stop contract and skip the session
+                                # commit machinery, matching the cancel path.
+                                generated["text"] = streamed_history_content()
+                                generated["finish_reason"] = "stop"
+                                stats = generated.setdefault("stats", {})
+                                stats["stop_sequence_hit"] = True
+                                stats["stop_sequence_matched"] = (
+                                    stop_monitor.matched_stop
+                                )
+                                _attach_dashboard_progress_stats(
+                                    state,
+                                    request_id=response_id,
+                                    stats=stats,
+                                )
+                                _merge_final_bridge_stats_into_latest_metrics(
+                                    state, stats
+                                )
+                                break
+                            if buffer_read_only_force_answer_stream:
+                                for _field, text in drain_stream_tokens([], force=True):
+                                    for chunk in stream_read_only_force_answer_text(
+                                        text
+                                    ):
+                                        yield mark_sse_sent(chunk)
+                                tail = decoder.finish()
+                                if tail:
+                                    for _field, text in splitter.feed(tail):
+                                        if text:
+                                            for chunk in stream_read_only_force_answer_text(
+                                                text
+                                            ):
+                                                yield mark_sse_sent(chunk)
+                                visible_text, stripped_chars = (
+                                    _read_only_force_answer_visible_text(
+                                        str(generated.get("text") or "")
+                                    )
+                                )
+                                visible_tokens = _encode_rendered_chat_text(
+                                    state.runtime.tokenizer,
+                                    visible_text,
+                                )
+                                stats = generated.setdefault("stats", {})
+                                stats["read_only_force_answer_buffered_stream"] = True
+                                stats[
+                                    "read_only_force_answer_marker_stream_started"
+                                ] = bool(read_only_force_answer_stream_started)
+                                stats[
+                                    "read_only_force_answer_stream_marker_stripped_chars"
+                                ] = int(
+                                    read_only_force_answer_stream_marker_stripped_chars
+                                )
+                                stats[
+                                    "read_only_force_answer_visible_prefix_stripped_chars"
+                                ] = int(stripped_chars)
+                                stats["read_only_force_answer_visible_tokens"] = len(
+                                    visible_tokens
+                                )
+                                if visible_text:
+                                    generated["text"] = visible_text
+                                    generated["tokens"] = visible_tokens
+                                    if read_only_force_answer_stream_started:
+                                        streamed_visible_text = (
+                                            streamed_history_content()
+                                        )
+                                        missing_visible_text = ""
+                                        if visible_text.startswith(
+                                            streamed_visible_text
+                                        ):
+                                            missing_visible_text = visible_text[
+                                                len(streamed_visible_text) :
+                                            ]
+                                        if missing_visible_text:
+                                            for part in read_only_force_answer_text_slices(
+                                                missing_visible_text
+                                            ):
+                                                for chunk in stream_content_delta_chunks(
+                                                    "content",
+                                                    part,
+                                                    use_orphan_guard=False,
+                                                    use_tool_translator=False,
+                                                ):
+                                                    yield mark_sse_sent(chunk)
+                                    else:
+                                        for chunk in emit_read_only_force_answer_visible_text(
+                                            visible_text
+                                        ):
+                                            yield mark_sse_sent(chunk)
+                                    stats[
+                                        "read_only_force_answer_marker_stream_started"
+                                    ] = bool(read_only_force_answer_stream_started)
+                                    stats[
+                                        "read_only_force_answer_stream_marker_stripped_chars"
+                                    ] = int(
+                                        read_only_force_answer_stream_marker_stripped_chars
+                                    )
+                            else:
+                                for field, text in drain_stream_tokens([], force=True):
+                                    for chunk in stream_content_delta_chunks(
+                                        field, text
+                                    ):
+                                        yield mark_sse_sent(chunk)
+                                tail = decoder.finish()
+                                if tail:
+                                    for field, text in splitter.feed(tail):
+                                        if text:
+                                            for chunk in stream_content_delta_chunks(
+                                                field, text
+                                            ):
+                                                yield mark_sse_sent(chunk)
+                                recover_unclosed_reasoning = (
+                                    str(generated.get("finish_reason") or "") == "stop"
+                                    and not tools_active
+                                )
+                                for field, text in _finish_stream_splitter(
+                                    splitter,
+                                    recover_unclosed_reasoning=(
+                                        recover_unclosed_reasoning
+                                    ),
+                                ):
                                     if text:
                                         for chunk in stream_content_delta_chunks(
                                             field, text
                                         ):
                                             yield mark_sse_sent(chunk)
-                            for field, text in splitter.finish():
-                                if text:
-                                    for chunk in stream_content_delta_chunks(
-                                        field, text
-                                    ):
-                                        yield mark_sse_sent(chunk)
-                            for chunk in finish_translated_stream_chunks():
-                                yield mark_sse_sent(chunk)
-                            assistant_tool_calls = tool_stream.tool_calls
-                            if tool_stream.tool_parser_dialect:
-                                generated["stats"]["tool_parser_dialect"] = (
-                                    tool_stream.tool_parser_dialect
+                                for chunk in finish_orphan_stream_guards():
+                                    yield mark_sse_sent(chunk)
+                                if (
+                                    stop_monitor is not None
+                                    and not stop_monitor.stopped
+                                ):
+                                    held_text = stop_monitor.flush()
+                                    if held_text:
+                                        for chunk in stream_content_delta_chunks(
+                                            "content",
+                                            held_text,
+                                            use_orphan_guard=False,
+                                            monitor_stop=False,
+                                        ):
+                                            yield mark_sse_sent(chunk)
+                                for chunk in finish_translated_stream_chunks():
+                                    yield mark_sse_sent(chunk)
+                            raw_generated_text = _strip_mtplx_internal_continuation_markers(
+                                _strip_generated_chat_template_sentinels(
+                                    str(generated.get("text") or "")
                                 )
+                            )
+                            raw_reasoning_text, raw_content_text = (
+                                _tool_extraction_text_parts(
+                                    state,
+                                    raw_generated_text,
+                                    thinking_enabled=thinking_enabled,
+                                )
+                            )
+                            extraction = (
+                                omlx_extract_tool_calls_with_thinking(
+                                    raw_reasoning_text,
+                                    raw_content_text,
+                                    state.runtime.tokenizer,
+                                    tool_specs,
+                                )
+                                # Forced final-answer turns already streamed
+                                # sanitized visible text through the buffered
+                                # marker path; running tool extraction over the
+                                # raw rehearsal text would re-emit it as a
+                                # malformed-as-content fallback.
+                                if tools_active and not read_only_force_answer_contract_active
+                                else None
+                            )
+                            assistant_tool_calls = streamed_assistant_tool_calls or (
+                                extraction.tool_calls if extraction is not None else None
+                            )
+                            stats = generated.setdefault("stats", {})
+                            stats["openai_bridge_mode"] = "omlx_style"
+                            stats["legacy_bridge_used"] = False
+                            stats["hidden_generation_repair_used"] = False
+                            stats["early_tool_cancel_used"] = bool(
+                                early_tool_cancel_used
+                            )
+                            if extraction is not None:
+                                stats["tool_parser_source"] = (
+                                    "streaming_translator"
+                                    if streamed_assistant_tool_calls
+                                    else extraction.parser_source
+                                )
+                                stats["tool_parse_status"] = (
+                                    "success"
+                                    if streamed_assistant_tool_calls
+                                    else extraction.status
+                                )
+                                stats["tool_calls_emitted"] = len(
+                                    assistant_tool_calls or []
+                                )
+                                stats["raw_tool_markup_suppressed"] = bool(
+                                    extraction.raw_tool_markup_suppressed
+                                    or streamed_tool_deltas_emitted
+                                    or stream_orphan_tool_markup_suppressed
+                                    or (
+                                        content_tool_translator is not None
+                                        and content_tool_translator.suppressed_tool_markup
+                                    )
+                                )
+                                if (
+                                    extraction.status == "malformed_as_content"
+                                    and extraction.cleaned_text
+                                    and (
+                                        fallback_visible_text := _visible_malformed_tool_content(
+                                            extraction.cleaned_text,
+                                            state.runtime.tokenizer,
+                                        )
+                                    )
+                                    and fallback_visible_text
+                                    not in "".join(history_content_chunks)
+                                ):
+                                    delta = {"content": fallback_visible_text}
+                                    remember_stream_delta(delta)
+                                    yield mark_sse_sent(delta_payload_chunk(delta))
                             if assistant_tool_calls:
-                                if tool_stream.tool_parser_dialect == "qwen_xml":
-                                    _record_tool_parse_event(
-                                        state,
-                                        event="tool_stream_xml_started",
-                                        response_id=response_id,
-                                        stream=True,
-                                    )
-                                elif tool_stream.tool_parser_dialect == "buffered":
-                                    _record_tool_parse_event(
-                                        state,
-                                        event="tool_stream_json_buffered",
-                                        response_id=response_id,
-                                        stream=True,
-                                    )
+                                if not streamed_tool_deltas_emitted:
+                                    for delta in _stream_tool_call_deltas(
+                                        assistant_tool_calls,
+                                        argument_chunk_chars=stream_interval,
+                                    ):
+                                        yield mark_sse_sent(delta_payload_chunk(delta))
                                 _record_tool_parse_event(
                                     state,
                                     event="tool_parse_success",
                                     response_id=response_id,
                                     stream=True,
                                 )
-                                generated["stats"]["tool_parse_success"] = True
+                                stats["tool_parse_success"] = True
+                                stats["tool_call_count"] = len(assistant_tool_calls)
                                 generated["finish_reason"] = "tool_calls"
-                            elif tool_stream.fallback_reason:
+                            elif (
+                                extraction is not None
+                                and extraction.status == "malformed_as_content"
+                            ):
+                                fallback_reason = (
+                                    extraction.malformed_reason
+                                    or "malformed_tool_call"
+                                )
                                 fallback_kind = _tool_parse_counter_key(
-                                    tool_stream.fallback_reason
+                                    fallback_reason
                                 )
                                 _record_tool_parse_event(
                                     state,
                                     event=fallback_kind,
-                                    reason=tool_stream.fallback_reason,
+                                    reason=fallback_reason,
                                     response_id=response_id,
                                     stream=True,
                                 )
-                                generated["stats"]["tool_parse_fallback"] = True
-                                generated["stats"]["tool_parse_fallback_reason"] = (
-                                    tool_stream.fallback_reason
-                                )
-                                generated["stats"]["tool_parse_fallback_kind"] = (
-                                    fallback_kind
-                                )
+                                stats["tool_parse_fallback"] = True
+                                stats["tool_parse_fallback_reason"] = fallback_reason
+                                stats["tool_parse_fallback_kind"] = fallback_kind
+                            _merge_final_bridge_stats_into_latest_metrics(
+                                state, stats
+                            )
                             if session is not None:
                                 assistant_history_content = streamed_history_content()
                                 commit_state["assistant_history_content"] = (
@@ -9101,34 +21268,52 @@ def create_app(state: ServerState) -> FastAPI:
                                         if assistant_tool_calls
                                         else "postcommit_prompt_prefix"
                                     )
-                                    prompt_prefix_commit = session.commit_prompt_prefix(
-                                        prompt_ids=prompt_ids,
-                                        finish_reason=str(
-                                            generated.get("finish_reason") or "stop"
-                                        ),
-                                        boundary_kind=prompt_prefix_boundary_kind,
-                                    )
+                                    if read_only_force_answer_contract_active:
+                                        prompt_prefix_commit_info = {
+                                            "committed": False,
+                                            "reason": "transient_generation_contract",
+                                            "prefix_len": int(
+                                                getattr(session, "prefix_len", 0) or 0
+                                            ),
+                                            "boundary_kind": prompt_prefix_boundary_kind,
+                                        }
+                                        prompt_prefix_len = int(
+                                            prompt_prefix_commit_info["prefix_len"]
+                                        )
+                                    else:
+                                        prompt_prefix_commit = session.commit_prompt_prefix(
+                                            prompt_ids=prompt_ids,
+                                            finish_reason=str(
+                                                generated.get("finish_reason") or "stop"
+                                            ),
+                                            boundary_kind=prompt_prefix_boundary_kind,
+                                        )
+                                        prompt_prefix_commit_info = {
+                                            "committed": bool(
+                                                prompt_prefix_commit.committed
+                                            ),
+                                            "reason": prompt_prefix_commit.reason,
+                                            "prefix_len": int(
+                                                prompt_prefix_commit.prefix_len
+                                            ),
+                                            "boundary_kind": prompt_prefix_boundary_kind,
+                                        }
+                                        prompt_prefix_len = int(
+                                            prompt_prefix_commit.prefix_len
+                                        )
                                     generated["stats"][
                                         "session_prompt_prefix_commit"
-                                    ] = {
-                                        "committed": bool(
-                                            prompt_prefix_commit.committed
-                                        ),
-                                        "reason": prompt_prefix_commit.reason,
-                                        "prefix_len": int(
-                                            prompt_prefix_commit.prefix_len
-                                        ),
-                                        "boundary_kind": prompt_prefix_boundary_kind,
-                                    }
+                                    ] = prompt_prefix_commit_info
                                     unsafe_reason = str(
                                         postcommit.get("reason") or "unsafe_history"
                                     )
                                     postcommit_snapshot = (
                                         _skipped_idle_postcommit_snapshot(
+                                            state=state,
                                             unsafe_reason=unsafe_reason,
                                             assistant_tool_calls=assistant_tool_calls,
                                             prompt_prefix_len=(
-                                                prompt_prefix_commit.prefix_len
+                                                prompt_prefix_len
                                             ),
                                         )
                                     )
@@ -9143,22 +21328,22 @@ def create_app(state: ServerState) -> FastAPI:
                                         postcommit_snapshot = _schedule_idle_postcommit_snapshot(
                                             state,
                                             session_id=session_id,
-                                            messages=request.messages,
+                                            messages=raw_messages_for_postcommit,
                                             assistant_content=(
                                                 assistant_history_content
                                             ),
                                             assistant_tool_calls=assistant_tool_calls,
                                             thinking_enabled=thinking_enabled,
-                                            policy_fingerprint=policy_fingerprint,
+                                            policy_fingerprint=postcommit_policy_fingerprint,
                                             unsafe_reason=unsafe_reason,
-                                            tool_specs=(
-                                                tool_specs if tools_active else None
-                                            ),
+                                            tool_specs=postcommit_tool_specs,
                                             session=session,
                                             expected_session_revision=getattr(
                                                 session, "revision", None
                                             ),
                                             keep_live_ref=session_keep_live_ref,
+                                            tool_prompt_mode=postcommit_tool_prompt_mode,
+                                            strip_tool_call_preamble_text=opencode_client,
                                         )
                                     generated["stats"][
                                         "session_postcommit_snapshot"
@@ -9173,6 +21358,15 @@ def create_app(state: ServerState) -> FastAPI:
                                     )
                                     yield mark_sse_sent("data: [DONE]\n\n")
                                     return
+                            generated = attach_response_observability(generated)
+                            _attach_dashboard_progress_stats(
+                                state,
+                                request_id=response_id,
+                                stats=generated.get("stats") or {},
+                            )
+                            _merge_final_bridge_stats_into_latest_metrics(
+                                state, generated.get("stats") or {}
+                            )
                             generated["stats"]["reasoning_reentries"] = (
                                 splitter.reentry_count
                             )
@@ -9191,17 +21385,130 @@ def create_app(state: ServerState) -> FastAPI:
                                     splitter.reentry_count
                                 )
                             footer = _stats_footer_text(state, generated)
-                            if footer and not tool_stream.has_tool_calls:
+                            if footer and not assistant_tool_calls:
+                                # The footer is server-injected, not model
+                                # output: bypass stop monitoring so a stop
+                                # string like "\n\n" can neither suppress it
+                                # nor false-match against it.
                                 for chunk in stream_content_delta_chunks(
-                                    "content", f"\n\n{footer}"
+                                    "content",
+                                    f"\n\n{footer}",
+                                    monitor_stop=False,
                                 ):
                                     yield mark_sse_sent(chunk)
                             break
+                        elif kind == "reset_orphan_stream_guards":
+                            reset_orphan_stream_guards()
+                            continue
+                        elif kind == "close_unclosed_reasoning_for_repair":
+                            if _reasoning_parser_for_state(state) not in {"qwen3", "step3p5"}:
+                                continue
+                            for field, text in drain_stream_tokens([], force=True):
+                                for chunk in stream_content_delta_chunks(field, text):
+                                    yield mark_sse_sent(chunk)
+                            tail = decoder.finish()
+                            if tail:
+                                for field, text in splitter.feed(tail):
+                                    if text:
+                                        for chunk in stream_content_delta_chunks(
+                                            field, text
+                                        ):
+                                            yield mark_sse_sent(chunk)
+                            for field, text in splitter.feed(THINK_CLOSE):
+                                if text:
+                                    for chunk in stream_content_delta_chunks(field, text):
+                                        yield mark_sse_sent(chunk)
+                            decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
+                            continue
                         elif kind == "error":
                             yield mark_sse_sent(error_chunk(item))
                             yield mark_sse_sent("data: [DONE]\n\n")
                             return
                         elif kind == "cancelled":
+                            if stop_monitor is not None and stop_monitor.stopped:
+                                # Stop-sequence cancel: the worker unwound
+                                # through the normal cancellation path, but for
+                                # the client this is a successful completion
+                                # that ended at the stop string.
+                                generated = {
+                                    "text": streamed_history_content(),
+                                    "tokens": list(streamed_token_ids),
+                                    "prompt_tokens": len(prompt_ids),
+                                    "completion_tokens": int(
+                                        streamed_progress_tokens
+                                    ),
+                                    "finish_reason": "stop",
+                                    "stats": {
+                                        "generation_mode": request_generation_mode,
+                                        "mtp_depth": request_depth,
+                                        "prompt_tokens": len(prompt_ids),
+                                        "completion_tokens": int(
+                                            streamed_progress_tokens
+                                        ),
+                                        "stop_sequence_hit": True,
+                                        "stop_sequence_matched": (
+                                            stop_monitor.matched_stop
+                                        ),
+                                        "openai_bridge_mode": "omlx_style",
+                                        "legacy_bridge_used": False,
+                                        "hidden_generation_repair_used": False,
+                                        "early_tool_cancel_used": False,
+                                    },
+                                }
+                                generated = attach_response_observability(
+                                    generated
+                                )
+                                _attach_dashboard_progress_stats(
+                                    state,
+                                    request_id=response_id,
+                                    stats=generated["stats"],
+                                )
+                                _merge_final_bridge_stats_into_latest_metrics(
+                                    state, generated["stats"]
+                                )
+                                break
+                            if early_tool_cancel_used and streamed_assistant_tool_calls:
+                                generated = {
+                                    "text": streamed_history_content(),
+                                    "tokens": list(streamed_token_ids),
+                                    "prompt_tokens": len(prompt_ids),
+                                    "completion_tokens": int(streamed_progress_tokens),
+                                    "finish_reason": "tool_calls",
+                                    "stats": {
+                                        "generation_mode": request_generation_mode,
+                                        "mtp_depth": request_depth,
+                                        "prompt_tokens": len(prompt_ids),
+                                        "completion_tokens": int(
+                                            streamed_progress_tokens
+                                        ),
+                                        "tool_parse_success": True,
+                                        "tool_call_count": len(
+                                            streamed_assistant_tool_calls
+                                        ),
+                                        "tool_parser_source": (
+                                            "streaming_translator"
+                                        ),
+                                        "tool_parse_status": "success",
+                                        "tool_calls_emitted": len(
+                                            streamed_assistant_tool_calls
+                                        ),
+                                        "raw_tool_markup_suppressed": True,
+                                        "early_tool_cancel_used": True,
+                                        "openai_bridge_mode": "omlx_style",
+                                        "legacy_bridge_used": False,
+                                        "hidden_generation_repair_used": False,
+                                    },
+                                }
+                                generated = attach_response_observability(generated)
+                                _attach_dashboard_progress_stats(
+                                    state,
+                                    request_id=response_id,
+                                    stats=generated["stats"],
+                                )
+                                _merge_final_bridge_stats_into_latest_metrics(
+                                    state, generated["stats"]
+                                )
+                                break
                             return
                         else:
                             yield mark_sse_sent(
@@ -9220,6 +21527,11 @@ def create_app(state: ServerState) -> FastAPI:
                     yield mark_sse_sent("data: [DONE]\n\n")
                     return
                 finally:
+                    nonlocal_cancel_reason = (
+                        "client_disconnected"
+                        if stream_cancelled_by_client
+                        else "stream_cancelled"
+                    )
                     _cancel_stream_generation(cancel_event, generation_future)
                     if (
                         stream_cancelled_by_client
@@ -9230,6 +21542,23 @@ def create_app(state: ServerState) -> FastAPI:
                     if session is not None and not commit_event.is_set():
                         commit_state["commit"] = False
                         commit_event.set()
+                    if cancel_event.is_set() and generated is None:
+                        state.dashboard.lifetime.record_cancellation()
+                        if not cancelled_metric_recorded:
+                            _record_stream_cancellation_metric(
+                                state,
+                                response_id=response_id,
+                                session_id=session_id,
+                                prompt_tokens=len(prompt_ids),
+                                streamed_completion_tokens=streamed_progress_tokens,
+                                stream_started_s=stream_started_s,
+                                reason=nonlocal_cancel_reason,
+                                request_observability=request_observability,
+                                client_disconnected=stream_cancelled_by_client,
+                            )
+                            cancelled_metric_recorded = True
+                    state.dashboard.in_flight.deregister(response_id)
+                    state.dashboard.progress_events.forget(response_id)
 
                 if generated is None:
                     yield mark_sse_sent(
@@ -9237,6 +21566,12 @@ def create_app(state: ServerState) -> FastAPI:
                     )
                     yield mark_sse_sent("data: [DONE]\n\n")
                     return
+                finish_reason = generated.get("finish_reason") or "stop"
+                generated["finish_reason"] = finish_reason
+                generated.setdefault("stats", {})["finish_reason"] = finish_reason
+                _merge_final_bridge_stats_into_latest_metrics(
+                    state, {"finish_reason": finish_reason}
+                )
                 done = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -9246,7 +21581,7 @@ def create_app(state: ServerState) -> FastAPI:
                         {
                             "index": 0,
                             "delta": {},
-                            "finish_reason": generated.get("finish_reason", "stop"),
+                            "finish_reason": finish_reason,
                         }
                     ],
                     "usage": _usage_payload(generated),
@@ -9260,58 +21595,244 @@ def create_app(state: ServerState) -> FastAPI:
         def run_nonstream_generation() -> dict[str, Any]:
             return run_generation_for_response()
 
-        try:
-            generated = await asyncio.wrap_future(
-                _submit_foreground_model_work(
-                    state,
-                    run_nonstream_generation,
-                    batch_key="chat.nonstream",
-                )
+        nonstream_handle = InFlightHandle(
+            request_id=response_id,
+            cancel_event=nonstream_cancel_event,
+            started_s=time.time(),
+            session_id=session_id,
+            model=model,
+            prompt_preview=_dashboard_prompt_preview(request, state.runtime.tokenizer),
+            prompt_tokens=len(prompt_ids),
+        )
+        state.dashboard.in_flight.register(nonstream_handle)
+        nonstream_started_s = time.perf_counter()
+
+        def mark_nonstream_client_disconnected() -> None:
+            nonlocal nonstream_cancel_reason
+            nonlocal nonstream_client_disconnected
+            nonstream_cancel_reason = "client_disconnected"
+            nonstream_client_disconnected = True
+
+        disconnect_monitor_task = asyncio.create_task(
+            _monitor_request_disconnect(
+                raw_request,
+                nonstream_cancel_event,
+                on_disconnect=mark_nonstream_client_disconnected,
             )
+        )
+        try:
+            generated = await asyncio.to_thread(run_nonstream_generation)
         except EngineSessionBusy as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        tool_fallback_reason: str | None = None
-        if tools_active:
-            tool_calls, tool_fallback_reason = _parse_generated_tool_calls_or_content(
-                str(generated["text"]),
-                tools=tool_specs,
-                tokenizer=state.runtime.tokenizer,
-                state=state,
+        except _StopSequenceHit:
+            # A client stop string matched mid-generation: this is a normal
+            # completion that ends at the stop boundary, not a cancellation.
+            # The monitor holds exactly the visible text before the match;
+            # session postcommit is skipped, matching the streaming stop path.
+            assert nonstream_stop_monitor is not None
+            stop_reasoning_text = "".join(nonstream_stop_reasoning_chunks).strip()
+            stop_generated: dict[str, Any] = {
+                "text": nonstream_stop_monitor.emitted_text,
+                "tokens": [],
+                "prompt_tokens": len(prompt_ids),
+                "completion_tokens": int(nonstream_completion_tokens),
+                "finish_reason": "stop",
+                "stats": {
+                    "generation_mode": request_generation_mode,
+                    "mtp_depth": request_depth,
+                    "prompt_tokens": len(prompt_ids),
+                    "completion_tokens": int(nonstream_completion_tokens),
+                    "stop_sequence_hit": True,
+                    "stop_sequence_matched": (
+                        nonstream_stop_monitor.matched_stop
+                    ),
+                    "openai_bridge_mode": "omlx_style",
+                    "legacy_bridge_used": False,
+                    "hidden_generation_repair_used": False,
+                    "early_tool_cancel_used": False,
+                    "finish_reason": "stop",
+                },
+            }
+            stop_generated = attach_response_observability(stop_generated)
+            _merge_final_bridge_stats_into_latest_metrics(
+                state, stop_generated["stats"]
+            )
+            stop_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": nonstream_stop_monitor.emitted_text,
+            }
+            if stop_reasoning_text and not suppress_visible_reasoning:
+                stop_message["reasoning_content"] = stop_reasoning_text
+            return JSONResponse(
+                {
+                    "id": response_id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": stop_message,
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": _usage_payload(stop_generated),
+                    "mtplx_stats": _public_mtplx_stats(stop_generated),
+                }
+            )
+        except _StreamCancelled as exc:
+            state.dashboard.lifetime.record_cancellation()
+            _record_stream_cancellation_metric(
+                state,
                 response_id=response_id,
-                stream=False,
+                session_id=session_id,
+                prompt_tokens=len(prompt_ids),
+                streamed_completion_tokens=nonstream_completion_tokens,
+                stream_started_s=nonstream_started_s,
+                reason=nonstream_cancel_reason,
+                request_observability=request_observability,
+                client_disconnected=nonstream_client_disconnected,
+            )
+            return JSONResponse(
+                status_code=499,
+                content=_openai_error_content(
+                    str(exc),
+                    status_code=499,
+                    code="request_cancelled",
+                    error_type="request_cancelled",
+                ),
+            )
+        finally:
+            disconnect_monitor_task.cancel()
+            with suppress(asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(disconnect_monitor_task, timeout=0.25)
+            state.dashboard.in_flight.deregister(response_id)
+            state.dashboard.progress_events.forget(response_id)
+        generated.setdefault("stats", {})
+        generated["stats"]["openai_bridge_mode"] = "omlx_style"
+        generated["stats"]["legacy_bridge_used"] = False
+        generated["stats"]["hidden_generation_repair_used"] = False
+        generated["stats"]["early_tool_cancel_used"] = False
+        if tools_active:
+            raw_text = _strip_mtplx_internal_continuation_markers(
+                _strip_generated_chat_template_sentinels(
+                    str(generated.get("text") or "")
+                )
+            )
+            raw_reasoning_text, raw_content_text = _tool_extraction_text_parts(
+                state,
+                raw_text,
+                thinking_enabled=thinking_enabled,
+            )
+            extraction = omlx_extract_tool_calls_with_thinking(
+                raw_reasoning_text,
+                raw_content_text,
+                state.runtime.tokenizer,
+                tool_specs,
+            )
+            tool_calls = extraction.tool_calls
+            generated["stats"]["tool_parser_source"] = extraction.parser_source
+            generated["stats"]["tool_parse_status"] = extraction.status
+            generated["stats"]["tool_calls_emitted"] = len(tool_calls or [])
+            generated["stats"]["raw_tool_markup_suppressed"] = bool(
+                extraction.raw_tool_markup_suppressed
             )
         else:
             tool_calls = None
+            extraction = None
         if tool_calls:
             generated["finish_reason"] = "tool_calls"
             generated["stats"]["tool_parse_success"] = True
+            generated["stats"]["tool_call_count"] = len(tool_calls)
+            _record_tool_parse_event(
+                state,
+                event="tool_parse_success",
+                response_id=response_id,
+                stream=False,
+            )
+            _merge_final_bridge_stats_into_latest_metrics(
+                state, generated["stats"]
+            )
+            assistant_content = (
+                extraction.cleaned_text.strip()
+                if extraction is not None and extraction.cleaned_text
+                else ""
+            )
             await store_postcommit_snapshot(
                 generated,
-                assistant_content="",
+                assistant_content=assistant_content,
                 assistant_tool_calls=tool_calls,
+            )
+            _merge_final_bridge_stats_into_latest_metrics(
+                state, generated["stats"]
             )
             message: dict[str, Any] = {
                 "role": "assistant",
-                "content": None,
+                "content": assistant_content or None,
                 "tool_calls": tool_calls,
             }
             finish_reason = "tool_calls"
         else:
-            display_text = _display_text(
-                state,
-                generated,
-                thinking_enabled=thinking_enabled,
-            )
-            if tool_fallback_reason:
-                fallback_kind = _tool_parse_counter_key(tool_fallback_reason)
+            reasoning_text = ""
+            if (
+                extraction is not None
+                and extraction.status == "malformed_as_content"
+            ):
+                display_text = _visible_malformed_tool_content(
+                    extraction.cleaned_text,
+                    state.runtime.tokenizer,
+                )
+                display_text = _strip_mtplx_internal_continuation_markers(
+                    display_text
+                )
+                fallback_reason = extraction.malformed_reason or "malformed_tool_call"
+                fallback_kind = _tool_parse_counter_key(fallback_reason)
                 generated["stats"]["tool_parse_fallback"] = True
-                generated["stats"]["tool_parse_fallback_reason"] = tool_fallback_reason
+                generated["stats"]["tool_parse_fallback_reason"] = fallback_reason
                 generated["stats"]["tool_parse_fallback_kind"] = fallback_kind
+                generated["stats"]["raw_tool_markup_suppressed"] = bool(
+                    generated["stats"].get("raw_tool_markup_suppressed")
+                    or display_text != extraction.cleaned_text
+                )
+                _record_tool_parse_event(
+                    state,
+                    event=fallback_kind,
+                    reason=fallback_reason,
+                    response_id=response_id,
+                    stream=False,
+                )
+            else:
+                display_text, reasoning_text = _nonstream_chat_message_parts(
+                    state,
+                    generated,
+                    thinking_enabled=thinking_enabled,
+                    suppress_visible_reasoning=suppress_visible_reasoning,
+                )
+            if stop_sequences:
+                # Post-trim safety net for matches the incremental monitor
+                # cannot see (e.g. a stop string completed only by the
+                # decoder's held-back partial word at end of generation).
+                trimmed_text, matched_stop = _trim_text_at_stop_sequences(
+                    display_text, stop_sequences
+                )
+                if matched_stop is not None:
+                    display_text = trimmed_text
+                    generated["finish_reason"] = "stop"
+                    generated["stats"]["stop_sequence_hit"] = True
+                    generated["stats"]["stop_sequence_matched"] = matched_stop
+            _merge_final_bridge_stats_into_latest_metrics(
+                state, generated["stats"]
+            )
             await store_postcommit_snapshot(
                 generated,
                 assistant_content=display_text,
             )
+            _merge_final_bridge_stats_into_latest_metrics(
+                state, generated["stats"]
+            )
             message = {"role": "assistant", "content": display_text}
+            if reasoning_text:
+                message["reasoning_content"] = reasoning_text
             finish_reason = generated.get("finish_reason", "stop")
         return JSONResponse(
             {
@@ -9346,7 +21867,7 @@ def create_app(state: ServerState) -> FastAPI:
             return StreamingResponse(
                 _anthropic_stream_from_openai_sse(
                     response.body_iterator,
-                    model=request.model or state.model_id,
+                    model=state.model_id,
                 ),
                 media_type="text/event-stream",
             )
@@ -9364,73 +21885,424 @@ def create_app(state: ServerState) -> FastAPI:
         return JSONResponse(payload, status_code=response.status_code)
 
     @app.post("/v1/messages/count_tokens")
-    async def anthropic_count_tokens(request: AnthropicMessagesRequest) -> Any:
+    async def anthropic_count_tokens(
+        raw_request: Request, request: AnthropicMessagesRequest
+    ) -> Any:
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
         chat_request = _anthropic_to_chat_request(request)
-        tool_specs = _filter_tool_specs_for_request(
-            _normalize_tool_specs(chat_request.tools),
-            chat_request.messages,
+        headers = dict(raw_request.headers)
+        metadata = _request_metadata(chat_request)
+        requested_tool_specs = _normalize_tool_specs(chat_request.tools)
+        tools_active = _tools_active_for_request(
+            requested_tool_specs,
+            chat_request.tool_choice,
         )
-        tools_active = _tools_active_for_request(tool_specs, chat_request.tool_choice)
-        thinking_enabled = _thinking_enabled_for_request(state, chat_request)
+        messages_for_generation, _transcript_stats = _canonicalize_agent_transcript(
+            chat_request.messages,
+            tools_active=tools_active,
+        )
+        messages_for_generation, _backend_chat_policy_active = _with_backend_chat_policy(
+            state,
+            messages_for_generation,
+        )
+        client_controls_allowed = _client_controls_allowed(headers, metadata)
+        thinking_enabled = _thinking_enabled_for_request(
+            state,
+            chat_request,
+            allow_client_controls=client_controls_allowed,
+        )
+        reasoning_effort = _reasoning_effort_for_state(
+            state,
+            thinking_enabled=thinking_enabled,
+            request_effort=chat_request.reasoning_effort,
+            allow_client_controls=client_controls_allowed,
+        )
+        tool_prompt_mode, _tool_prompt_mode_resolution = _tool_prompt_mode_for_request(
+            state.args,
+            headers=headers,
+            metadata=metadata,
+            tools_active=tools_active,
+        )
         prompt_ids = _encode_messages(
             state.runtime.tokenizer,
-            chat_request.messages,
+            messages_for_generation,
             enable_thinking=thinking_enabled,
+            reasoning_effort=reasoning_effort,
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
-            tools=tool_specs if tools_active else None,
+            tools=requested_tool_specs if tools_active else None,
+            tool_choice=chat_request.tool_choice,
+            tool_prompt_mode=tool_prompt_mode,
         )
         return {"input_tokens": len(prompt_ids)}
 
     @app.post("/v1/completions")
-    async def completions(request: CompletionRequest) -> Any:
+    async def completions(raw_request: Request, request: CompletionRequest) -> Any:
+        headers = dict(raw_request.headers)
+        raw_metadata = _request_extra(request, "metadata", {})
+        metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
+        client_controls_allowed = _client_controls_allowed(headers, metadata)
         prompt_ids = _encode_prompt(state.runtime.tokenizer, request.prompt)
         request_generation_mode = _request_generation_mode_for_generation(
-            state, request
+            state,
+            request,
+            allow_client_controls=client_controls_allowed,
         )
         request_depth = _request_depth_for_generation(
             state,
             request,
             generation_mode=request_generation_mode,
+            allow_client_controls=client_controls_allowed,
         )
-        generated = await asyncio.wrap_future(
-            _submit_foreground_model_work(
-                state,
-                lambda: _run_generation(
-                    state,
-                    prompt_ids,
-                    max_tokens=request.max_tokens,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    top_k=request.top_k,
-                    seed=request.seed,
-                    generation_mode=request_generation_mode,
-                    depth=request_depth,
-                ),
-                batch_key="completion",
-            )
+        effective_request_depth, _ = _long_context_mtp_depth_policy_for_request(
+            state,
+            generation_mode=request_generation_mode,
+            request_depth=request_depth,
+            prompt_tokens=len(prompt_ids),
         )
-        model = request.model or state.model_id
+        sampler_temperature = request.temperature if client_controls_allowed else None
+        sampler_top_p = request.top_p if client_controls_allowed else None
+        sampler_top_k = request.top_k if client_controls_allowed else None
+        request_observability = {
+            "request_client_hint": _request_client_hint_from_headers(headers, metadata),
+            "request_client_label": _request_client_hint_from_headers(headers, metadata)
+            or "openai",
+            "request_generation_mode": request_generation_mode,
+            "request_depth": int(request_depth),
+            "request_effective_mtp_depth": int(effective_request_depth),
+            "request_temperature": request.temperature,
+            "request_top_p": request.top_p,
+            "request_top_k": request.top_k,
+            "mtplx_control_owner": (
+                "client" if client_controls_allowed else "server"
+            ),
+            "client_controls_allowed": bool(client_controls_allowed),
+        }
+        if not client_controls_allowed:
+            ignored_fields = _ignored_client_control_fields(request)
+            if ignored_fields:
+                request_observability["client_control_fields_ignored"] = ignored_fields
+                request_observability["client_sampler_fields_ignored"] = [
+                    field
+                    for field in ignored_fields
+                    if field in {"temperature", "top_p", "top_k"}
+                ]
+        stop_sequences = _normalize_stop_sequences(request.stop)
+        model = state.model_id
         response_id = f"cmpl-{uuid.uuid4().hex}"
         created = int(time.time())
-        display_text = _display_text(state, generated)
-        if request.stream:
 
+        if request.stream:
+            # Real incremental streaming: tokens flow through a queue from the
+            # generation worker and are decoded as they arrive, mirroring the
+            # chat pattern. The previous implementation generated everything
+            # first and then re-chunked the final text, which kept clients
+            # staring at a silent stream for the whole generation.
             async def event_stream():
-                chunk_chars = 24 * max(1, int(state.args.stream_interval))
-                for chunk in _chunk_text(display_text, chunk_chars=chunk_chars):
+                queue: Queue[tuple[str, Any]] = Queue()
+                cancel_event = Event()
+                decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
+                stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
+                streamed_completion_tokens = 0
+                generated: dict[str, Any] | None = None
+                stop_hit = False
+
+                def on_tokens(new_tokens: list[int]) -> None:
+                    _raise_if_stream_cancelled(cancel_event)
+                    queue.put(("tokens", [int(token) for token in new_tokens]))
+                    _raise_if_stream_cancelled(cancel_event)
+
+                def worker() -> None:
+                    try:
+                        result = _run_generation_dispatched(
+                            state,
+                            prompt_ids,
+                            batch_key="completion.stream",
+                            response_id=response_id,
+                            max_tokens=request.max_tokens,
+                            temperature=sampler_temperature,
+                            top_p=sampler_top_p,
+                            top_k=sampler_top_k,
+                            seed=request.seed,
+                            generation_mode=request_generation_mode,
+                            depth=request_depth,
+                            resolved_mtp_depth=effective_request_depth,
+                            token_callback=on_tokens,
+                            request_observability=request_observability,
+                            cancel_event=cancel_event,
+                        )
+                    except _StreamCancelled as exc:
+                        queue.put(_stream_cancelled_queue_item(exc))
+                    except BaseException as exc:
+                        queue.put(("error", exc))
+                    else:
+                        queue.put(("done", result))
+
+                generation_future: Future = Future()
+
+                def run_worker_thread() -> None:
+                    try:
+                        worker()
+                    except BaseException as exc:
+                        queue.put(("error", exc))
+                        if not generation_future.done():
+                            generation_future.set_exception(exc)
+                    else:
+                        if not generation_future.done():
+                            generation_future.set_result(None)
+
+                Thread(
+                    target=run_worker_thread,
+                    name=f"mtplx-completion-worker-{response_id[-8:]}",
+                    daemon=True,
+                ).start()
+
+                def text_chunk(text: str) -> str:
                     payload = {
                         "id": response_id,
                         "object": "text_completion",
                         "created": created,
                         "model": model,
-                        "choices": [{"index": 0, "text": chunk, "finish_reason": None}],
+                        "choices": [
+                            {"index": 0, "text": text, "finish_reason": None}
+                        ],
                     }
-                    yield f"data: {json.dumps(payload)}\n\n"
+                    return f"data: {json.dumps(payload)}\n\n"
+
+                def error_chunk(exc: BaseException) -> str:
+                    if isinstance(exc, HTTPException):
+                        message = str(exc.detail)
+                        status_code = exc.status_code
+                    else:
+                        message = str(exc)
+                        status_code = 500
+                    payload = {
+                        "id": response_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {"index": 0, "text": "", "finish_reason": "error"}
+                        ],
+                        **_openai_error_content(
+                            message,
+                            status_code=status_code,
+                            code=type(exc).__name__,
+                        ),
+                    }
+                    return f"data: {json.dumps(payload)}\n\n"
+
+                def emit_text(text: str, *, monitor: bool = True) -> list[str]:
+                    nonlocal stop_hit
+                    if not text:
+                        return []
+                    if monitor and stop_monitor.active:
+                        if stop_monitor.stopped:
+                            return []
+                        text = stop_monitor.feed(text)
+                        if stop_monitor.stopped and not stop_hit:
+                            stop_hit = True
+                            _cancel_stream_generation(
+                                cancel_event, generation_future
+                            )
+                        if not text:
+                            return []
+                    return [text_chunk(text)]
+
+                try:
+                    while True:
+                        try:
+                            kind, item = await asyncio.to_thread(
+                                queue.get, True, 0.25
+                            )
+                        except Empty:
+                            if (
+                                cancel_event.is_set() and not stop_hit
+                            ) or await raw_request.is_disconnected():
+                                _cancel_stream_generation(
+                                    cancel_event, generation_future
+                                )
+                                return
+                            continue
+                        if kind == "tokens":
+                            streamed_completion_tokens += len(item)
+                            for chunk in emit_text(decoder.feed(item)):
+                                yield chunk
+                        elif kind == "done":
+                            generated = item
+                            for chunk in emit_text(decoder.finish()):
+                                yield chunk
+                            held_text = stop_monitor.flush()
+                            for chunk in emit_text(held_text, monitor=False):
+                                yield chunk
+                            break
+                        elif kind == "cancelled":
+                            if stop_hit:
+                                generated = {
+                                    "text": stop_monitor.emitted_text,
+                                    "tokens": [],
+                                    "prompt_tokens": len(prompt_ids),
+                                    "completion_tokens": int(
+                                        streamed_completion_tokens
+                                    ),
+                                    "finish_reason": "stop",
+                                    "stats": {
+                                        "generation_mode": request_generation_mode,
+                                        "mtp_depth": request_depth,
+                                        "prompt_tokens": len(prompt_ids),
+                                        "completion_tokens": int(
+                                            streamed_completion_tokens
+                                        ),
+                                    },
+                                }
+                                break
+                            return
+                        elif kind == "error":
+                            yield error_chunk(item)
+                            yield "data: [DONE]\n\n"
+                            return
+                        else:
+                            yield error_chunk(
+                                RuntimeError(f"unexpected stream event: {kind}")
+                            )
+                            yield "data: [DONE]\n\n"
+                            return
+                except asyncio.CancelledError:
+                    _cancel_stream_generation(cancel_event, generation_future)
+                    raise
+                except BaseException as exc:
+                    yield error_chunk(exc)
+                    yield "data: [DONE]\n\n"
+                    return
+                finally:
+                    _cancel_stream_generation(cancel_event, generation_future)
+
+                if generated is None:
+                    yield error_chunk(
+                        RuntimeError("generation ended without a result")
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
+                finish_reason = str(generated.get("finish_reason") or "stop")
+                stats = generated.setdefault("stats", {})
+                if stop_hit or stop_monitor.stopped:
+                    finish_reason = "stop"
+                    generated["finish_reason"] = "stop"
+                    stats["stop_sequence_hit"] = True
+                    stats["stop_sequence_matched"] = stop_monitor.matched_stop
+                else:
+                    footer = (
+                        _stats_footer_text(state, generated)
+                        if state.args.stats_footer
+                        else ""
+                    )
+                    if footer:
+                        for chunk in emit_text(f"\n\n{footer}", monitor=False):
+                            yield chunk
+                stats["finish_reason"] = finish_reason
+                final_payload = {
+                    "id": response_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {"index": 0, "text": "", "finish_reason": finish_reason}
+                    ],
+                    "usage": _usage_payload(generated),
+                    "mtplx_stats": _public_mtplx_stats(generated),
+                }
+                yield f"data: {json.dumps(final_payload)}\n\n"
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+        nonstream_stop_monitor: _StopSequenceStreamMonitor | None = None
+        nonstream_stop_decoder: _IncrementalTokenDecoder | None = None
+        nonstream_completion_tokens = 0
+        if stop_sequences:
+            nonstream_stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
+            nonstream_stop_decoder = _IncrementalTokenDecoder(
+                state.runtime.tokenizer
+            )
+
+        def nonstream_stop_on_tokens(new_tokens: list[int]) -> None:
+            nonlocal nonstream_completion_tokens
+            nonstream_completion_tokens += len(new_tokens)
+            if nonstream_stop_monitor is None or nonstream_stop_decoder is None:
+                return
+            delta = nonstream_stop_decoder.feed(
+                [int(token) for token in new_tokens]
+            )
+            if not delta:
+                return
+            nonstream_stop_monitor.feed(delta)
+            if nonstream_stop_monitor.stopped:
+                raise _StopSequenceHit(
+                    nonstream_stop_monitor.matched_stop or ""
+                )
+
+        try:
+            generated = await asyncio.to_thread(
+                lambda: _run_generation_dispatched(
+                    state,
+                    prompt_ids,
+                    batch_key="completion",
+                    response_id=response_id,
+                    max_tokens=request.max_tokens,
+                    temperature=sampler_temperature,
+                    top_p=sampler_top_p,
+                    top_k=sampler_top_k,
+                    seed=request.seed,
+                    generation_mode=request_generation_mode,
+                    depth=request_depth,
+                    resolved_mtp_depth=effective_request_depth,
+                    request_observability=request_observability,
+                    token_callback=(
+                        nonstream_stop_on_tokens
+                        if nonstream_stop_monitor is not None
+                        else None
+                    ),
+                )
+            )
+        except _StopSequenceHit:
+            # A stop string matched mid-generation: return the text before
+            # the match as a normal completion instead of burning tokens
+            # until EOS/max_tokens.
+            assert nonstream_stop_monitor is not None
+            generated = {
+                "text": nonstream_stop_monitor.emitted_text,
+                "tokens": [],
+                "prompt_tokens": len(prompt_ids),
+                "completion_tokens": int(nonstream_completion_tokens),
+                "finish_reason": "stop",
+                "stats": {
+                    "generation_mode": request_generation_mode,
+                    "mtp_depth": request_depth,
+                    "prompt_tokens": len(prompt_ids),
+                    "completion_tokens": int(nonstream_completion_tokens),
+                    "stop_sequence_hit": True,
+                    "stop_sequence_matched": (
+                        nonstream_stop_monitor.matched_stop
+                    ),
+                },
+            }
+        finish_reason = str(generated.get("finish_reason") or "stop")
+        if stop_sequences and not generated.get("stats", {}).get(
+            "stop_sequence_hit"
+        ):
+            # Post-trim safety net for matches the incremental monitor cannot
+            # see (e.g. completed only by the decoder's held-back tail).
+            trimmed_text, matched_stop = _trim_text_at_stop_sequences(
+                str(generated.get("text") or ""), stop_sequences
+            )
+            if matched_stop is not None:
+                generated["text"] = trimmed_text
+                finish_reason = "stop"
+                generated["finish_reason"] = "stop"
+                generated.setdefault("stats", {})["stop_sequence_hit"] = True
+                generated["stats"]["stop_sequence_matched"] = matched_stop
+        generated.setdefault("stats", {})["finish_reason"] = finish_reason
+        display_text = _display_text(state, generated)
         return JSONResponse(
             {
                 "id": response_id,
@@ -9438,7 +22310,7 @@ def create_app(state: ServerState) -> FastAPI:
                 "created": created,
                 "model": model,
                 "choices": [
-                    {"index": 0, "text": display_text, "finish_reason": "stop"}
+                    {"index": 0, "text": display_text, "finish_reason": finish_reason}
                 ],
                 "usage": _usage_payload(generated),
                 "mtplx_stats": _public_mtplx_stats(generated),
@@ -9450,13 +22322,20 @@ def create_app(state: ServerState) -> FastAPI:
         _request: Request, exc: HTTPException
     ) -> JSONResponse:
         _record_tool_parse_event(state, event="openai_error_response")
+        detail_payload = exc.detail if isinstance(exc.detail, dict) else None
+        message = str(exc.detail)
+        if detail_payload is not None:
+            detail_message = detail_payload.get("message")
+            if isinstance(detail_message, str) and detail_message:
+                message = detail_message
         return JSONResponse(
             status_code=exc.status_code,
             headers=getattr(exc, "headers", None),
             content=_openai_error_content(
-                str(exc.detail),
+                message,
                 status_code=exc.status_code,
                 code=type(exc).__name__,
+                detail=detail_payload,
             ),
         )
 
@@ -9496,7 +22375,53 @@ def create_app(state: ServerState) -> FastAPI:
             ),
         )
 
+    # Mount the dashboard SPA last so its catch-all does not shadow the
+    # explicit routes above (FastAPI/Starlette route resolution is order-
+    # sensitive once a StaticFiles mount with html=True is involved).
+    _mount_dashboard(app)
+
     return app
+
+
+def _mount_dashboard(app: FastAPI) -> None:
+    """Mount the dashboard SPA at ``/dashboard`` if the bundle is present.
+
+    When the bundle is missing (e.g. running from source without a
+    ``bun run build``) we register a fallback HTML route at the same path
+    with build instructions, so curl ``/dashboard`` always returns
+    something useful.
+    """
+
+    from mtplx.dashboard import DASHBOARD_STATIC_DIR, has_static_bundle
+
+    if has_static_bundle():
+        from fastapi.staticfiles import StaticFiles
+
+        app.mount(
+            "/dashboard",
+            StaticFiles(directory=str(DASHBOARD_STATIC_DIR), html=True),
+            name="dashboard",
+        )
+        return
+
+    fallback_html = (
+        "<!doctype html><meta charset=utf-8><title>MTPLX Dashboard</title>"
+        "<body style='font-family:ui-sans-serif,system-ui;background:#0a0a0a;"
+        "color:#e8eef3;padding:48px;max-width:720px'>"
+        "<h1>MTPLX Dashboard</h1>"
+        "<p>The dashboard SPA bundle is missing from this MTPLX install.</p>"
+        "<pre style='background:#14181d;padding:16px;border-radius:8px'>"
+        "cd dashboard\nbun install\nbun run build</pre>"
+        "<p>Then restart <code>mtplx serve</code> and reload this page.</p>"
+        f"<p style='color:#8d97a3;font-size:13px'>Expected bundle: "
+        f"<code>{DASHBOARD_STATIC_DIR}</code></p>"
+        "</body>"
+    )
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    @app.get("/dashboard/", response_class=HTMLResponse)
+    def dashboard_fallback() -> HTMLResponse:
+        return HTMLResponse(fallback_html, status_code=200)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -9506,13 +22431,179 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _explicit_server_flags(raw_args: list[str]) -> set[str]:
+    flags: set[str] = set()
+    for token in raw_args:
+        if not token.startswith("-") or token in {"-", "--"}:
+            continue
+        head = token.split("=", 1)[0]
+        if head.startswith("--"):
+            flags.add(head[2:])
+        else:
+            flags.add(head[1:])
+    return flags
+
+
+def _server_flag_present(flags: set[str], *names: str) -> bool:
+    candidates = set(names)
+    candidates.update(name.replace("_", "-") for name in names)
+    candidates.update(name.replace("-", "_") for name in names)
+    return any(name in flags for name in candidates)
+
+
+def _model_ref_is_gemma4_pair(model_ref: str | None) -> bool:
+    if is_gemma4_pair_repo_id(model_ref):
+        return True
+    if not model_ref:
+        return False
+    try:
+        return resolve_gemma4_pair_paths(model_ref) is not None
+    except Exception:
+        return False
+
+
+def _gemma4_bundle_defaults(model_ref: str | None) -> tuple[dict[str, Any] | None, int | None]:
+    if not model_ref:
+        return None, None
+    pair = resolve_gemma4_pair_paths(model_ref)
+    if pair is None:
+        return None, None
+    metadata = pair["metadata"]
+    sampler = gemma4_pair_sampler_defaults(
+        target_model=pair["target_model"],
+        metadata=metadata,
+    )
+    benchmark = metadata.get("benchmark") if isinstance(metadata, dict) else {}
+    draft_block_size = None
+    if isinstance(benchmark, dict):
+        try:
+            draft_block_size = int(benchmark.get("best_block_size"))
+        except (TypeError, ValueError):
+            draft_block_size = None
+    return sampler, draft_block_size
+
+
+def _apply_backend_server_defaults(
+    args: argparse.Namespace,
+    *,
+    explicit_flags: set[str],
+) -> None:
+    if (
+        not _server_flag_present(explicit_flags, "backend-id")
+        and _model_ref_is_gemma4_pair(getattr(args, "model", None))
+    ):
+        args.backend_id = GEMMA4_BACKEND
+
+    sync_backend_arg_aliases(args)
+    backend = descriptor_for_backend_id(getattr(args, "backend_id", None))
+    if not _server_flag_present(explicit_flags, "reasoning-parser"):
+        args.reasoning_parser = backend.reasoning_codec.parser
+    if (
+        not _server_flag_present(explicit_flags, "reasoning-effort")
+        and getattr(args, "reasoning_effort", None) in (None, "auto")
+        and backend.reasoning_codec.default_effort
+    ):
+        args.reasoning_effort = backend.reasoning_codec.default_effort
+    if backend.backend_id != GEMMA4_BACKEND:
+        return
+
+    sampler, draft_block_size = _gemma4_bundle_defaults(getattr(args, "model", None))
+    sampler = sampler or backend.sampler_defaults.to_dict()
+    draft_block_size = backend.draft_semantics.clamp(
+        draft_block_size or backend.draft_semantics.default
+    )
+    if not _server_flag_present(explicit_flags, "model-id"):
+        args.model_id = "mtplx-gemma4-31b-assistant-mtp"
+    if not _server_flag_present(explicit_flags, "temperature", "default-temperature"):
+        args.temperature = float(sampler["temperature"])
+    if not _server_flag_present(explicit_flags, "top-p", "default-top-p"):
+        args.top_p = float(sampler["top_p"])
+    if not _server_flag_present(explicit_flags, "top-k"):
+        args.top_k = int(sampler["top_k"])
+    if not _server_flag_present(explicit_flags, "draft-top-p"):
+        args.draft_top_p = float(sampler["top_p"])
+    if not _server_flag_present(explicit_flags, "draft-top-k"):
+        args.draft_top_k = int(sampler["top_k"])
+    if (
+        not _server_flag_present(explicit_flags, "chat-template-profile")
+        or getattr(args, "chat_template_profile", None) == _CHAT_TEMPLATE_PROFILE_LOCAL
+    ):
+        args.chat_template_profile = _CHAT_TEMPLATE_PROFILE_TOKENIZER
+    if not _server_flag_present(
+        explicit_flags,
+        "reasoning",
+        "reasoning-mode",
+        "enable-thinking",
+        "no-enable-thinking",
+    ):
+        args.reasoning = backend.reasoning_codec.default_mode
+        args.reasoning_mode = backend.reasoning_codec.default_mode
+        args.enable_thinking = backend.reasoning_codec.default_mode != "off"
+    if not _server_flag_present(
+        explicit_flags,
+        "depth",
+        "mtp-depth",
+        "speculative-depth",
+        backend.draft_semantics.request_field,
+        "draft-block-size",
+        "gemma-draft-block-size",
+    ):
+        set_draft_control_arg(args, backend, int(draft_block_size))
+    else:
+        sync_backend_arg_aliases(args)
+        if (
+            getattr(args, "draft_block_size", None) is None
+            and _server_flag_present(
+                explicit_flags,
+                "depth",
+                "mtp-depth",
+                "speculative-depth",
+            )
+            and getattr(args, "depth", None) is not None
+        ):
+            set_draft_control_arg(args, backend, int(args.depth))
+    if not _server_flag_present(
+        explicit_flags,
+        "target-distribution-mode",
+        "gemma-target-distribution-mode",
+    ):
+        target_mode = target_distribution_mode_from_args(args, backend)
+        if target_mode is not None:
+            args.target_distribution_mode = target_mode
+            args.gemma_target_distribution_mode = target_mode
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__)
     postcommit_default = os.environ.get("MTPLX_SESSION_POSTCOMMIT_MODE", "async")
     if postcommit_default not in {"inline", "async"}:
         postcommit_default = "async"
     parser.add_argument("--model", default=DEFAULT_HF_MODEL_ID)
     parser.add_argument("--model-id", default="mtplx-qwen36-27b-native-mtp")
+    parser.add_argument("--backend-id", default="qwen3_next", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--assistant-model",
+        "--gemma-assistant-model",
+        dest="assistant_model",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--draft-block-size",
+        "--gemma-draft-block-size",
+        dest="draft_block_size",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--target-distribution-mode",
+        "--gemma-target-distribution-mode",
+        dest="target_distribution_mode",
+        choices=list(assistant_target_distribution_choices()),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME
     )
@@ -9520,8 +22611,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
         "--api-key",
-        default=os.environ.get("MTPLX_AUTH"),
+        default=None,
         help="Require Bearer or X-API-Key auth. Required for non-localhost binds.",
+    )
+    parser.add_argument(
+        "--api-key-file",
+        help="Read the API key from a local file instead of argv/env.",
     )
     parser.add_argument(
         "--rate-limit",
@@ -9534,6 +22629,64 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=_env_int("MTPLX_STREAM_INTERVAL", 1),
         help="Committed-token batch size per chat SSE chunk. Default: 1.",
+    )
+    parser.add_argument(
+        "--scheduler-mode",
+        choices=SCHEDULER_MODE_CHOICES,
+        default=os.environ.get("MTPLX_SCHEDULER_MODE", "serial"),
+        help=(
+            "Generation scheduler mode. The live default remains serial so "
+            "single-request MTP stays the oracle while batching modes are "
+            "brought online behind explicit flags."
+        ),
+    )
+    parser.add_argument(
+        "--batching-preset",
+        choices=BATCHING_PRESET_CHOICES,
+        default=os.environ.get("MTPLX_BATCHING_PRESET", "latency"),
+        help="Concurrent batching policy preset: solo, latency, agent, or throughput.",
+    )
+    parser.add_argument("--max-active-requests", type=int)
+    parser.add_argument("--decode-batch-max", type=int)
+    parser.add_argument("--batch-wait-ms", type=float)
+    parser.add_argument("--prefill-chunk-tokens", type=int)
+    parser.add_argument(
+        "--experimental-mtp-cohorts",
+        action="store_true",
+        help="Expose future batched-MTP verify cohorts as experimental; off by default.",
+    )
+    parser.add_argument(
+        "--ssd-session-cache",
+        choices=["off", "on", "write-only"],
+        default=os.environ.get("MTPLX_SSD_SESSION_CACHE", "off"),
+        help="Persistent SessionBank cold tier. Default off for raw serve.",
+    )
+    parser.add_argument(
+        "--ssd-session-cache-dir",
+        default=os.environ.get("MTPLX_SSD_SESSION_CACHE_DIR", "~/.mtplx/session-bank"),
+        help="Directory for persistent SessionBank snapshots.",
+    )
+    parser.add_argument(
+        "--ssd-session-cache-max-size",
+        default=os.environ.get("MTPLX_SSD_SESSION_CACHE_MAX_SIZE", "100GB"),
+        help="Soft maximum SSD SessionBank cache size.",
+    )
+    parser.add_argument(
+        "--ssd-session-cache-min-prefix-tokens",
+        type=int,
+        default=_env_int("MTPLX_SSD_SESSION_CACHE_MIN_PREFIX_TOKENS", 512),
+        help="Minimum committed prefix length before writing to the SSD SessionBank cache.",
+    )
+    parser.add_argument(
+        "--paged-kv-quantization",
+        "--paged-kv-quant",
+        "--kv-quant",
+        dest="paged_kv_quantization",
+        metavar="{off,q8,q4}",
+        default=os.environ.get("MTPLX_VLLM_METAL_PAGED_KV_QUANT")
+        or os.environ.get("MTPLX_PAGED_KV_QUANT")
+        or "off",
+        help="Paged KV cache quantization mode: off, q8, or q4.",
     )
     parser.add_argument(
         "--warmup-tokens",
@@ -9620,6 +22773,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.18,
     )
+    parser.add_argument("--adaptive-ev-warmup-full-depth-cycles", type=int, default=4)
+    parser.add_argument("--adaptive-ev-exploration-interval", type=int, default=32)
     parser.add_argument(
         "--seed",
         type=int,
@@ -9652,7 +22807,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--reasoning-mode",
         choices=["auto", "on", "off"],
-        default="on",
+        default="auto",
         help="Server-default Qwen thinking mode for clients that do not send enable_thinking.",
     )
     parser.add_argument(
@@ -9662,10 +22817,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Pass enable_thinking to the Qwen chat template for visible <think> reasoning blocks.",
     )
     parser.add_argument(
+        "--reasoning",
+        choices=["auto", "on", "off"],
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--reasoning-parser",
-        choices=["qwen3", "none"],
+        choices=["qwen3", "step3p5", "gemma4", "none"],
         default="qwen3",
         help="Parser for streamed reasoning tags. Use 'none' to stream all text as content.",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["auto", "low", "medium", "high"],
+        default="auto",
+        help="Backend reasoning effort. Step-3.7 Flash maps this to low/medium/high in its chat template.",
     )
     parser.add_argument(
         "--preserve-thinking",
@@ -9675,6 +22842,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Preserve prior assistant <think>/reasoning blocks in chat-template "
             "history. Default auto preserves them for Qwen reasoning templates."
         ),
+    )
+    parser.add_argument(
+        "--tool-prompt-mode",
+        choices=sorted(_TOOL_PROMPT_MODES),
+        default=os.environ.get("MTPLX_TOOL_PROMPT_MODE", _TOOL_PROMPT_MODE_HYBRID),
+        help=(
+            "Tool prompt contract mode. native passes tools only to the model "
+            "chat template; hybrid keeps the legacy MTPLX contract for rollback."
+        ),
+    )
+    parser.add_argument(
+        "--chat-template-profile",
+        choices=sorted(_CHAT_TEMPLATE_PROFILES),
+        default=os.environ.get(
+            "MTPLX_CHAT_TEMPLATE_PROFILE",
+            _CHAT_TEMPLATE_PROFILE_LOCAL,
+        ),
+        help="Chat template profile to apply at model load.",
+    )
+    parser.add_argument(
+        "--chat-template-path",
+        default=os.environ.get("MTPLX_CHAT_TEMPLATE_PATH"),
+        help="Explicit chat_template.jinja path for diagnostics.",
     )
     parser.add_argument(
         "--strip-assistant-reasoning-history",
@@ -9692,6 +22882,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--verify-strategy", default="capture_commit")
     parser.add_argument("--verify-core", default="linear-gdn-from-conv-tape")
+    parser.add_argument("--mtp-adapter", default=None)
+    parser.add_argument("--merge-mtp-adapter", action="store_true")
+    parser.add_argument("--mtp-quant-bits", type=int, default=None)
+    parser.add_argument("--mtp-quant-group-size", type=int, default=64)
+    parser.add_argument(
+        "--mtp-quant-mode",
+        choices=["affine", "symmetric"],
+        default="affine",
+    )
     parser.add_argument(
         "--online-correction-cache",
         action="store_true",
@@ -9747,6 +22946,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--clear-cache-every",
+        type=int,
+        default=None,
+        help=(
+            "Diagnostic override for MTPLX_CLEAR_CACHE_EVERY during generation "
+            "after profile env is applied. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--strict-startup-asserts",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -9772,6 +22980,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Open the local MTPLX browser chat UI after startup.",
     )
     parser.add_argument(
+        "--open-dashboard",
+        action="store_true",
+        help=(
+            "Open the live MTPLX dashboard (/dashboard) after startup "
+            "instead of the chat UI."
+        ),
+    )
+    parser.add_argument(
+        "--enable-thermal-poll",
+        action="store_true",
+        help=(
+            "Enable a 1 Hz background poll of thermal.fan_summary() so the "
+            "dashboard's fan panel updates live. Off by default because the "
+            "poll shells out to `thermalforge status` (~10-30 ms per tick)."
+        ),
+    )
+    parser.add_argument(
+        "--fan-mode",
+        choices=FAN_MODE_CHOICES,
+        default=normalize_fan_mode(os.environ.get("MTPLX_FAN_MODE") or FAN_MODE_DEFAULT),
+        help=(
+            "Fan policy: default leaves Apple fan control alone, smart boosts "
+            "only while visible requests generate, max reports sustained max mode."
+        ),
+    )
+    parser.add_argument(
+        "--app-launch-id",
+        default=os.environ.get("MTPLX_APP_LAUNCH_ID"),
+        help="Opaque native-app launch id echoed by /health for daemon ownership checks.",
+    )
+    parser.add_argument(
         "--launch-pi",
         action="store_true",
         help="Open Pi in Terminal after the MTPLX server is ready.",
@@ -9780,6 +23019,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--launch-opencode",
         action="store_true",
         help="Open OpenCode Desktop after the MTPLX server is ready.",
+    )
+    parser.add_argument(
+        "--launch-hermes",
+        action="store_true",
+        help="Open Hermes Agent in Terminal after the MTPLX server is ready.",
     )
     parser.add_argument(
         "--server-console",
@@ -9791,11 +23035,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="",
         help="Pi command to open when --launch-pi is set.",
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--hermes-launch-command",
+        default="",
+        help="Hermes command to open when --launch-hermes is set.",
+    )
+    args = parser.parse_args(raw_args)
+    args._raw_args = list(raw_args)
+    args._cli_flags = _explicit_server_flags(raw_args)
+    try:
+        resolved_key = resolve_api_key(
+            explicit_api_key=getattr(args, "api_key", None),
+            api_key_file=getattr(args, "api_key_file", None),
+        )
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    args.api_key = resolved_key.value
+    args.api_key_source = resolved_key.source
+    try:
+        args.paged_kv_quantization = normalize_paged_kv_quantization(
+            getattr(args, "paged_kv_quantization", "off")
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    try:
+        args.fan_mode = normalize_fan_mode(getattr(args, "fan_mode", FAN_MODE_DEFAULT))
+    except ValueError as exc:
+        parser.error(str(exc))
+    _apply_backend_server_defaults(args, explicit_flags=args._cli_flags)
+    sync_backend_arg_aliases(args)
     if args.stock_ar:
         args.generation_mode = "ar"
         args.load_mtp = False
-    args.reasoning = _normalize_reasoning_mode(args.reasoning_mode)
+    if getattr(args, "reasoning", None) is None:
+        args.reasoning = args.reasoning_mode
+    args.reasoning = _normalize_reasoning_mode(args.reasoning)
     if args.reasoning == "off":
         args.enable_thinking = False
     elif args.reasoning == "on":
@@ -9807,9 +23081,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _start_aime_parent_watchdog_from_env() -> None:
+    raw = str(os.environ.get("MTPLX_AIME_PARENT_PID") or "").strip()
+    if not raw:
+        return
+    try:
+        parent_pid = int(raw)
+    except ValueError:
+        return
+    if parent_pid <= 1 or parent_pid == os.getpid():
+        return
+
+    def watch_parent() -> None:
+        while True:
+            if os.getppid() == 1:
+                os._exit(0)
+            try:
+                os.kill(parent_pid, 0)
+            except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    os._exit(0)
+            time.sleep(1.0)
+
+    Thread(
+        target=watch_parent,
+        name="aime-parent-watchdog",
+        daemon=True,
+    ).start()
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     validate_server_security_args(args)
+    _start_aime_parent_watchdog_from_env()
     try:
         state = ServerState(args)
     except RuntimeError as exc:
@@ -9829,12 +23133,13 @@ def main(argv: list[str] | None = None) -> None:
 
     _startup_line()
     _startup_line("MTPLX is ready.")
+    chat_url = _startup_printable_chat_url(args)
     if is_wildcard_bind(getattr(args, "host", None)):
         _startup_line("Listening: " + _startup_bind_label(args))
-        _startup_line("Local Chat UI: " + _startup_chat_url(args))
+        _startup_line("Local Chat UI: " + chat_url)
         _startup_line("Local OpenAI API Base URL: " + _startup_openai_base_url(args))
     else:
-        _startup_line("Chat UI: " + _startup_chat_url(args))
+        _startup_line("Chat UI: " + chat_url)
         _startup_line("OpenAI API Base URL: " + _startup_openai_base_url(args))
     _startup_line("Model: " + str(args.model_id))
     _startup_line(
@@ -9851,9 +23156,16 @@ def main(argv: list[str] | None = None) -> None:
     if args.server_console:
         _startup_line("Type /help here for live MTPLX controls.")
         _start_server_console(state)
+    # Open chat and dashboard independently: a user with --open-browser
+    # AND --open-dashboard gets both tabs (chat first, then dashboard with
+    # a small stagger so neither becomes the dropped focus).
     if args.open_browser:
         _startup_line("Opening chat UI in your browser...")
-        _open_browser_later(_startup_chat_url(args))
+        _open_browser_later(_startup_browser_chat_url(args))
+    if getattr(args, "open_dashboard", False):
+        _startup_line("Live Dashboard: " + _startup_dashboard_url(args))
+        _startup_line("Opening live dashboard in your browser...")
+        _open_browser_later(_startup_browser_dashboard_url(args), delay_s=1.6)
     if args.launch_pi:
         command = str(args.pi_launch_command or "").strip()
         if command:
@@ -9866,6 +23178,15 @@ def main(argv: list[str] | None = None) -> None:
     if args.launch_opencode:
         _startup_line("Opening OpenCode Desktop...")
         _open_opencode_later()
+    if args.launch_hermes:
+        command = str(args.hermes_launch_command or "").strip()
+        if command:
+            _startup_line("Opening Hermes Agent in Terminal...")
+            _open_hermes_later(command)
+        else:
+            _startup_line(
+                "warning: --launch-hermes was set but no Hermes command was provided."
+            )
     uvicorn.run(
         app, host=args.host, port=args.port, log_level="warning", access_log=False
     )

@@ -403,9 +403,6 @@ def _payload(args: argparse.Namespace, prompt: str, row_id: str) -> dict[str, An
         "model": args.model,
         "messages": [{"role": "user", "content": content}],
         "max_tokens": int(args.max_tokens),
-        "temperature": float(args.temperature),
-        "top_p": float(args.top_p),
-        "top_k": int(args.top_k),
         "seed": int(args.seed),
         "enable_thinking": bool(args.enable_thinking),
         "stream": False,
@@ -413,11 +410,52 @@ def _payload(args: argparse.Namespace, prompt: str, row_id: str) -> dict[str, An
             "mtplx_benchmark": "aime_shape_memory",
             "row_id": row_id,
             "phase": args.phase,
+            "sampler_source": _sampler_source(args),
         },
     }
+    _apply_sampler_overrides(payload, args)
     if args.stop:
         payload["stop"] = args.stop
     return payload
+
+
+def _sampler_source(args: argparse.Namespace) -> str:
+    return (
+        "explicit_payload"
+        if any(
+            getattr(args, field, None) is not None
+            for field in ("temperature", "top_p", "top_k")
+        )
+        else "server_defaults"
+    )
+
+
+def _apply_sampler_overrides(
+    payload: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    if args.temperature is not None:
+        payload["temperature"] = float(args.temperature)
+    if args.top_p is not None:
+        payload["top_p"] = float(args.top_p)
+    if args.top_k is not None:
+        payload["top_k"] = int(args.top_k)
+
+
+def _request_snapshot(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "max_tokens": int(args.max_tokens),
+        "sampler_source": _sampler_source(args),
+        "temperature": (
+            None if args.temperature is None else float(args.temperature)
+        ),
+        "top_p": None if args.top_p is None else float(args.top_p),
+        "top_k": None if args.top_k is None else int(args.top_k),
+        "seed": int(args.seed),
+        "enable_thinking": bool(args.enable_thinking),
+        "prompt_mode": args.prompt_mode,
+        "stop": args.stop,
+    }
 
 
 def run(args: argparse.Namespace) -> int:
@@ -503,16 +541,7 @@ def run(args: argparse.Namespace) -> int:
                 "suite": args.suite,
                 "elapsed_wall_s": elapsed,
                 "prompt_preview": prompt[:160],
-                "request": {
-                    "max_tokens": int(args.max_tokens),
-                    "temperature": float(args.temperature),
-                    "top_p": float(args.top_p),
-                    "top_k": int(args.top_k),
-                    "seed": int(args.seed),
-                    "enable_thinking": bool(args.enable_thinking),
-                    "prompt_mode": args.prompt_mode,
-                    "stop": args.stop,
-                },
+                "request": _request_snapshot(args),
                 "response_finish_reason": (
                     (response.get("choices") or [{}])[0].get("finish_reason")
                     if isinstance(response.get("choices"), list)
@@ -575,14 +604,7 @@ def run(args: argparse.Namespace) -> int:
             "health_before": health_before,
         },
         "request": {
-            "max_tokens": int(args.max_tokens),
-            "temperature": float(args.temperature),
-            "top_p": float(args.top_p),
-            "top_k": int(args.top_k),
-            "seed": int(args.seed),
-            "enable_thinking": bool(args.enable_thinking),
-            "prompt_mode": args.prompt_mode,
-            "stop": args.stop,
+            **_request_snapshot(args),
             "repeat": int(args.repeat),
             "limit": args.limit,
         },
@@ -667,9 +689,21 @@ def main() -> int:
     run_p.add_argument("--server-pid", type=int)
     run_p.add_argument("--server-pid-file")
     run_p.add_argument("--max-tokens", type=int, default=65536)
-    run_p.add_argument("--temperature", type=float, default=0.0)
-    run_p.add_argument("--top-p", type=float, default=1.0)
-    run_p.add_argument("--top-k", type=int, default=0)
+    run_p.add_argument(
+        "--temperature",
+        type=float,
+        help="Optional explicit sampler override. Omitted by default so serve profile defaults own QA.",
+    )
+    run_p.add_argument(
+        "--top-p",
+        type=float,
+        help="Optional explicit sampler override. Omitted by default so serve profile defaults own QA.",
+    )
+    run_p.add_argument(
+        "--top-k",
+        type=int,
+        help="Optional explicit sampler override. Omitted by default so serve profile defaults own QA.",
+    )
     run_p.add_argument("--seed", type=int, default=42)
     run_p.add_argument("--enable-thinking", action="store_true", default=True)
     run_p.add_argument("--disable-thinking", dest="enable_thinking", action="store_false")

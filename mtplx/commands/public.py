@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import signal
 import shlex
 import shutil
 import socket
@@ -28,6 +29,7 @@ from typing import Any, Callable
 
 from mtplx.artifacts import inspect_model
 from mtplx.benchmarks.validators.basic import (
+    summarize_benchmark_quality,
     validate_balanced_delimiters,
     validate_no_degenerate_loop,
     validate_python_syntax,
@@ -41,6 +43,7 @@ from mtplx.default_models import (
     select_default_model,
 )
 from mtplx.env import collect_environment
+from mtplx.fan_mode import FAN_MODE_MAX, FAN_MODE_SMART, fan_mode_from_args
 from mtplx.kpi import (
     EXIT_EXACTNESS,
     EXIT_QUALITY,
@@ -63,6 +66,14 @@ from mtplx.backends.registry import (
     TIER_ARCH_COMPATIBLE_UNVERIFIED,
     architecture_catalog,
 )
+from mtplx.backends.descriptors import (
+    descriptor_for_architecture_id,
+    descriptor_for_backend_id,
+    descriptor_from_inspection,
+    model_controls_for_descriptor,
+    model_family_from_inspection,
+    tune_policy_for_model,
+)
 from mtplx.profiles import (
     DEFAULT_FP16_HF_MODEL_ID,
     DEFAULT_FP16_PUBLIC_MODEL_ID,
@@ -74,14 +85,33 @@ from mtplx.profiles import (
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
     QUALITY_HF_MODEL_ID,
     QUALITY_PUBLIC_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     apply_profile_env,
     get_profile,
+    restore_profile_env,
+    runtime_env_with_contract_overrides,
 )
 from mtplx.server_urls import (
     bind_label,
     connect_host_for_bind,
     is_wildcard_bind,
     local_url_for_bind,
+)
+from mtplx.runtime_options import (
+    normalize_paged_kv_quantization,
+    paged_kv_quantization_env,
+    resolve_api_key,
 )
 
 
@@ -92,7 +122,46 @@ QUICKSTART_SPEED_PROMPT = (
     "Create a compact single-file HTML5 Canvas Flappy Bird game. "
     "Draw visuals procedurally, include physics, score, restart, and no prose."
 )
-QUICKSTART_TARGETS = {"terminal", "openwebui", "open-webui", "pi", "opencode", "swival"}
+QUICKSTART_TARGETS = {
+    "terminal",
+    "openwebui",
+    "open-webui",
+    "pi",
+    "opencode",
+    "swival",
+    "hermes",
+    "dashboard",
+}
+HERMES_PROFILE_NAME = "mtplx"
+HERMES_LOCAL_API_KEY = "mtplx-local"
+HERMES_CODING_TOOLSETS = ("terminal", "file", "web", "browser", "messaging")
+HERMES_CODING_TOOLSETS_TEXT = ",".join(HERMES_CODING_TOOLSETS)
+HERMES_CAPABILITY_SUMMARY = "Terminal, file, web, browser, and messaging tools."
+HERMES_GATEWAY_STATUS_COMMAND = "env -u HERMES_HOME hermes gateway status"
+HERMES_GATEWAY_TRUTH_HINT = (
+    "MTPLX uses a profile-scoped HERMES_HOME for model routing, while Hermes "
+    "Gateway runs from the root ~/.hermes LaunchAgent. For live messaging "
+    "truth, use `env -u HERMES_HOME hermes gateway status` and "
+    "send_message(action='list')."
+)
+HERMES_MESSAGING_SETUP_HINT = (
+    "Messaging uses Hermes Gateway. Setup is `hermes gateway setup`; choose "
+    "Telegram, provide the required token/user/channel values, and then run "
+    "`hermes gateway start` if the LaunchAgent is stale. Never print token, "
+    "user id, channel id, webhook URL, API key, or other secret values from "
+    ".env; report only configured, missing, connected, not connected, or "
+    "needs repair unless the user explicitly asks for a redacted diagnostic."
+)
+HERMES_SYSTEM_PROMPT = (
+    "You are Hermes inside MTPLX on macOS. You have terminal, file, web, "
+    "browser, and messaging tools. MTPLX owns model routing through the local "
+    "OpenAI-compatible server. Do not send external messages unless the user "
+    "explicitly gives both the destination and content. Do not print token, "
+    "user id, channel id, webhook URL, API key, or other secret values from "
+    ".env; report only configured, missing, connected, not connected, or "
+    "needs repair unless explicitly asked for a redacted diagnostic. "
+    + HERMES_GATEWAY_TRUTH_HINT
+)
 LONG_RESPONSE_DIRECT_PROFILE = (
     "vllm_metal_paged_attn_partitioned_block_16_blocks_1024_"
     "partition_threshold_2048_impl_mlx_vector_paged"
@@ -106,6 +175,8 @@ BENCH_SUSTAINED_DEFAULT_SUITES = {
 }
 BENCH_SUSTAINED_LENGTH_SENSITIVE_SUITES = {"long_code", "long-code"}
 BENCH_SUSTAINED_MAX_TOKENS_THRESHOLD = 512
+BENCH_SUITE_FULL_EXACTNESS_CONTEXTS = "64,2048,6144,10240"
+BENCH_SUITE_QUICK_EXACTNESS_CONTEXTS = "64,2048"
 EXTERNAL_RUNTIME_ENV_KEYS = (
     "MTPLX_VERIFY_OUTPUT_DEPENDS",
     "MTPLX_VERIFY_OUTPUT_DEPENDS_AFTER_TOKENS",
@@ -125,9 +196,10 @@ EXTERNAL_RUNTIME_ENV_KEYS = (
 )
 LOCALHOST_BINDS = {"", "127.0.0.1", "::1", "localhost"}
 MAX_PUBLIC_SPECULATIVE_DEPTH = 3
+MAX_GEMMA4_SPECULATIVE_DEPTH = 8
 TUNE_DEFAULT_DEPTHS = "1,2,3"
 TUNE_DEFAULT_SUITE = "cold-long-code-192"
-TUNE_DEFAULT_MAX_TOKENS = 192
+TUNE_DEFAULT_MAX_TOKENS = 512
 TUNE_DEFAULT_LIMIT = 1
 TUNE_DEFAULT_SEED = 0
 TUNE_STATE_PATH = Path("~/.mtplx/tuning.json").expanduser()
@@ -135,10 +207,104 @@ TUNE_TELEMETRY_SAMPLE_INTERVAL_S = 0.75
 TUNE_POWERMETRICS_SAMPLE_INTERVAL_S = 1.5
 TUNE_CANDIDATE_SETTLE_S = 5.0
 TUNE_TIE_PREFER_DEEPER_WITHIN_PCT = 2.0
+TUNE_ACCEPTANCE_COLLAPSE_THRESHOLD = 0.05
 TUNE_TELEMETRY_ENV = "MTPLX_BENCH_TUNE_TELEMETRY"
 GENERATION_MODE_MTP = "mtp"
 GENERATION_MODE_AR = "ar"
 GENERATION_MODES = {GENERATION_MODE_MTP, GENERATION_MODE_AR}
+OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT = "local_qwen36"
+OPENCODE_FAIR_BATCHING_DEFAULTS: dict[str, Any] = {
+    "scheduler_mode": "ar_batch",
+    "batching_preset": "agent",
+    "decode_batch_max": 4,
+    "batch_wait_ms": 50,
+    "prefill_chunk_tokens": 2048,
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "32GB",
+    "ssd_session_cache_min_prefix_tokens": 1024,
+}
+HERMES_LATENCY_DEFAULTS: dict[str, Any] = {
+    "scheduler_mode": "serial",
+    "batching_preset": "latency",
+    "max_active_requests": None,
+    "decode_batch_max": None,
+    "batch_wait_ms": None,
+    "prefill_chunk_tokens": 2048,
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "100GB",
+    "ssd_session_cache_min_prefix_tokens": 512,
+    "temperature": 0.6,
+    "top_p": 1.0,
+    "top_k": 20,
+    "draft_temperature": 0.6,
+    "draft_top_p": 1.0,
+    "draft_top_k": 20,
+    "tool_prompt_mode": "hybrid",
+    "chat_template_profile": OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT,
+    "adaptive_policy": "expected_value",
+    "adaptive_min_depth": 1,
+    "adaptive_ev_base_depth": 2,
+    "adaptive_ev_warmup_full_depth_cycles": 4,
+    "adaptive_ev_exploration_interval": 32,
+    "reasoning": "auto",
+    "preserve_thinking": "auto",
+}
+_OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES = 96 * 1024**3
+_OPENCODE_HIGH_MEMORY_MAX_BYTES = "24G"
+_OPENCODE_HIGH_MEMORY_PER_SESSION_BYTES = "16G"
+_OPENCODE_DEFAULT_MAX_ENTRIES = "4"
+_OPENCODE_HIGH_MEMORY_MAX_ENTRIES = "16"
+
+
+def _detect_total_ram_bytes_for_opencode_defaults() -> int | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        output = subprocess.check_output(
+            ["sysctl", "-n", "hw.memsize"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+        )
+        total = int(str(output).strip())
+    except Exception:
+        return None
+    return total if total > 0 else None
+
+
+def _opencode_memory_env_defaults() -> dict[str, str]:
+    total_ram = _detect_total_ram_bytes_for_opencode_defaults()
+    high_memory = (
+        total_ram is not None
+        and total_ram >= _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES
+    )
+    max_bytes = _OPENCODE_HIGH_MEMORY_MAX_BYTES if high_memory else "8G"
+    per_session_bytes = (
+        _OPENCODE_HIGH_MEMORY_PER_SESSION_BYTES if high_memory else "4G"
+    )
+    max_entries = (
+        _OPENCODE_HIGH_MEMORY_MAX_ENTRIES
+        if high_memory
+        else _OPENCODE_DEFAULT_MAX_ENTRIES
+    )
+    return {
+        "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+        "MTPLX_SESSION_BANK_MAX_ENTRIES": max_entries,
+        "MTPLX_SESSION_BANK_MAX_BYTES": max_bytes,
+        "MTPLX_SESSION_BANK_PER_SESSION_BYTES": per_session_bytes,
+        "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+        "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+        "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "1",
+        "MTPLX_LAZY_BONUS_VERIFY": "1",
+        "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+        "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+        "MTPLX_ACTIVE_READ_INSPECTION_TOTAL_MAX_LINES": "72",
+        "MTPLX_ACTIVE_READ_INSPECTION_MIN_LINES_PER_FILE": "8",
+        "MTPLX_ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS": "120",
+        "MTPLX_READ_ONLY_INSPECTION_FORCE_ANSWER_AFTER_TOOLS": "12",
+        "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+        "MTPLX_CHAT_TEMPLATE_PROFILE": OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT,
+    }
 
 
 def _absolute_user_path(path: str | Path) -> Path:
@@ -180,6 +346,43 @@ def _runtime_env_with_external_overrides(runtime_env: dict[str, str]) -> dict[st
         if value is not None and value != "":
             merged[key] = value
     return merged
+
+
+def _model_runtime_contract(inspection: dict[str, Any]) -> dict[str, Any] | None:
+    compatibility = inspection.get("compatibility") if isinstance(inspection, dict) else None
+    if isinstance(compatibility, dict):
+        contract = compatibility.get("runtime_contract")
+        if isinstance(contract, dict):
+            return contract
+    contract = inspection.get("runtime_contract") if isinstance(inspection, dict) else None
+    return contract if isinstance(contract, dict) else None
+
+
+def _profile_scoped_model_runtime_contract(
+    inspection: dict[str, Any],
+    profile: Any,
+) -> dict[str, Any] | None:
+    contract = _model_runtime_contract(inspection)
+    if not isinstance(contract, dict):
+        return None
+    recommended = str(contract.get("recommended_profile") or "").strip()
+    if not recommended:
+        return contract
+    active = str(getattr(profile, "name", profile) or "").strip()
+    if recommended == active:
+        return contract
+    return None
+
+
+def _runtime_env_with_model_contract_overrides(
+    runtime_env: dict[str, str],
+    inspection: dict[str, Any],
+    profile: Any,
+) -> dict[str, str]:
+    return runtime_env_with_contract_overrides(
+        runtime_env,
+        _profile_scoped_model_runtime_contract(inspection, profile),
+    )
 
 
 def _bench_run_console_summary(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -234,11 +437,10 @@ def _model_gate(
         unsafe_force_unverified
         and yes
         and tier == TIER_ARCH_COMPATIBLE_UNVERIFIED
-        and compatibility.get("unsafe_force_required")
     ):
         print(
-            "WARNING: running an architecture-compatible but unverified MTPLX model; "
-            "exactness and performance are not guaranteed.",
+            "WARNING: attempting an architecture-compatible but unverified MTPLX "
+            "model; startup will continue and the loader result is authoritative.",
             file=sys.stderr,
         )
         return inspection, None
@@ -325,7 +527,7 @@ def _model_gate_error_lines(inspection: dict[str, Any]) -> list[str]:
             "fix: choose a model with real MTP weights, or graft an MTP sidecar "
             "into this base model."
         )
-    elif compatibility.get("unsafe_force_required"):
+    elif tier == TIER_ARCH_COMPATIBLE_UNVERIFIED:
         lines.append(
             "try: add --unsafe-force-unverified --yes to run without support guarantees"
         )
@@ -377,16 +579,39 @@ def _print_command_error(
         print("try: mtplx models")
 
 
+def _looks_like_gemma4_model_ref(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    normalized = text.replace("_", "-").lower()
+    if "gemma4" in normalized or "gemma-4" in normalized:
+        return True
+    try:
+        path = Path(text).expanduser()
+    except (TypeError, ValueError):
+        return False
+    return (path / "mtplx_pair.json").exists()
+
+
+def _public_depth_ceiling(args: Any) -> int:
+    if _looks_like_gemma4_model_ref(getattr(args, "model", None)) or _looks_like_gemma4_model_ref(
+        getattr(args, "model_id", None)
+    ):
+        return MAX_GEMMA4_SPECULATIVE_DEPTH
+    return MAX_PUBLIC_SPECULATIVE_DEPTH
+
+
 def _validate_public_depth(args: Any, *, printer=print) -> int | None:
     try:
         depth = int(getattr(args, "depth", 3))
     except (TypeError, ValueError):
         printer("error: --depth must be an integer")
         return 2
-    if depth < 1 or depth > MAX_PUBLIC_SPECULATIVE_DEPTH:
+    depth_ceiling = _public_depth_ceiling(args)
+    if depth < 1 or depth > depth_ceiling:
         printer(
             "error: --depth must be between "
-            f"1 and {MAX_PUBLIC_SPECULATIVE_DEPTH} for the current MTPLX runtime"
+            f"1 and {depth_ceiling} for the selected MTPLX runtime"
         )
         printer("hint: omit --depth to use the model contract default")
         return 2
@@ -407,11 +632,20 @@ def _generation_mode_from_args(args: Any) -> str:
     explicit = getattr(args, "generation_mode", None)
     if explicit is not None:
         return _normalize_generation_mode(explicit)
+    if getattr(args, "load_mtp", True) is False:
+        return GENERATION_MODE_AR
     return (
         GENERATION_MODE_AR
         if bool(getattr(args, "no_mtp", False))
         else GENERATION_MODE_MTP
     )
+
+
+def _fan_mode_from_args(args: Any) -> str:
+    mode = fan_mode_from_args(args)
+    setattr(args, "fan_mode", mode)
+    setattr(args, "max", mode == FAN_MODE_MAX)
+    return mode
 
 
 def _set_generation_mode_on_args(args: Any, mode: str) -> None:
@@ -512,13 +746,12 @@ def _model_draft_lm_head_spec(
     inspection: dict[str, Any],
     profile: Any,
 ) -> dict[str, Any] | None:
-    """Use model contract draft-head metadata when present, else profile default."""
+    """Use profile-matching model contract draft-head metadata, else default."""
     fallback = _profile_draft_lm_head_spec(profile)
     try:
         from mtplx.draft_lm_head import draft_lm_head_spec_from_runtime_contract
 
-        compatibility = inspection.get("compatibility") or {}
-        contract = compatibility.get("runtime_contract")
+        contract = _profile_scoped_model_runtime_contract(inspection, profile)
         return draft_lm_head_spec_from_runtime_contract(contract, fallback=fallback)
     except ImportError:
         return fallback
@@ -528,42 +761,217 @@ def _model_draft_sampler_spec(
     inspection: dict[str, Any],
     profile: Any,
 ) -> dict[str, Any] | None:
-    """Use model contract draft-sampler metadata when present, else profile default."""
+    """Use profile-matching model contract draft-sampler metadata, else default."""
     fallback = _profile_draft_sampler_spec(profile)
     try:
         from mtplx.draft_sampling import draft_sampler_spec_from_runtime_contract
 
-        compatibility = inspection.get("compatibility") or {}
-        contract = compatibility.get("runtime_contract")
+        contract = _profile_scoped_model_runtime_contract(inspection, profile)
         return draft_sampler_spec_from_runtime_contract(contract, fallback=fallback)
     except ImportError:
         return fallback
 
 
-def _model_contract_depth(inspection: dict[str, Any], *, fallback: int = 3) -> int:
-    compatibility = inspection.get("compatibility") or {}
-    contract = (
-        compatibility.get("runtime_contract")
-        if isinstance(compatibility, dict)
-        else inspection.get("runtime_contract")
-    )
+def _model_contract_depth(
+    inspection: dict[str, Any],
+    *,
+    profile: Any,
+    fallback: int = 3,
+) -> int:
+    contract = _profile_scoped_model_runtime_contract(inspection, profile)
     if not isinstance(contract, dict):
         return int(fallback)
     try:
         depth = int(contract.get("mtp_depth_max", fallback))
     except (TypeError, ValueError):
         return int(fallback)
-    return max(1, min(MAX_PUBLIC_SPECULATIVE_DEPTH, depth))
+    depth_ceiling = (
+        MAX_GEMMA4_SPECULATIVE_DEPTH
+        if _inspection_is_gemma4_assistant(inspection)
+        else MAX_PUBLIC_SPECULATIVE_DEPTH
+    )
+    return max(1, min(depth_ceiling, depth))
 
 
-def _apply_model_contract_depth_default(args: Any, inspection: dict[str, Any]) -> None:
+def _apply_model_contract_depth_default(
+    args: Any,
+    inspection: dict[str, Any],
+    profile: Any,
+) -> None:
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     if "depth" in cli_flags:
         return
     args.depth = _model_contract_depth(
         inspection,
+        profile=profile,
         fallback=int(getattr(args, "depth", 3)),
     )
+
+
+def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None:
+    if model_id != QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID:
+        return
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    injected = set(getattr(args, "_injected_default_flags", set()) or set())
+    if "depth" not in cli_flags:
+        args.depth = 1
+    if "verify-strategy" not in cli_flags:
+        args.verify_strategy = "target_prefix"
+    if "draft-temperature" not in cli_flags:
+        args.draft_temperature = 0.6
+        injected.add("draft-temperature")
+    if "draft-top-p" not in cli_flags:
+        args.draft_top_p = 0.95
+        injected.add("draft-top-p")
+    if "draft-top-k" not in cli_flags:
+        args.draft_top_k = 20
+        injected.add("draft-top-k")
+    # Measured product defaults must reach the daemon even when the model
+    # contract carries no recommended_draft_sampler; record them so the
+    # draft-sampler resolution treats them like requested values while
+    # user-typed flags still win.
+    args._injected_default_flags = injected
+    if (
+        "chat-template-profile" not in cli_flags
+        and getattr(args, "chat_template_profile", None) in (None, "local_qwen36")
+    ):
+        args.chat_template_profile = "local_qwen36"
+
+
+def _inspection_backend_id(inspection: dict[str, Any]) -> str:
+    compatibility = (
+        inspection.get("compatibility")
+        if isinstance(inspection.get("compatibility"), dict)
+        else {}
+    )
+    return str(
+        inspection.get("recommended_backend")
+        or compatibility.get("recommended_backend")
+        or ""
+    )
+
+
+def _inspection_is_gemma4_assistant(inspection: dict[str, Any]) -> bool:
+    return _inspection_backend_id(inspection) == "gemma4_assistant"
+
+
+def _gemma4_pair_sampler(inspection: dict[str, Any]) -> dict[str, Any]:
+    sampler = inspection.get("recommended_sampler")
+    if not isinstance(sampler, dict):
+        pair = inspection.get("gemma4_pair")
+        sampler = pair.get("sampler") if isinstance(pair, dict) else None
+    if isinstance(sampler, dict):
+        try:
+            return {
+                "temperature": float(sampler["temperature"]),
+                "top_p": float(sampler["top_p"]),
+                "top_k": int(sampler["top_k"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            pass
+    return {"temperature": 1.0, "top_p": 0.95, "top_k": 64}
+
+
+def _gemma4_pair_draft_block_size(inspection: dict[str, Any]) -> int:
+    pair = inspection.get("gemma4_pair")
+    benchmark = pair.get("benchmark") if isinstance(pair, dict) else None
+    if isinstance(benchmark, dict):
+        try:
+            return max(2, min(8, int(benchmark["best_block_size"])))
+        except (KeyError, TypeError, ValueError):
+            pass
+    return 4
+
+
+def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None:
+    descriptor = descriptor_from_inspection(inspection)
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    reasoning = descriptor.reasoning_codec
+    if "reasoning" not in cli_flags and getattr(args, "reasoning", None) is None:
+        args.reasoning = reasoning.default_mode if reasoning.supported else "off"
+    if (
+        "reasoning-parser" not in cli_flags
+        and getattr(args, "reasoning_parser", None) in (None, "qwen3")
+    ):
+        args.reasoning_parser = descriptor.reasoning_codec.parser
+    if (
+        "reasoning-effort" not in cli_flags
+        and getattr(args, "reasoning_effort", None) in (None, "auto")
+        and descriptor.reasoning_codec.default_effort
+    ):
+        args.reasoning_effort = descriptor.reasoning_codec.default_effort
+
+    sampler = descriptor.sampler_defaults.to_dict()
+    if (
+        "temperature" not in cli_flags
+        and "default-temperature" not in cli_flags
+        and getattr(args, "temperature", None) in (None, 0.6)
+    ):
+        args.temperature = sampler["temperature"]
+    if (
+        "top-p" not in cli_flags
+        and "default-top-p" not in cli_flags
+        and getattr(args, "top_p", None) is None
+    ):
+        args.top_p = sampler["top_p"]
+    if "top-k" not in cli_flags and getattr(args, "top_k", None) in (None, 20):
+        args.top_k = sampler["top_k"]
+    if (
+        "depth" not in cli_flags
+        and descriptor.draft_semantics.request_field == "depth"
+        and getattr(args, "depth", None) in (None, 3)
+    ):
+        args.depth = descriptor.draft_semantics.default
+    if (
+        "draft-temperature" not in cli_flags
+        and getattr(args, "draft_temperature", None) in (None, 0.6)
+    ):
+        args.draft_temperature = sampler["temperature"]
+    if "draft-top-p" not in cli_flags and getattr(args, "draft_top_p", None) is None:
+        args.draft_top_p = sampler["top_p"]
+    if (
+        "draft-top-k" not in cli_flags
+        and getattr(args, "draft_top_k", None) in (None, 20)
+    ):
+        args.draft_top_k = sampler["top_k"]
+    if (
+        "chat-template-profile" not in cli_flags
+        and descriptor.model_family not in {"qwen", "qwen3_5", "qwen3_6"}
+        and getattr(args, "chat_template_profile", None) == "local_qwen36"
+    ):
+        args.chat_template_profile = "tokenizer"
+
+    if not descriptor.supports("native_adaptive_depth_policy"):
+        if (
+            "adaptive-policy" not in cli_flags
+            and getattr(args, "adaptive_policy", None) == "expected_value"
+        ):
+            args.adaptive_policy = "none"
+
+    if not _inspection_is_gemma4_assistant(inspection):
+        return
+    sampler = _gemma4_pair_sampler(inspection)
+    draft_block_size = _gemma4_pair_draft_block_size(inspection)
+    if getattr(args, "model_id", None) == DEFAULT_PUBLIC_MODEL_ID:
+        args.model_id = "mtplx-gemma4-31b-assistant-mtp"
+    if getattr(args, "temperature", None) in (None, 0.6):
+        args.temperature = sampler["temperature"]
+    if getattr(args, "top_p", None) is None:
+        args.top_p = sampler["top_p"]
+    if getattr(args, "top_k", None) in (None, 20):
+        args.top_k = sampler["top_k"]
+    if getattr(args, "depth", None) in (None, 3):
+        args.depth = draft_block_size
+    if getattr(args, "draft_temperature", None) in (None, 0.6):
+        args.draft_temperature = sampler["temperature"]
+    if getattr(args, "draft_top_p", None) is None:
+        args.draft_top_p = sampler["top_p"]
+    if getattr(args, "draft_top_k", None) in (None, 20):
+        args.draft_top_k = sampler["top_k"]
+    if getattr(args, "chat_template_profile", None) == "local_qwen36":
+        args.chat_template_profile = "tokenizer"
+    if getattr(args, "adaptive_policy", None) == "expected_value":
+        args.adaptive_policy = "none"
 
 
 def _draft_sampler_from_spec(spec: dict[str, Any] | None) -> Any | None:
@@ -576,6 +984,56 @@ def _draft_sampler_from_spec(spec: dict[str, Any] | None) -> Any | None:
         top_p=float(spec["top_p"]),
         top_k=int(spec["top_k"]),
     )
+
+
+_DRAFT_SAMPLER_FLAG_ATTRS = {
+    "draft-temperature": "draft_temperature",
+    "draft-top-p": "draft_top_p",
+    "draft-top-k": "draft_top_k",
+}
+
+
+def _explicit_draft_sampler_override(
+    args: Any,
+    base_sampler: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return a user-requested draft sampler override, not an internal default.
+
+    Measured per-model defaults injected by `_apply_*_defaults` helpers count
+    as requested values (tracked via ``args._injected_default_flags``) so the
+    benchmarked launch configuration still reaches the daemon when the model
+    contract carries no ``recommended_draft_sampler``.
+    """
+
+    cli_flags = set(getattr(args, "_cli_flags", set()) or set())
+    cli_flags |= set(getattr(args, "_injected_default_flags", set()) or set())
+    if not any(flag in cli_flags for flag in _DRAFT_SAMPLER_FLAG_ATTRS):
+        return None
+    base = base_sampler or {
+        "temperature": getattr(args, "temperature", 0.6),
+        "top_p": getattr(args, "top_p", 0.95),
+        "top_k": getattr(args, "top_k", 20),
+    }
+    return {
+        "temperature": (
+            getattr(args, "draft_temperature", None)
+            if "draft-temperature" in cli_flags
+            and getattr(args, "draft_temperature", None) is not None
+            else base["temperature"]
+        ),
+        "top_p": (
+            getattr(args, "draft_top_p", None)
+            if "draft-top-p" in cli_flags
+            and getattr(args, "draft_top_p", None) is not None
+            else base["top_p"]
+        ),
+        "top_k": (
+            getattr(args, "draft_top_k", None)
+            if "draft-top-k" in cli_flags
+            and getattr(args, "draft_top_k", None) is not None
+            else base["top_k"]
+        ),
+    }
 
 
 def _resolve_model_context_window(tokenizer: Any, model_path: str | Path) -> int:
@@ -652,6 +1110,24 @@ def _preserve_thinking_policy(args: Any) -> str:
     return mode if mode in {"auto", "on", "off"} else "auto"
 
 
+def _pi_preserve_thinking_policy(args: Any) -> str:
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if "preserve-thinking" in cli_flags or "strip-assistant-reasoning-history" in cli_flags:
+        return _preserve_thinking_policy(args)
+    return "off"
+
+
+def _apply_pi_history_budget_env_defaults(env: dict[str, str]) -> None:
+    env.setdefault("MTPLX_TOOL_RESULT_COMPACT_THRESHOLD_CHARS", "1200")
+    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_COMPACT_MAX_LINES", "32")
+    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_LINE_MAX_CHARS", "180")
+    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_TOTAL_MAX_LINES", "96")
+    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_MIN_LINES_PER_FILE", "16")
+    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS", "150")
+    env.setdefault("MTPLX_ACTIVE_TOOL_RESULT_COMPACT_MAX_LINES", "32")
+    env.setdefault("MTPLX_ACTIVE_TOOL_RESULT_LINE_MAX_CHARS", "220")
+
+
 def _enable_thinking_for_reasoning(mode: str) -> bool | None:
     if mode == "auto":
         return None
@@ -689,6 +1165,13 @@ def _redact_secret_value(value: Any) -> Any:
             for marker in ("hf_", "bearer ", "api-key", "password", "secret")
         ):
             return "[redacted]"
+    if isinstance(value, str):
+        # Support bundles are shared on GitHub issues; the user's home
+        # directory is identifying. Keep the tail (still diagnostic),
+        # drop the account name (QA-120).
+        home = os.path.expanduser("~")
+        if home and home != "~" and home in value:
+            return value.replace(home, "~")
     return value
 
 
@@ -744,6 +1227,35 @@ def _deep_doctor_report(args: Any, base: dict[str, Any]) -> dict[str, Any]:
     return base
 
 
+def _doctor_model_id_candidates(value: str | None) -> set[str]:
+    text = str(value or "").strip()
+    if not text:
+        return set()
+    raw_candidates = {
+        text,
+        text.replace("\\", "/").rsplit("/", 1)[-1],
+        public_model_id_for_ref(text, default_model_id=DEFAULT_PUBLIC_MODEL_ID),
+    }
+    candidates: set[str] = set()
+    for raw in raw_candidates:
+        normalized = str(raw).strip().lower().replace("_", "-")
+        normalized = normalized.replace("\\", "/").rsplit("/", 1)[-1]
+        normalized = re.sub(r"[^a-z0-9.-]+", "-", normalized)
+        normalized = re.sub(r"-{2,}", "-", normalized).strip("-.")
+        if not normalized:
+            continue
+        candidates.add(normalized)
+        if normalized.startswith("youssofal-") and "-mtplx-" in normalized:
+            candidates.add(normalized.removeprefix("youssofal-"))
+    return candidates
+
+
+def _doctor_model_ids_match(left: str | None, right: str | None) -> bool:
+    left_ids = _doctor_model_id_candidates(left)
+    right_ids = _doctor_model_id_candidates(right)
+    return bool(left_ids and right_ids and left_ids.intersection(right_ids))
+
+
 def _opencode_doctor_report(args: Any) -> dict[str, Any]:
     from mtplx.opencode import (
         detect_opencode_desktop,
@@ -768,6 +1280,7 @@ def _opencode_doctor_report(args: Any) -> dict[str, Any]:
     model_id = (
         str(model_ref or "").split("/", 1)[-1] if model_ref else DEFAULT_PUBLIC_MODEL_ID
     )
+    configured_model_id = str(model_id) if model_ref else None
     model_config = None
     if isinstance(provider, dict):
         models = provider.get("models")
@@ -775,12 +1288,59 @@ def _opencode_doctor_report(args: Any) -> dict[str, Any]:
             model_config = models.get(model_id) or next(iter(models.values()), None)
     options = provider.get("options") if isinstance(provider, dict) else {}
     base_url = ""
+    api_key: str | None = None
+    headers: dict[str, Any] = {}
     if isinstance(options, dict):
         base_url = str(options.get("baseURL") or "")
+        raw_api_key = options.get("apiKey")
+        if raw_api_key:
+            api_key = str(raw_api_key)
+        raw_headers = options.get("headers")
+        if isinstance(raw_headers, dict):
+            headers = raw_headers
     server_url = base_url.rstrip("/")
     if server_url.endswith("/v1"):
         server_url = server_url[:-3]
-    health = _http_json(server_url + "/health", timeout=1.5) if server_url else {}
+    health = (
+        _http_json(server_url + "/health", timeout=1.5, api_key=api_key)
+        if server_url
+        else {}
+    )
+    live_model_id = None
+    if isinstance(health, dict):
+        live_model = (
+            health.get("model")
+            or health.get("model_id")
+            or health.get("served_model_id")
+        )
+        if live_model:
+            live_model_id = str(live_model).split("/", 1)[-1]
+    model_matches_live_server = None
+    stale_model_warning = None
+    if configured_model_id and live_model_id:
+        model_matches_live_server = _doctor_model_ids_match(
+            configured_model_id,
+            live_model_id,
+        )
+        if not model_matches_live_server:
+            stale_model_warning = (
+                "OpenCode config points at "
+                f"{configured_model_id}, but the live MTPLX server reports "
+                f"{live_model_id}. Launch OpenCode from the MTPLX app, or rerun "
+                "`mtplx start opencode` for the intended model before judging "
+                "client behavior."
+            )
+    plugin_setting = (parsed or {}).get("plugin") if isinstance(parsed, dict) else None
+    if isinstance(plugin_setting, list):
+        plugin_paths = [item for item in plugin_setting if isinstance(item, str)]
+    elif isinstance(plugin_setting, str):
+        plugin_paths = [plugin_setting]
+    else:
+        plugin_paths = []
+    deprecated_plugin_configured = any(
+        Path(path).name == "mtplx-session-headers.js" for path in plugin_paths
+    )
+    client_header_ready = headers.get("x-mtplx-client") == "opencode"
     return {
         "config_path": str(config_path),
         "config_exists": config_path.exists(),
@@ -788,14 +1348,17 @@ def _opencode_doctor_report(args: Any) -> dict[str, Any]:
         "detected": detect_opencode_desktop(),
         "provider_present": isinstance(provider, dict),
         "model_ref": model_ref,
+        "configured_model_id": configured_model_id,
         "base_url": base_url,
         "server_url": server_url,
         "server_health": health,
-        "reasoning_field": (
-            (model_config or {}).get("interleaved", {}).get("field")
-            if isinstance(model_config, dict)
-            else None
-        ),
+        "api_key_configured": bool(api_key),
+        "live_model_id": live_model_id,
+        "model_matches_live_server": model_matches_live_server,
+        "stale_model_warning": stale_model_warning,
+        "transport_headers": headers,
+        "mtplx_client_header_configured": client_header_ready,
+        "reasoning_field": None,
         "reasoning_enabled": (
             bool((model_config or {}).get("reasoning"))
             if isinstance(model_config, dict)
@@ -807,7 +1370,103 @@ def _opencode_doctor_report(args: Any) -> dict[str, Any]:
             else False
         ),
         "has_hidden_max_tokens": "maxTokens" in json.dumps(model_config or {}),
+        "plugin_paths": plugin_paths,
+        "deprecated_session_headers_plugin_configured": deprecated_plugin_configured,
+        "session_headers_ready": False,
+        "session_headers_status": "retired",
         "expected_start_command": "mtplx start opencode --port 18083 --profile sustained --max",
+    }
+
+
+def _pi_doctor_report(args: Any) -> dict[str, Any]:
+    from mtplx.pi import pi_models_json_path, pi_model_ref
+
+    config_path = pi_models_json_path()
+    parsed: dict[str, Any] | None = None
+    error: str | None = None
+    if config_path.exists():
+        try:
+            value = json.loads(config_path.read_text(encoding="utf-8"))
+            parsed = value if isinstance(value, dict) else {}
+        except Exception as exc:
+            error = str(exc)
+    providers = (parsed or {}).get("providers") if isinstance(parsed, dict) else None
+    provider = providers.get("mtplx") if isinstance(providers, dict) else None
+    models = provider.get("models") if isinstance(provider, dict) else None
+    model_config = None
+    if isinstance(models, list) and models:
+        first = models[0]
+        model_config = first if isinstance(first, dict) else None
+    configured_model_id = (
+        str(model_config.get("id")) if isinstance(model_config, dict) and model_config.get("id") else None
+    )
+    model_ref = pi_model_ref(configured_model_id) if configured_model_id else None
+    base_url = str(provider.get("baseUrl") or "") if isinstance(provider, dict) else ""
+    api_key = None
+    headers: dict[str, Any] = {}
+    auth_header = False
+    if isinstance(provider, dict):
+        raw_api_key = provider.get("apiKey")
+        if raw_api_key:
+            api_key = str(raw_api_key)
+        auth_header = bool(provider.get("authHeader"))
+        raw_headers = provider.get("headers")
+        if isinstance(raw_headers, dict):
+            headers = raw_headers
+    server_url = base_url.rstrip("/")
+    if server_url.endswith("/v1"):
+        server_url = server_url[:-3]
+    health = (
+        _http_json(server_url + "/health", timeout=1.5, api_key=api_key)
+        if server_url
+        else {}
+    )
+    live_model_id = None
+    if isinstance(health, dict):
+        live_model = (
+            health.get("model")
+            or health.get("model_id")
+            or health.get("served_model_id")
+        )
+        if live_model:
+            live_model_id = str(live_model).split("/", 1)[-1]
+    model_matches_live_server = None
+    stale_model_warning = None
+    if configured_model_id and live_model_id:
+        model_matches_live_server = _doctor_model_ids_match(
+            configured_model_id,
+            live_model_id,
+        )
+        if not model_matches_live_server:
+            stale_model_warning = (
+                "Pi config points at "
+                f"{configured_model_id}, but the live MTPLX server reports "
+                f"{live_model_id}. Launch Pi from the MTPLX app, or rerun "
+                "`mtplx start pi` for the intended model before judging "
+                "client behavior."
+            )
+    return {
+        "config_path": str(config_path),
+        "config_exists": config_path.exists(),
+        "config_error": error,
+        "provider_present": isinstance(provider, dict),
+        "model_ref": model_ref,
+        "configured_model_id": configured_model_id,
+        "base_url": base_url,
+        "server_url": server_url,
+        "server_health": health,
+        "api_key_configured": bool(api_key),
+        "auth_header": auth_header,
+        "live_model_id": live_model_id,
+        "model_matches_live_server": model_matches_live_server,
+        "stale_model_warning": stale_model_warning,
+        "transport_headers": headers,
+        "mtplx_client_header_configured": headers.get("x-mtplx-client") == "pi",
+        "reasoning_enabled": (
+            bool(model_config.get("reasoning")) if isinstance(model_config, dict) else False
+        ),
+        "has_hidden_max_tokens": "maxTokens" in json.dumps(model_config or {}),
+        "expected_start_command": "mtplx start pi --port 8000 --profile sustained --max",
     }
 
 
@@ -936,47 +1595,65 @@ def _depth_sweep_native60(
     max_tokens: int,
     limit: int | None,
     seed: int,
+    temperature: float = 0.6,
+    top_p: float = 0.95,
+    top_k: int = 20,
     draft_lm_head: dict[str, Any] | None = None,
     draft_sampler: dict[str, Any] | None = None,
+    base_hidden_variant: str | None = None,
+    mtp_hidden_variant: str | None = None,
+    concat_order: str | None = None,
+    mtp_cache_policy: str = "persistent",
+    mtp_history_policy: str = "committed",
     compare_ar: bool = False,
     ar_only: bool = False,
+    gemma4_draft_block_size: int | None = None,
+    runtime_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     from mtplx.benchmarks.runners.mtp_depth_sweep import run_mtp_depth_sweep
 
-    apply_profile_env("performance-cold")
+    previous = apply_profile_env("performance-cold")
+    if runtime_env:
+        os.environ.update({key: str(value) for key, value in runtime_env.items()})
     draft_lm_head = draft_lm_head or {
         "bits": 4,
         "group_size": 64,
         "mode": "affine",
     }
-    return run_mtp_depth_sweep(
-        model,
-        prompt_suite,
-        depths=depths,
-        temperature=0.6,
-        top_p=0.95,
-        top_k=20,
-        max_tokens=max_tokens,
-        seed=seed,
-        limit=limit,
-        enable_thinking=False,
-        compare_ar=compare_ar,
-        ar_only=ar_only,
-        mtp_hidden_variant="post_norm",
-        mtp_cache_policy="persistent",
-        mtp_history_policy="committed",
-        min_speculative_depth=1,
-        verify_strategy="capture_commit",
-        verify_core="linear-gdn-from-conv-tape",
-        draft_lm_head_bits=int(draft_lm_head["bits"]),
-        draft_lm_head_group_size=int(draft_lm_head["group_size"]),
-        draft_lm_head_mode=str(draft_lm_head["mode"]),
-        draft_temperature=(
-            None if draft_sampler is None else float(draft_sampler["temperature"])
-        ),
-        draft_top_p=None if draft_sampler is None else float(draft_sampler["top_p"]),
-        draft_top_k=None if draft_sampler is None else int(draft_sampler["top_k"]),
-    )
+    try:
+        return run_mtp_depth_sweep(
+            model,
+            prompt_suite,
+            depths=depths,
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=int(top_k),
+            max_tokens=max_tokens,
+            seed=seed,
+            limit=limit,
+            enable_thinking=False,
+            compare_ar=compare_ar,
+            ar_only=ar_only,
+            gemma4_draft_block_size=gemma4_draft_block_size,
+            base_hidden_variant=base_hidden_variant,
+            mtp_hidden_variant=mtp_hidden_variant,
+            concat_order=concat_order,
+            mtp_cache_policy=mtp_cache_policy,
+            mtp_history_policy=mtp_history_policy,
+            min_speculative_depth=1,
+            verify_strategy="capture_commit",
+            verify_core="linear-gdn-from-conv-tape",
+            draft_lm_head_bits=int(draft_lm_head["bits"]),
+            draft_lm_head_group_size=int(draft_lm_head["group_size"]),
+            draft_lm_head_mode=str(draft_lm_head["mode"]),
+            draft_temperature=(
+                None if draft_sampler is None else float(draft_sampler["temperature"])
+            ),
+            draft_top_p=None if draft_sampler is None else float(draft_sampler["top_p"]),
+            draft_top_k=None if draft_sampler is None else int(draft_sampler["top_k"]),
+        )
+    finally:
+        restore_profile_env(previous)
 
 
 class _temporary_env:
@@ -1032,8 +1709,10 @@ def cmd_doctor(args: Any) -> int:
             "benchmark_exactness_smoke_context": 2048,
         },
     }
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
     report["diagnostics"] = build_diagnostics_payload(
         model_cache=getattr(args, "model_cache", None),
+        include_startup_default_model="model-cache" not in cli_flags,
         deep=bool(getattr(args, "deep", False)),
         mlx_info=env.get("mlx") if isinstance(env.get("mlx"), dict) else None,
         thermal_control=thermal_control,
@@ -1041,6 +1720,8 @@ def cmd_doctor(args: Any) -> int:
     )
     if getattr(args, "topic", None) == "opencode":
         report["opencode"] = _opencode_doctor_report(args)
+    if getattr(args, "topic", None) == "pi":
+        report["pi"] = _pi_doctor_report(args)
     if getattr(args, "topic", None) in {"android-studio", "android_studio"}:
         report["android_studio"] = _android_studio_doctor_report(args)
     if getattr(args, "deep", False):
@@ -1098,11 +1779,50 @@ def cmd_doctor(args: Any) -> int:
                 f"  provider: {'present' if opencode.get('provider_present') else 'missing'}"
             )
             print(f"  model: {opencode.get('model_ref') or 'missing'}")
+            if opencode.get("model_matches_live_server") is True:
+                print("  model sync: ok")
+            elif opencode.get("model_matches_live_server") is False:
+                print("  model sync: stale")
+            else:
+                print("  model sync: unknown")
+            if opencode.get("live_model_id"):
+                print(f"  live model: {opencode.get('live_model_id')}")
             print(f"  base URL: {opencode.get('base_url') or 'missing'}")
             print(f"  reasoning field: {opencode.get('reasoning_field') or 'missing'}")
             print(
                 f"  hidden maxTokens: {str(bool(opencode.get('has_hidden_max_tokens'))).lower()}"
             )
+            print(
+                "  MTPLX client header: "
+                + ("ready" if opencode.get("mtplx_client_header_configured") else "missing")
+            )
+            if opencode.get("stale_model_warning"):
+                print(f"  warning: {opencode.get('stale_model_warning')}")
+        if report.get("pi"):
+            pi = report["pi"]
+            print("Pi:")
+            print(f"  config: {pi.get('config_path')}")
+            print(f"  provider: {'present' if pi.get('provider_present') else 'missing'}")
+            print(f"  model: {pi.get('model_ref') or 'missing'}")
+            if pi.get("model_matches_live_server") is True:
+                print("  model sync: ok")
+            elif pi.get("model_matches_live_server") is False:
+                print("  model sync: stale")
+            else:
+                print("  model sync: unknown")
+            if pi.get("live_model_id"):
+                print(f"  live model: {pi.get('live_model_id')}")
+            print(f"  base URL: {pi.get('base_url') or 'missing'}")
+            print(f"  auth header: {str(bool(pi.get('auth_header'))).lower()}")
+            print(
+                f"  hidden maxTokens: {str(bool(pi.get('has_hidden_max_tokens'))).lower()}"
+            )
+            print(
+                "  MTPLX client header: "
+                + ("ready" if pi.get("mtplx_client_header_configured") else "missing")
+            )
+            if pi.get("stale_model_warning"):
+                print(f"  warning: {pi.get('stale_model_warning')}")
         if report.get("android_studio"):
             android = report["android_studio"]
             print("Android Studio:")
@@ -1188,8 +1908,368 @@ def _print_inspect_human(inspection: dict[str, Any]) -> None:
         print(f"message: {message}")
 
 
+def cmd_stop_public(args: Any) -> int:
+    """Stop a running MTPLX server via its health-reported pid."""
+
+    from mtplx.daemon_client import (
+        DAEMON_PROBE_PORTS,
+        probe_running_daemons,
+        stop_daemon,
+    )
+
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = getattr(args, "port", None)
+    json_output = bool(getattr(args, "json", False))
+
+    def emit(payload: dict[str, Any], *, lines: list[str]) -> None:
+        if json_output:
+            _print(payload)
+        else:
+            for line in lines:
+                print(line)
+
+    if port is None:
+        # The app persists its (possibly port-preflight-bumped) port in
+        # its settings; without this a bumped daemon is invisible to
+        # `mtplx stop` and the user is told nothing is running (QA-121).
+        from mtplx.daemon_client import default_probe_ports
+
+        probe_ports = default_probe_ports()
+        daemons = probe_running_daemons(host=host, ports=probe_ports)
+        if not daemons:
+            emit(
+                {"ok": False, "reason": "no_server"},
+                lines=[
+                    "No running MTPLX server found on ports "
+                    + ", ".join(str(p) for p in probe_ports)
+                    + ".",
+                ],
+            )
+            return 1
+        if len(daemons) > 1:
+            lines = ["Multiple MTPLX servers are running:"]
+            for daemon in daemons:
+                lines.append(
+                    f"  port {daemon.port}  ·  model {daemon.model or '?'}"
+                    f"  ·  started by {daemon.owner_label}"
+                )
+            lines.append("Pick one with: mtplx stop --port <port>")
+            emit(
+                {
+                    "ok": False,
+                    "reason": "multiple_servers",
+                    "ports": [daemon.port for daemon in daemons],
+                },
+                lines=lines,
+            )
+            return 2
+        port = daemons[0].port
+
+    grace_s = float(getattr(args, "grace_seconds", 10.0))
+    result = stop_daemon(host, int(port), grace_s=grace_s)
+    if result.get("ok"):
+        emit(
+            result,
+            lines=[
+                f"Stopped the MTPLX server on port {port} "
+                f"(pid {result.get('pid')}, {result.get('signal')})."
+            ],
+        )
+        return 0
+    reason = str(result.get("reason") or "unknown")
+    reason_lines = {
+        "no_server": [f"No MTPLX server is listening on port {port}."],
+        "not_mtplx": [
+            f"Port {port} is in use, but not by an MTPLX server. "
+            "Not touching it."
+        ],
+        "no_pid": [
+            f"The MTPLX server on port {port} does not report a pid; "
+            "it is likely an older version. Stop it from the terminal "
+            "that started it (Ctrl-C)."
+        ],
+        "permission_denied": [
+            f"No permission to stop the MTPLX server on port {port} "
+            f"(pid {result.get('pid')}). It belongs to another user."
+        ],
+    }
+    emit(result, lines=reason_lines.get(reason, [f"Could not stop: {reason}"]))
+    return 1
+
+
+def _parse_settings_pairs(pairs: list[str]) -> tuple[dict[str, Any], list[str]]:
+    """Parse ``key=value`` pairs; values decode as JSON with string fallback."""
+
+    parsed: dict[str, Any] = {}
+    errors: list[str] = []
+    for pair in pairs:
+        key, separator, raw_value = str(pair).partition("=")
+        key = key.strip()
+        if not separator or not key:
+            errors.append(pair)
+            continue
+        value_text = raw_value.strip()
+        try:
+            parsed[key] = json.loads(value_text)
+        except json.JSONDecodeError:
+            parsed[key] = value_text
+    return parsed, errors
+
+
+def cmd_settings_public(args: Any) -> int:
+    """Read or change live server settings over /v1/mtplx/settings."""
+
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = int(getattr(args, "port", 8000))
+    base = _server_url(host, port)
+    json_output = bool(getattr(args, "json", False))
+    action = str(getattr(args, "settings_action", None) or "get")
+    pairs = list(getattr(args, "pairs", None) or [])
+    if action == "get" and pairs:
+        # `mtplx settings depth=2` reads as intent to set.
+        action = "set"
+
+    def fail_unreachable() -> int:
+        print(f"No MTPLX server is responding on {base}.")
+        print("Start one with the MTPLX app or: mtplx start")
+        return 1
+
+    if action == "get":
+        payload = _http_json(base + "/v1/mtplx/settings", timeout=5.0)
+        if not payload.get("ok"):
+            return fail_unreachable()
+        if json_output:
+            _print(payload)
+            return 0
+        print(f"MTPLX server settings  ·  {base}")
+        for key in sorted(payload):
+            if key in {"ok"}:
+                continue
+            print(f"  {key} = {json.dumps(payload[key], default=str)}")
+        return 0
+
+    update, malformed = _parse_settings_pairs(pairs)
+    if malformed or not update:
+        for pair in malformed:
+            print(f"error: not a key=value pair: {pair!r}")
+        if not update:
+            print("usage: mtplx settings set key=value [key=value ...]")
+            print("example: mtplx settings set depth=2 reasoning=off")
+        return 2
+    response = _http_post_json(
+        base + "/v1/mtplx/settings", update, timeout=10.0
+    )
+    if response.get("ok"):
+        body = response.get("json") or {}
+        applied = body.get("applied") or {}
+        if json_output:
+            _print(body)
+            return 0
+        if applied:
+            for key in sorted(applied):
+                print(f"applied: {key} = {json.dumps(applied[key], default=str)}")
+        else:
+            print("nothing to apply")
+        return 0
+    error = response.get("error")
+    if isinstance(error, dict) and isinstance(error.get("error"), dict):
+        # _http_post_json stores the whole response body; the daemon
+        # wraps errors in the OpenAI envelope {"error": {...}} with the
+        # structured detail inside it (QA-105).
+        error = error["error"]
+    detail = error.get("detail") if isinstance(error, dict) else None
+    if isinstance(detail, dict):
+        kind = detail.get("error")
+        keys = detail.get("keys") or []
+        if kind == "restart_required":
+            print(
+                "error: these settings need a server restart: "
+                + ", ".join(str(key) for key in keys)
+            )
+            print(
+                "Change them in the MTPLX app's settings, or restart "
+                "`mtplx serve` with the matching flags."
+            )
+            return 2
+        if kind == "unknown_settings":
+            print(
+                "error: unknown settings: " + ", ".join(str(key) for key in keys)
+            )
+            supported = detail.get("supported") or []
+            if supported:
+                print(
+                    "supported: " + ", ".join(str(key) for key in supported)
+                )
+            return 2
+    if isinstance(detail, str) and detail:
+        print(f"error: {detail}")
+        return 2
+    if response.get("status") is None:
+        return fail_unreachable()
+    print(f"error: settings update failed ({response.get('status')})")
+    return 1
+
+
+def _format_aime_question_line(event: dict[str, Any]) -> str:
+    idx = int(event.get("idx") or 0)
+    status = str(event.get("status") or "?")
+    extracted = event.get("extracted")
+    expected = event.get("expected")
+    duration_ms = event.get("duration_ms")
+    tokens = int(event.get("reasoning_token_count") or 0) + int(
+        event.get("answer_token_count") or 0
+    )
+    parts = [f"Q{idx:>2}", f"{status:<9}"]
+    parts.append(f"answer={extracted if extracted is not None else '—'}")
+    if status != "correct" and expected is not None:
+        parts.append(f"expected={expected}")
+    if isinstance(duration_ms, (int, float)) and duration_ms > 0:
+        seconds = float(duration_ms) / 1000.0
+        parts.append(f"{seconds:6.1f}s")
+        if tokens:
+            parts.append(f"{tokens / seconds:6.1f} tok/s")
+    return "  ".join(parts)
+
+
+def _format_aime_grid(per_question: list[dict[str, Any]]) -> list[str]:
+    marks: dict[int, str] = {}
+    for row in per_question:
+        idx = int(row.get("idx") or 0)
+        status = str(row.get("status") or "")
+        marks[idx] = (
+            "✓" if status == "correct" else "·" if status == "skipped" else "✗"
+        )
+    if not marks:
+        return []
+    highest = max(marks)
+    lines: list[str] = []
+    for start in range(1, highest + 1, 10):
+        cells = [marks.get(i, " ") for i in range(start, min(start + 10, highest + 1))]
+        lines.append(f"  Q{start:>2}-{min(start + 9, highest):<2}  " + " ".join(cells))
+    return lines
+
+
+def _print_aime_summary(summary: dict[str, Any]) -> None:
+    score = summary.get("score")
+    total = summary.get("total")
+    accuracy = summary.get("accuracy")
+    duration_ms = summary.get("duration_ms")
+    print()
+    for line in _format_aime_grid(list(summary.get("per_question") or [])):
+        print(line)
+    print()
+    headline = f"AIME {summary.get('state') or 'done'}: {score}/{total}"
+    if isinstance(accuracy, (int, float)):
+        headline += f"  ({float(accuracy) * 100:.1f}%)"
+    if isinstance(duration_ms, (int, float)) and duration_ms > 0:
+        headline += f"  in {float(duration_ms) / 60000.0:.1f} min"
+    print(headline)
+    if summary.get("model"):
+        print(f"model: {summary.get('model')}")
+
+
+def _cmd_bench_aime(args: Any) -> int:
+    """Run the app's AIME benchmark from the terminal over the daemon API."""
+
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if "port" in cli_flags:
+        base = _server_url("127.0.0.1", int(getattr(args, "port", 8000)))
+    else:
+        base = str(getattr(args, "url", "http://127.0.0.1:8000")).rstrip("/")
+    health = _http_json(base + "/health", timeout=3.0)
+    if not health.get("ok"):
+        print(f"No MTPLX server is responding on {base}.")
+        print("Start one with the MTPLX app or: mtplx start")
+        return 1
+    print(f"MTPLX AIME benchmark  ·  {base}  ·  model {health.get('model')}")
+
+    active = _http_json(base + "/v1/mtplx/benchmarks/aime/active", timeout=3.0)
+    run_id = active.get("active_run_id")
+    if run_id:
+        print(f"Attaching to the AIME run already in progress ({run_id}).")
+    else:
+        body: dict[str, Any] = {}
+        if bool(getattr(args, "quick", False)):
+            body["question_limit"] = 5
+        started = _http_post_json(
+            base + "/v1/mtplx/benchmarks/aime/start", body, timeout=30.0
+        )
+        if not started.get("ok"):
+            error = started.get("error")
+            if isinstance(error, dict) and error.get("error") == "run_in_progress":
+                run_id = error.get("active_run_id")
+            else:
+                detail = (
+                    error.get("detail")
+                    if isinstance(error, dict)
+                    else error or started.get("status")
+                )
+                print(f"error: could not start the AIME run: {detail}")
+                return 1
+        else:
+            payload = started.get("json") or {}
+            run_id = payload.get("run_id")
+            total = payload.get("total")
+            print(f"run {run_id}  ·  {total} questions  ·  Ctrl-C cancels")
+    if not run_id:
+        print("error: no run id returned by the server")
+        return 1
+
+    stream_url = f"{base}/v1/mtplx/benchmarks/aime/{run_id}/stream"
+    request = urllib.request.Request(stream_url)
+    summary: dict[str, Any] | None = None
+    try:
+        with urllib.request.urlopen(request, timeout=None) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:") :].strip()
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                kind = str(event.get("event") or "")
+                if kind == "question_started":
+                    idx = int(event.get("idx") or 0)
+                    attempt = int(event.get("attempt") or 1)
+                    suffix = f" (attempt {attempt})" if attempt > 1 else ""
+                    print(f"Q{idx:>2} running{suffix}...", flush=True)
+                elif kind == "question_done":
+                    print(_format_aime_question_line(event), flush=True)
+                elif kind in {"run_done", "run_cancelled"}:
+                    summary = event
+                    break
+                elif kind == "error":
+                    print(f"error: {event.get('message') or event}")
+                    return 1
+    except KeyboardInterrupt:
+        print()
+        print("Cancelling the run...")
+        cancelled = _http_post_json(
+            base + f"/v1/mtplx/benchmarks/aime/{run_id}/cancel", {}, timeout=10.0
+        )
+        if cancelled.get("ok"):
+            summary = cancelled.get("json") or {}
+        else:
+            print("error: could not cancel; the run may still be active")
+            return 130
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        print(f"error: lost connection to the server: {exc}")
+        return 1
+    if summary is not None:
+        _print_aime_summary(summary)
+        if getattr(args, "json", False):
+            _print(summary)
+    return 0
+
+
 def cmd_bench_public(args: Any) -> int:
     action = args.bench_action
+    if action == "aime":
+        return _cmd_bench_aime(args)
     if action == "prefill-ladder":
         from mtplx.prefill_bench import (
             UnsafePrefillDiagnosticError,
@@ -1211,7 +2291,7 @@ def cmd_bench_public(args: Any) -> int:
         return _cmd_bench_run(args)
     if action == "tune":
         return _cmd_bench_tune(args)
-    if action == "nightly":
+    if action in {"nightly", "suite"}:
         return _cmd_bench_nightly(args)
     if action == "compare":
         return _cmd_bench_compare(args)
@@ -1222,6 +2302,267 @@ def cmd_bench_public(args: Any) -> int:
     if action == "reference-vllm":
         return _cmd_bench_reference_vllm(args)
     raise SystemExit(f"unknown bench action: {action}")
+
+
+def _tune_requested_model(args: Any) -> str:
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if "model" not in cli_flags:
+        configured_model = (getattr(args, "mtplx_config", None) or {}).get("model")
+        current_model = getattr(args, "model", None)
+        if configured_model and str(current_model) == str(configured_model):
+            return str(configured_model)
+        try:
+            selection = select_default_model()
+            model = getattr(selection, "model", None) or getattr(selection, "hf_model", None)
+            if model:
+                return str(model)
+        except Exception:
+            pass
+    return str(getattr(args, "model", None) or DEFAULT_CHAMPION)
+
+
+def _descriptor_for_tune_family(
+    family: str,
+    inspection: dict[str, Any] | None,
+) -> Any:
+    if inspection:
+        return descriptor_from_inspection(inspection)
+    if family == "gemma4":
+        return descriptor_for_backend_id("gemma4_assistant")
+    if family == "step":
+        return descriptor_for_backend_id("step3p5_mtp")
+    if family == "glm":
+        return descriptor_for_backend_id("glm_mtp")
+    if family == "deepseek":
+        return descriptor_for_backend_id("deepseek_mtp")
+    return descriptor_for_backend_id("qwen3_next")
+
+
+def _local_runtime_metadata(model: str) -> tuple[dict[str, Any] | None, Path | None]:
+    path = Path(str(model)).expanduser()
+    if not path.is_dir():
+        return None, None
+    runtime_path = path / "mtplx_runtime.json"
+    if not runtime_path.is_file():
+        return None, None
+    try:
+        data = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None, runtime_path
+    return data if isinstance(data, dict) else None, runtime_path
+
+
+def _identity_text_parts(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        out: list[str] = []
+        for key, item in value.items():
+            out.append(str(key))
+            out.extend(_identity_text_parts(item))
+        return out
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            out.extend(_identity_text_parts(item))
+        return out
+    if value is None:
+        return []
+    return [str(value)]
+
+
+def _mtplx_tune_family_from_text(text: str) -> str | None:
+    if any(marker in text for marker in ("qwen3.6", "qwen3_6", "qwen3-6", "qwen36")):
+        return "qwen3_6"
+    if any(marker in text for marker in ("qwen3.5", "qwen3_5", "qwen3-5", "qwen35")):
+        return "qwen3_5"
+    if "gemma4" in text or "gemma-4" in text or "gemma 4" in text:
+        return "gemma4"
+    if "step3p5" in text or "step3p7" in text or "step-3.7" in text:
+        return "step"
+    if "deepseek" in text:
+        return "deepseek"
+    if "glm" in text:
+        return "glm"
+    return None
+
+
+def _fast_mtplx_tune_inspection(model: str) -> dict[str, Any] | None:
+    runtime, runtime_path = _local_runtime_metadata(model)
+    parts = [str(model)]
+    parts.extend(_identity_text_parts(runtime))
+    text = " ".join(parts).lower()
+    if "mtplx" not in text:
+        return None
+
+    arch_id = str((runtime or {}).get("arch_id") or "").strip() or None
+    descriptor = descriptor_for_architecture_id(arch_id) if arch_id else None
+    family = _mtplx_tune_family_from_text(text)
+    if family is None and descriptor is not None:
+        if descriptor.model_family == "qwen":
+            family = "qwen3_6"
+        elif descriptor.model_family:
+            family = descriptor.model_family
+    if family is None:
+        return None
+
+    descriptor = descriptor or _descriptor_for_tune_family(family, None)
+    runtime_contract = dict(runtime) if isinstance(runtime, dict) else None
+    compatibility = {
+        "tier": "verified",
+        "can_run": True,
+        "supported": True,
+        "recognized": True,
+        "exit_code": 0,
+        "arch_id": arch_id or descriptor.architecture_id,
+        "recommended_backend": descriptor.backend_id,
+        "recommended_profile": (
+            (runtime or {}).get("recommended_profile") or DEFAULT_PROFILE_NAME
+        ),
+        "runtime_contract": runtime_contract,
+        "runtime_contract_path": str(runtime_path) if runtime_path is not None else None,
+        "runtime_compatibility": "native",
+        "support_level": "mtplx-fast-tune",
+    }
+    model_path = Path(str(model)).expanduser()
+    return {
+        "source": "mtplx-fast-tune",
+        "model_dir": str(model_path) if model_path.is_dir() else str(model),
+        "runtime_model": str(model),
+        "architecture": arch_id or descriptor.architecture_id,
+        "model_type": family,
+        "mtp_arch": arch_id or descriptor.architecture_id,
+        "recommended_backend": descriptor.backend_id,
+        "recommended_profile": compatibility["recommended_profile"],
+        "runtime_contract": runtime_contract,
+        "runtime_contract_path": str(runtime_path) if runtime_path is not None else None,
+        "compatibility": compatibility,
+    }
+
+
+def _tune_support_payload(
+    model: str,
+    *,
+    inspect_local: bool = False,
+) -> dict[str, Any]:
+    inspection: dict[str, Any] | None = _fast_mtplx_tune_inspection(str(model))
+    if inspect_local or Path(str(model)).expanduser().exists():
+        if inspection is None:
+            try:
+                inspection = inspect_model(str(model)).to_dict()
+            except Exception:
+                inspection = None
+    family = model_family_from_inspection(inspection, model_ref=str(model))
+    descriptor = _descriptor_for_tune_family(family, inspection)
+    policy = tune_policy_for_model(str(model), inspection, descriptor)
+    controls = model_controls_for_descriptor(
+        descriptor,
+        model_ref=str(model),
+        inspection=inspection,
+    )
+    unsupported_reason = policy.unsupported_reason or (
+        "Tune is supported for Qwen 3.5, Qwen 3.6, and Gemma 4 MTPLX models only."
+    )
+    return {
+        "ok": bool(policy.supported),
+        "model": str(model),
+        "model_family": controls["model_family"],
+        "backend_id": controls["backend_id"],
+        "architecture_id": controls["architecture_id"],
+        "tune_supported": bool(policy.supported),
+        "supported_families": list(policy.supported_families),
+        "unsupported_reason": None if policy.supported else unsupported_reason,
+        "model_controls": controls,
+    }
+
+
+def _unsupported_tune_model_error(
+    payload: dict[str, Any],
+    *,
+    json_output: bool,
+) -> int:
+    message = "Tune is supported for Qwen 3.5, Qwen 3.6, and Gemma 4 MTPLX models only."
+    family = str(payload.get("model_family") or "unknown")
+    detail = str(payload.get("unsupported_reason") or message)
+    body = {
+        "ok": False,
+        "error": "unsupported_tune_model",
+        "model": payload.get("model"),
+        "model_family": family,
+        "supported_families": payload.get("supported_families")
+        or ["qwen3_5", "qwen3_6", "gemma4"],
+        "message": message,
+        "detail": detail,
+        "model_controls": payload.get("model_controls"),
+    }
+    if json_output:
+        _print(body)
+    else:
+        print(message, file=sys.stderr)
+        print(f"Selected model family: {family}.", file=sys.stderr)
+        if detail and detail != message:
+            print(detail, file=sys.stderr)
+    return 2
+
+
+def _tune_control_field(support_payload: dict[str, Any] | None) -> str:
+    controls = (support_payload or {}).get("model_controls")
+    tune = controls.get("tune") if isinstance(controls, dict) else None
+    field = tune.get("control_field") if isinstance(tune, dict) else None
+    if isinstance(field, str) and field.strip():
+        return field.strip()
+    return "depth"
+
+
+def _tune_default_candidate_values(support_payload: dict[str, Any] | None) -> list[int]:
+    controls = (support_payload or {}).get("model_controls")
+    tune = controls.get("tune") if isinstance(controls, dict) else None
+    draft = controls.get("draft_control") if isinstance(controls, dict) else None
+    field = _tune_control_field(support_payload)
+    if isinstance(tune, dict):
+        values: list[int] = []
+        for label in tune.get("candidates") or []:
+            text = str(label)
+            digits = "".join(ch for ch in text if ch.isdigit())
+            if digits:
+                value = int(digits)
+                if value not in values:
+                    values.append(value)
+        if values:
+            return values
+    if field == "draft_block_size" and isinstance(draft, dict):
+        minimum = int(draft.get("minimum") or 2)
+        maximum = int(draft.get("maximum") or 8)
+        return list(range(minimum, maximum + 1))
+    return _parse_tune_depths(TUNE_DEFAULT_DEPTHS)
+
+
+def _parse_tune_candidate_values(
+    raw: Any,
+    *,
+    support_payload: dict[str, Any] | None,
+) -> list[int]:
+    field = _tune_control_field(support_payload)
+    if raw is None or str(raw).strip() == "":
+        return _tune_default_candidate_values(support_payload)
+    parts = [part.strip() for part in str(raw).split(",") if part.strip()]
+    if not parts:
+        raise ValueError("tune candidates must include at least one value")
+    values: list[int] = []
+    for part in parts:
+        try:
+            value = int(part)
+        except ValueError as exc:
+            if field == "draft_block_size":
+                raise ValueError("Gemma tune blocks must be integers from 2 to 8") from exc
+            raise ValueError("tune depths must be integers from 1 to 3") from exc
+        if field == "draft_block_size":
+            if value < 2 or value > 8:
+                raise ValueError("Gemma tune blocks must be between 2 and 8")
+        else:
+            if value < 1 or value > MAX_PUBLIC_SPECULATIVE_DEPTH:
+                raise ValueError("tune depths must be between 1 and 3")
+        if value not in values:
+            values.append(value)
+    return values
 
 
 def cmd_tune_public(args: Any) -> int:
@@ -1255,15 +2596,7 @@ def _cmd_tune(
     save_default: bool,
     verbose_default: bool,
 ) -> int:
-    try:
-        depths = _parse_tune_depths(
-            getattr(args, "depths", None) or TUNE_DEFAULT_DEPTHS
-        )
-    except ValueError as exc:
-        return _tune_error(str(exc), json_output=bool(getattr(args, "json", False)))
-
-    model = getattr(args, "model", None) or DEFAULT_CHAMPION
-    settings = _tune_settings(args, depths=depths)
+    model = _tune_requested_model(args)
     run_id = getattr(args, "run_id", None) or f"tune-{time.strftime('%Y%m%d-%H%M%S')}"
     output_dir = _absolute_user_path(
         getattr(args, "output_dir", None) or "outputs/cli/tune"
@@ -1279,6 +2612,24 @@ def _cmd_tune(
     collect_telemetry = _tune_collect_telemetry(args, action=action)
 
     if bool(getattr(args, "dry_run", False)):
+        support_payload = _tune_support_payload(model)
+        if not support_payload["tune_supported"]:
+            return _unsupported_tune_model_error(
+                support_payload,
+                json_output=json_output or action == "bench tune",
+            )
+        try:
+            depths = _parse_tune_candidate_values(
+                getattr(args, "depths", None),
+                support_payload=support_payload,
+            )
+        except ValueError as exc:
+            return _tune_error(str(exc), json_output=json_output)
+        settings = _tune_settings(
+            args,
+            depths=depths,
+            control_field=_tune_control_field(support_payload),
+        )
         model_source_notes = _tune_model_source_notes(args, runtime_model=model)
         payload = _tune_dry_run_payload(
             args,
@@ -1292,6 +2643,7 @@ def _cmd_tune(
             save_default=save_default,
             collect_telemetry=collect_telemetry,
             model_source_notes=model_source_notes,
+            support_payload=support_payload,
         )
         if json_output or action == "bench tune":
             _print(payload)
@@ -1309,22 +2661,66 @@ def _cmd_tune(
             detail=resolve_error.get("detail"),
             json_output=json_output,
         )
+    support_payload = _tune_support_payload(runtime_model, inspect_local=True)
+    if not support_payload["tune_supported"]:
+        return _unsupported_tune_model_error(
+            support_payload,
+            json_output=json_output,
+        )
+    try:
+        depths = _parse_tune_candidate_values(
+            getattr(args, "depths", None),
+            support_payload=support_payload,
+        )
+    except ValueError as exc:
+        return _tune_error(str(exc), json_output=json_output)
+    settings = _tune_settings(
+        args,
+        depths=depths,
+        control_field=_tune_control_field(support_payload),
+    )
     model_source_notes = _tune_model_source_notes(args, runtime_model=runtime_model)
 
     profile = get_profile("performance-cold")
-    hardware = _apple_hardware_context()
-    software = _software_context()
-    backend = _mlx_backend_context(profile)
-    state_key, key_material = _tune_state_key(
-        runtime_model,
-        settings=settings,
-        hardware=hardware,
-        software=software,
-        backend=backend,
-    )
-    cached = (
-        None if bool(getattr(args, "retune", False)) else _load_tune_record(state_key)
-    )
+    hardware: dict[str, Any] | None = None
+    software: dict[str, Any] | None = None
+    backend: dict[str, Any] | None = None
+    state_key: str | None = None
+    key_material: dict[str, Any] | None = None
+
+    def _resolve_tune_state_context() -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        str,
+        dict[str, Any],
+    ]:
+        nonlocal hardware, software, backend, state_key, key_material
+        if (
+            hardware is None
+            or software is None
+            or backend is None
+            or state_key is None
+            or key_material is None
+        ):
+            hardware = _apple_hardware_context()
+            software = _software_context()
+            backend = _mlx_backend_context(profile)
+            state_key, key_material = _tune_state_key(
+                runtime_model,
+                settings=settings,
+                hardware=hardware,
+                software=software,
+                backend=backend,
+            )
+        return hardware, software, backend, state_key, key_material
+
+    cached = None
+    if save_default and not bool(getattr(args, "retune", False)):
+        _hardware, _software, _backend, _state_key, _key_material = (
+            _resolve_tune_state_context()
+        )
+        cached = _load_tune_record(_state_key)
     if save_default and cached is not None:
         payload = dict(cached.get("payload") or {})
         payload["from_cache"] = True
@@ -1372,8 +2768,11 @@ def _cmd_tune(
         if not json_output:
             _emit(f"[tune] artifacts: {output_root}")
             _emit(
-                "[tune] running isolated candidates: AR, "
-                + ", ".join(f"D{depth}" for depth in depths)
+                "[tune] running isolated candidates: "
+                + ", ".join(
+                    _tune_candidate_label(candidate, settings.get("control_field"))
+                    for candidate in ["ar", *[str(depth) for depth in depths]]
+                )
             )
         candidate_rows = _run_tune_candidates(
             args,
@@ -1388,6 +2787,7 @@ def _cmd_tune(
     finally:
         max_session.stop()
 
+    hardware, software, backend, state_key, key_material = _resolve_tune_state_context()
     payload = _tune_payload(
         action=action,
         run_id=run_id,
@@ -1429,7 +2829,12 @@ def _cmd_tune(
                 "tune failed; no candidate produced usable tokens"
             )
         elif not payload.get("best"):
-            payload["save_skipped_reason"] = "no MTP depth beat AR"
+            verdict = str((payload.get("best_multiplier") or {}).get("verdict") or "")
+            payload["save_skipped_reason"] = (
+                "no quality-passed MTP depth beat AR"
+                if verdict == "no_quality_passed_mtp_depth_beat_ar"
+                else "no MTP depth beat AR"
+            )
         elif bool(getattr(args, "no_save", False)) or not save_default:
             payload["save_skipped_reason"] = "save disabled"
         write_json(output_path, payload)
@@ -1448,7 +2853,7 @@ def _cmd_tune(
 def _cmd_tune_candidate(args: Any) -> int:
     candidate = str(getattr(args, "_tune_candidate", "")).lower()
     output = Path(getattr(args, "_tune_candidate_output", None) or "")
-    if candidate not in {"ar", "1", "2", "3"}:
+    if candidate not in {"ar", "1", "2", "3", "4", "5", "6", "7", "8"}:
         return _tune_error("invalid tune candidate", json_output=True)
     if not output:
         return _tune_error("missing tune candidate output path", json_output=True)
@@ -1460,20 +2865,67 @@ def _cmd_tune_candidate(args: Any) -> int:
     if resolve_error is not None:
         _print(resolve_error)
         return 1
-    inspection, gate_exit = _model_gate(
-        runtime_model,
-        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
-        yes=True,
-    )
-    if gate_exit is not None:
+    fast_inspection = _fast_mtplx_tune_inspection(runtime_model)
+    if fast_inspection is not None:
+        inspection, gate_exit = fast_inspection, None
+    else:
+        inspection, gate_exit = _model_gate(
+            runtime_model,
+            unsafe_force_unverified=bool(
+                getattr(args, "unsafe_force_unverified", False)
+            ),
+            yes=True,
+        )
+    if gate_exit is not None or inspection is None:
         _print({"error": "model failed MTP primary gate", "model": inspection})
-        return gate_exit
+        return gate_exit or 1
+    support_payload = _tune_support_payload(runtime_model, inspect_local=True)
+    if not support_payload["tune_supported"]:
+        return _unsupported_tune_model_error(support_payload, json_output=True)
+    control_field = _tune_control_field(support_payload)
+    if candidate != "ar":
+        value = int(candidate)
+        if control_field == "draft_block_size":
+            if value < 2 or value > 8:
+                return _tune_error("Gemma tune blocks must be between 2 and 8", json_output=True)
+        elif value < 1 or value > MAX_PUBLIC_SPECULATIVE_DEPTH:
+            return _tune_error("tune depths must be between 1 and 3", json_output=True)
     profile = get_profile("performance-cold")
+    runtime_env = _runtime_env_with_external_overrides(
+        _runtime_env_with_model_contract_overrides(
+            profile.env_dict(),
+            inspection,
+            profile,
+        )
+    )
     draft_lm_head = _model_draft_lm_head_spec(inspection, profile)
     draft_sampler = _model_draft_sampler_spec(inspection, profile)
+    if any(
+        getattr(args, name, None) is not None
+        for name in ("draft_temperature", "draft_top_p", "draft_top_k")
+    ):
+        draft_sampler = {
+            "temperature": float(
+                getattr(args, "draft_temperature", None)
+                if getattr(args, "draft_temperature", None) is not None
+                else (draft_sampler or {}).get("temperature", 0.6)
+            ),
+            "top_p": float(
+                getattr(args, "draft_top_p", None)
+                if getattr(args, "draft_top_p", None) is not None
+                else (draft_sampler or {}).get("top_p", 0.95)
+            ),
+            "top_k": int(
+                getattr(args, "draft_top_k", None)
+                if getattr(args, "draft_top_k", None) is not None
+                else (draft_sampler or {}).get("top_k", 20)
+            ),
+        }
     result = _depth_sweep_native60(
         model=runtime_model,
-        prompt_suite=prompt_suite_path(TUNE_DEFAULT_SUITE),
+        prompt_suite=prompt_suite_path(
+            getattr(args, "prompt_suite", None) or TUNE_DEFAULT_SUITE
+        ),
         depths="1" if candidate == "ar" else candidate,
         max_tokens=int(
             getattr(args, "max_tokens", TUNE_DEFAULT_MAX_TOKENS)
@@ -1481,10 +2933,24 @@ def _cmd_tune_candidate(args: Any) -> int:
         ),
         limit=int(getattr(args, "limit", TUNE_DEFAULT_LIMIT) or TUNE_DEFAULT_LIMIT),
         seed=int(getattr(args, "seed", TUNE_DEFAULT_SEED) or TUNE_DEFAULT_SEED),
+        temperature=float(getattr(args, "temperature", 0.6)),
+        top_p=float(getattr(args, "top_p", 0.95)),
+        top_k=int(getattr(args, "top_k", 20)),
         draft_lm_head=draft_lm_head,
         draft_sampler=draft_sampler,
+        mtp_hidden_variant=getattr(args, "mtp_hidden_variant", None),
+        base_hidden_variant=getattr(args, "base_hidden_variant", None),
+        concat_order=getattr(args, "concat_order", None),
+        mtp_cache_policy=str(getattr(args, "mtp_cache_policy", None) or "persistent"),
+        mtp_history_policy=str(getattr(args, "mtp_history_policy", None) or "committed"),
         compare_ar=candidate == "ar",
         ar_only=candidate == "ar",
+        gemma4_draft_block_size=(
+            None
+            if candidate == "ar" or control_field != "draft_block_size"
+            else int(candidate)
+        ),
+        runtime_env=runtime_env,
     )
     from mtplx.benchmarks.runners.mtp_depth_sweep import write_depth_sweep
 
@@ -1589,18 +3055,52 @@ def _tune_model_source_notes(args: Any, *, runtime_model: str) -> list[str]:
     ]
 
 
-def _tune_settings(args: Any, *, depths: list[int]) -> dict[str, Any]:
+def _tune_settings(
+    args: Any,
+    *,
+    depths: list[int],
+    control_field: str = "depth",
+) -> dict[str, Any]:
+    suite = (
+        getattr(args, "prompt_suite", None)
+        or getattr(args, "suite", None)
+        or TUNE_DEFAULT_SUITE
+    )
     return {
         "profile": "performance-cold",
-        "suite": TUNE_DEFAULT_SUITE,
+        "suite": str(suite),
         "depths": ",".join(str(depth) for depth in depths),
+        "control_field": control_field,
         "max_tokens": int(
             getattr(args, "max_tokens", TUNE_DEFAULT_MAX_TOKENS)
             or TUNE_DEFAULT_MAX_TOKENS
         ),
         "limit": int(getattr(args, "limit", TUNE_DEFAULT_LIMIT) or TUNE_DEFAULT_LIMIT),
         "seed": int(getattr(args, "seed", TUNE_DEFAULT_SEED) or TUNE_DEFAULT_SEED),
+        "temperature": float(getattr(args, "temperature", 0.6)),
+        "top_p": float(getattr(args, "top_p", 0.95)),
+        "top_k": int(getattr(args, "top_k", 20)),
         "thinking": "disabled",
+        "mtp_hidden_variant": (
+            str(getattr(args, "mtp_hidden_variant"))
+            if getattr(args, "mtp_hidden_variant", None)
+            else None
+        ),
+        "base_hidden_variant": (
+            str(getattr(args, "base_hidden_variant"))
+            if getattr(args, "base_hidden_variant", None)
+            else None
+        ),
+        "concat_order": (
+            str(getattr(args, "concat_order"))
+            if getattr(args, "concat_order", None)
+            else None
+        ),
+        "mtp_cache_policy": str(getattr(args, "mtp_cache_policy", None) or "persistent"),
+        "mtp_history_policy": str(getattr(args, "mtp_history_policy", None) or "committed"),
+        "draft_temperature": getattr(args, "draft_temperature", None),
+        "draft_top_p": getattr(args, "draft_top_p", None),
+        "draft_top_k": getattr(args, "draft_top_k", None),
         "candidate_settle_s": max(
             0.0,
             _tune_env_float("MTPLX_TUNE_CANDIDATE_SETTLE_S", TUNE_CANDIDATE_SETTLE_S),
@@ -1718,15 +3218,16 @@ def _tune_dry_run_payload(
     save_default: bool,
     collect_telemetry: bool,
     model_source_notes: list[str] | None = None,
+    support_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     commands = []
     for candidate in ["ar", *[str(depth) for depth in depths]]:
-        candidate_output = (
-            output_root / f"{_tune_candidate_label(candidate).lower()}.json"
+        candidate_output = output_root / (
+            _tune_candidate_file_stem(candidate, settings.get("control_field")) + ".json"
         )
         commands.append(
             {
-                "candidate": _tune_candidate_label(candidate),
+                "candidate": _tune_candidate_label(candidate, settings.get("control_field")),
                 "command": _tune_candidate_command(
                     args,
                     candidate=candidate,
@@ -1743,6 +3244,11 @@ def _tune_dry_run_payload(
         "run_id": run_id,
         "model": model,
         "settings": settings,
+        "model_family": (support_payload or {}).get("model_family"),
+        "backend_id": (support_payload or {}).get("backend_id"),
+        "tune_supported": (support_payload or {}).get("tune_supported", True),
+        "unsupported_reason": (support_payload or {}).get("unsupported_reason"),
+        "model_controls": (support_payload or {}).get("model_controls"),
         "candidates": commands,
         "output": str(output_path),
         "state_path": str(_tune_state_path()),
@@ -2285,10 +3791,12 @@ def _run_tune_candidates(
     rows: list[dict[str, Any]] = []
     total = 1 + len(depths)
     settle_s = float(settings.get("candidate_settle_s") or 0.0)
+    control_field = str(settings.get("control_field") or "depth")
     for candidate in ["ar", *[str(depth) for depth in depths]]:
-        label = _tune_candidate_label(candidate)
-        candidate_output = output_root / f"{label.lower()}.json"
-        stdout_path = output_root / f"{label.lower()}.log"
+        label = _tune_candidate_label(candidate, control_field)
+        stem = _tune_candidate_file_stem(candidate, control_field)
+        candidate_output = output_root / f"{stem}.json"
+        stdout_path = output_root / f"{stem}.log"
         command = _tune_candidate_command(
             args,
             candidate=candidate,
@@ -2324,6 +3832,7 @@ def _run_tune_candidates(
         row = _tune_candidate_summary(
             candidate,
             candidate_output,
+            control_field=control_field,
             returncode=proc.returncode,
             stdout_path=stdout_path,
             command=command,
@@ -2380,25 +3889,84 @@ def _tune_candidate_command(
         command.extend(["--cache-dir", str(cache_dir)])
     if bool(getattr(args, "unsafe_force_unverified", False)):
         command.append("--unsafe-force-unverified")
+    suite = settings.get("suite")
+    if suite and str(suite) != TUNE_DEFAULT_SUITE:
+        command.extend(["--prompt-suite", str(suite)])
+    for key, flag in (
+        ("base_hidden_variant", "--base-hidden-variant"),
+        ("mtp_hidden_variant", "--mtp-hidden-variant"),
+        ("concat_order", "--concat-order"),
+        ("mtp_cache_policy", "--mtp-cache-policy"),
+        ("mtp_history_policy", "--mtp-history-policy"),
+        ("temperature", "--temperature"),
+        ("top_p", "--top-p"),
+        ("top_k", "--top-k"),
+        ("draft_temperature", "--draft-temperature"),
+        ("draft_top_p", "--draft-top-p"),
+        ("draft_top_k", "--draft-top-k"),
+    ):
+        value = settings.get(key)
+        if value is not None:
+            command.extend([flag, str(value)])
     return command
 
 
-def _tune_candidate_label(candidate: str) -> str:
-    return "AR" if candidate == "ar" else f"D{candidate}"
+def _tune_candidate_label(candidate: str, control_field: str | None = "depth") -> str:
+    if candidate == "ar":
+        return "AR"
+    if str(control_field or "depth") == "draft_block_size":
+        return f"Block {candidate}"
+    return f"D{candidate}"
+
+
+def _tune_candidate_file_stem(candidate: str, control_field: str | None = "depth") -> str:
+    if candidate == "ar":
+        return "ar"
+    if str(control_field or "depth") == "draft_block_size":
+        return f"block{candidate}"
+    return f"d{candidate}"
+
+
+def _row_validations(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        validation
+        for row in rows
+        if isinstance(row, dict)
+        for validation in (row.get("validations") or [])
+        if isinstance(validation, dict)
+    ]
+
+
+def _row_finish_reason_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        reason = row.get("finish_reason") if isinstance(row, dict) else None
+        if not isinstance(reason, str) or not reason:
+            continue
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
+def _row_hit_token_budget_count(rows: list[dict[str, Any]]) -> int:
+    return sum(1 for row in rows if isinstance(row, dict) and row.get("hit_token_budget"))
 
 
 def _tune_candidate_summary(
     candidate: str,
     path: Path,
     *,
+    control_field: str = "depth",
     returncode: int,
     stdout_path: Path,
     command: list[str],
 ) -> dict[str, Any]:
-    label = _tune_candidate_label(candidate)
+    label = _tune_candidate_label(candidate, control_field)
+    candidate_value = None if candidate == "ar" else int(candidate)
     base = {
         "mode": label,
-        "depth": None if candidate == "ar" else int(candidate),
+        "depth": candidate_value,
+        "control_field": control_field,
+        "draft_block_size": candidate_value if control_field == "draft_block_size" else None,
         "candidate": candidate,
         "returncode": returncode,
         "artifact": str(path),
@@ -2416,12 +3984,16 @@ def _tune_candidate_summary(
         return {**base, "error": f"candidate artifact is not valid JSON: {exc}"}
     if candidate == "ar":
         ar_rows = data.get("ar_rows") or []
+        quality = summarize_benchmark_quality(
+            [row for row in ar_rows if isinstance(row, dict)]
+        )
         tok_values = _row_metric_values(ar_rows, "decode_tok_s", "tok_s")
         end_to_end_values = _row_metric_values(ar_rows, "end_to_end_tok_s")
         elapsed_values = _row_metric_values(ar_rows, "elapsed_s")
         prompt_values = _row_metric_values(ar_rows, "prompt_eval_time_s")
         decode_elapsed_values = _row_metric_values(ar_rows, "decode_elapsed_s")
         generation_windows = _generation_windows_from_rows(ar_rows)
+        hit_token_budget_count = _row_hit_token_budget_count(ar_rows)
         return {
             **base,
             "tok_s": (sum(tok_values) / len(tok_values)) if tok_values else None,
@@ -2443,8 +4015,11 @@ def _tune_candidate_summary(
             "generation_window_s": sum(
                 window["duration_s"] for window in generation_windows
             ),
+            "hit_token_budget": hit_token_budget_count > 0,
+            "hit_token_budget_count": hit_token_budget_count,
+            "finish_reasons": _row_finish_reason_counts(ar_rows),
             "verify_ms_per_call": None,
-            "quality_passed": True if ar_rows else None,
+            **quality,
         }
     depth_rows = data.get("depths") or data.get("depth_results") or []
     row = depth_rows[0] if depth_rows else {}
@@ -2458,13 +4033,9 @@ def _tune_candidate_summary(
     prompt_values = _row_metric_values(generation_rows, "prompt_eval_time_s")
     decode_elapsed_values = _row_metric_values(generation_rows, "decode_elapsed_s")
     generation_windows = _generation_windows_from_rows(generation_rows)
+    hit_token_budget_count = _row_hit_token_budget_count(generation_rows)
     verify_calls = int(summary.get("verify_calls") or 0)
-    validations = [
-        validation
-        for depth_row in depth_rows
-        for result_row in depth_row.get("rows", [])
-        for validation in result_row.get("validations", [])
-    ]
+    quality = summarize_benchmark_quality(generation_rows)
     acceptance = summary.get("acceptance_by_depth")
     if acceptance is None:
         acceptance = _rate_lists(
@@ -2486,6 +4057,10 @@ def _tune_candidate_summary(
         "generation_window_s": sum(
             window["duration_s"] for window in generation_windows
         ),
+        "hit_token_budget": hit_token_budget_count > 0,
+        "hit_token_budget_count": hit_token_budget_count,
+        "finish_reasons": summary.get("finish_reasons")
+        or _row_finish_reason_counts(generation_rows),
         "verify_time_s": summary.get("verify_time_s"),
         "verify_calls": verify_calls,
         "verify_ms_per_call": _ms_per_call(summary.get("verify_time_s"), verify_calls),
@@ -2507,11 +4082,7 @@ def _tune_candidate_summary(
         "mean_accept_probability_by_depth": summary.get(
             "mean_accept_probability_by_depth"
         ),
-        "quality_passed": all(bool(v.get("passed")) for v in validations)
-        if validations
-        else None,
-        "validations_total": len(validations),
-        "validations_passed": sum(1 for v in validations if v.get("passed")),
+        **quality,
     }
 
 
@@ -2593,6 +4164,7 @@ def _tune_payload(
         "model": model,
         "profile": "performance-cold",
         "suite": settings["suite"],
+        "control_field": settings.get("control_field") or "depth",
         "settings": settings,
         "results": rows,
         "best": best.get("winner"),
@@ -2641,12 +4213,19 @@ def _best_multiplier_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
             "winner": None,
             "verdict": "tune_failed_no_ar_result",
         }
-    candidates = [
+    faster_than_ar = [
         row
         for row in annotated
         if row.get("depth") is not None
         and isinstance(row.get("multiplier_vs_ar"), (int, float))
         and float(row["multiplier_vs_ar"]) > 1.0
+    ]
+    quality_rejected = [
+        row for row in faster_than_ar if row.get("quality_passed") is False
+    ]
+    acceptance_collapsed = _tune_acceptance_collapsed_rows(annotated)
+    candidates = [
+        row for row in faster_than_ar if row.get("quality_passed") is not False
     ]
     raw_winner = max(
         candidates, key=lambda row: float(row["multiplier_vs_ar"]), default=None
@@ -2678,11 +4257,39 @@ def _best_multiplier_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
                 default=raw_winner,
             )
     if winner is None:
+        verdict = (
+            "no_quality_passed_mtp_depth_beat_ar"
+            if quality_rejected
+            else (
+                "mtp_acceptance_collapsed"
+                if acceptance_collapsed
+                else "no_mtp_depth_beat_ar"
+            )
+        )
         return {
             "available": bool(ar and isinstance(ar.get("tok_s"), (int, float))),
             "ar_tok_s": ar.get("tok_s") if ar else None,
             "winner": None,
-            "verdict": "no_mtp_depth_beat_ar",
+            "quality_rejected": [
+                {
+                    "mode": row.get("mode"),
+                    "depth": row.get("depth"),
+                    "tok_s": row.get("tok_s"),
+                    "multiplier_vs_ar": row.get("multiplier_vs_ar"),
+                    "hit_token_budget": row.get("hit_token_budget"),
+                    "hit_token_budget_count": row.get("hit_token_budget_count"),
+                    "finish_reasons": row.get("finish_reasons"),
+                }
+                for row in quality_rejected
+            ],
+            "acceptance_collapsed": acceptance_collapsed,
+            "failure_reasons": _tune_failure_reasons(
+                annotated,
+                quality_rejected=quality_rejected,
+                acceptance_collapsed=acceptance_collapsed,
+                winner=None,
+            ),
+            "verdict": verdict,
         }
     raw_winner_changed = raw_winner is not None and raw_winner.get(
         "mode"
@@ -2693,23 +4300,92 @@ def _best_multiplier_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         "winner": {
             "mode": winner.get("mode"),
             "depth": winner.get("depth"),
+            "control_field": winner.get("control_field"),
+            "draft_block_size": winner.get("draft_block_size"),
             "tok_s": winner.get("tok_s"),
             "multiplier_vs_ar": winner.get("multiplier_vs_ar"),
         },
         "raw_winner": {
             "mode": raw_winner.get("mode"),
             "depth": raw_winner.get("depth"),
+            "control_field": raw_winner.get("control_field"),
+            "draft_block_size": raw_winner.get("draft_block_size"),
             "tok_s": raw_winner.get("tok_s"),
             "multiplier_vs_ar": raw_winner.get("multiplier_vs_ar"),
         }
         if raw_winner is not None
         else None,
+        "quality_rejected": [
+                {
+                    "mode": row.get("mode"),
+                    "depth": row.get("depth"),
+                    "tok_s": row.get("tok_s"),
+                    "multiplier_vs_ar": row.get("multiplier_vs_ar"),
+                    "hit_token_budget": row.get("hit_token_budget"),
+                    "hit_token_budget_count": row.get("hit_token_budget_count"),
+                    "finish_reasons": row.get("finish_reasons"),
+                }
+                for row in quality_rejected
+            ],
+        "acceptance_collapsed": acceptance_collapsed,
+        "failure_reasons": _tune_failure_reasons(
+            annotated,
+            quality_rejected=quality_rejected,
+            acceptance_collapsed=acceptance_collapsed,
+            winner=winner,
+        ),
         "tie_breaker": {
             "applied": raw_winner_changed,
             "prefer_deeper_within_pct": tie_margin_pct,
         },
         "verdict": "mtp_depth_wins",
     }
+
+
+def _tune_acceptance_collapsed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    collapsed: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("depth") is None:
+            continue
+        acceptance = [
+            float(value)
+            for value in row.get("acceptance_by_depth") or []
+            if isinstance(value, (int, float))
+        ]
+        if not acceptance:
+            continue
+        if max(acceptance) > TUNE_ACCEPTANCE_COLLAPSE_THRESHOLD:
+            continue
+        collapsed.append(
+            {
+                "mode": row.get("mode"),
+                "depth": row.get("depth"),
+                "tok_s": row.get("tok_s"),
+                "multiplier_vs_ar": row.get("multiplier_vs_ar"),
+                "acceptance_by_depth": acceptance,
+                "quality_passed": row.get("quality_passed"),
+            }
+        )
+    return collapsed
+
+
+def _tune_failure_reasons(
+    rows: list[dict[str, Any]],
+    *,
+    quality_rejected: list[dict[str, Any]],
+    acceptance_collapsed: list[dict[str, Any]],
+    winner: dict[str, Any] | None,
+) -> list[str]:
+    if winner is not None:
+        return []
+    reasons: list[str] = []
+    if acceptance_collapsed:
+        reasons.append("mtp_acceptance_collapsed")
+    if quality_rejected:
+        reasons.append("quality_failed_fast_mtp")
+    if any(row.get("depth") is not None for row in rows):
+        reasons.append("no_mtp_depth_beat_ar")
+    return reasons
 
 
 def _print_tune_dry_run_human(payload: dict[str, Any]) -> None:
@@ -2825,6 +4501,17 @@ def _print_tune_human(payload: dict[str, Any], *, verbose: bool = False) -> None
     print("Speed shown is decode tok/s; prefill is tracked separately.")
     print()
     errors = [row for row in payload.get("results", []) if row.get("error")]
+    best_multiplier = payload.get("best_multiplier") or {}
+    quality_rejected = best_multiplier.get("quality_rejected") or []
+    if quality_rejected:
+        modes = ", ".join(
+            (
+                str(row.get("mode") or f"D{row.get('depth')}")
+                + (" (hit token budget)" if row.get("hit_token_budget") else "")
+            )
+            for row in quality_rejected
+        )
+        print(f"Rejected quality-failing MTP depths: {modes}")
     if errors:
         print("Tune failed for one or more candidates:")
         for row in errors:
@@ -2834,7 +4521,6 @@ def _print_tune_human(payload: dict[str, Any], *, verbose: bool = False) -> None
             f"Best for this Mac: {best.get('mode')}, "
             f"{_fmt_metric(best.get('multiplier_vs_ar'), digits=2)}x AR"
         )
-        best_multiplier = payload.get("best_multiplier") or {}
         tie_breaker = best_multiplier.get("tie_breaker") or {}
         raw_winner = best_multiplier.get("raw_winner") or {}
         if tie_breaker.get("applied") and raw_winner.get("mode"):
@@ -2844,10 +4530,18 @@ def _print_tune_human(payload: dict[str, Any], *, verbose: bool = False) -> None
                 f"of raw fastest {raw_winner.get('mode')}; preferred the deeper depth."
             )
     else:
-        print("No MTP depth beat AR on this run")
+        verdict = str(best_multiplier.get("verdict") or "")
+        if verdict == "no_quality_passed_mtp_depth_beat_ar":
+            print("No quality-passed MTP depth beat AR on this run")
+        elif verdict == "mtp_acceptance_collapsed":
+            print("No MTP depth beat AR; draft acceptance collapsed")
+        else:
+            print("No MTP depth beat AR on this run")
     if payload.get("saved") and best:
+        control_field = str(payload.get("control_field") or "").strip()
+        control_label = "draft block" if control_field == "draft_block_size" else "depth"
         print(
-            f"Saved: Web UI starts will use depth {best.get('depth')} for this model."
+            f"Saved: Web UI starts will use {control_label} {best.get('depth')} for this model."
         )
     elif payload.get("save_skipped_reason"):
         print(f"Not saved: {payload.get('save_skipped_reason')}.")
@@ -2897,13 +4591,23 @@ def cmd_pull_public(args: Any) -> int:
     from mtplx.hf_loader import pull_model, repo_id_from_model_ref
 
     json_mode = bool(getattr(args, "json", False))
+    progress_json = bool(getattr(args, "progress_json", False))
     callback = None
 
     def finalize() -> None:
         return None
 
     progress_interval_s = 10.0
-    if not json_mode:
+
+    def emit_progress_json(event: dict[str, Any]) -> None:
+        print(json.dumps(event, sort_keys=True), flush=True)
+
+    if progress_json:
+        repo_id = repo_id_from_model_ref(args.model) or args.model
+        callback = emit_progress_json
+        progress_interval_s = 0.4
+        emit_progress_json({"event": "resolving", "repo_id": repo_id})
+    elif not json_mode:
         callback, finalize = _rich_download_progress_callback(
             repo_id=repo_id_from_model_ref(args.model) or args.model,
         )
@@ -2918,11 +4622,24 @@ def cmd_pull_public(args: Any) -> int:
         )
     except KeyboardInterrupt:
         finalize()
-        print("download cancelled")
+        if progress_json:
+            emit_progress_json({"event": "cancelled", "model": args.model})
+        else:
+            print("download cancelled")
         return 130
     except Exception as exc:
         finalize()
-        if json_mode:
+        if progress_json:
+            emit_progress_json(
+                {
+                    "event": "failed",
+                    "error": "pull_failed",
+                    "model": args.model,
+                    "message": str(exc),
+                    "detail": str(exc),
+                }
+            )
+        elif json_mode:
             _print({"error": "pull failed", "model": args.model, "detail": str(exc)})
         else:
             print("error: pull failed")
@@ -2930,7 +4647,9 @@ def cmd_pull_public(args: Any) -> int:
             print(f"detail: {exc}")
         return 1
     finalize()
-    if json_mode:
+    if progress_json:
+        emit_progress_json({"event": "result", **result})
+    elif json_mode:
         _print(result)
     else:
         print("MTPLX pull")
@@ -3066,6 +4785,11 @@ def _cmd_bench_run(args: Any) -> int:
     if gate_exit is not None:
         _print({"error": "model failed MTP primary gate", "model": inspection})
         return gate_exit
+    runtime_env = _runtime_env_with_model_contract_overrides(
+        runtime_env,
+        inspection,
+        selected_profile,
+    )
     draft_lm_head = _model_draft_lm_head_spec(inspection, selected_profile)
     draft_sampler = _model_draft_sampler_spec(inspection, selected_profile)
 
@@ -3121,9 +4845,13 @@ def _cmd_bench_run(args: Any) -> int:
             max_tokens=args.max_tokens,
             limit=args.limit,
             seed=benchmark_seed,
+            temperature=float(getattr(args, "temperature", 0.6)),
+            top_p=float(getattr(args, "top_p", 0.95)),
+            top_k=int(getattr(args, "top_k", 20)),
             draft_lm_head=draft_lm_head,
             draft_sampler=draft_sampler,
             compare_ar=bool(getattr(args, "compare_ar", False)),
+            runtime_env=runtime_env,
         )
     output.parent.mkdir(parents=True, exist_ok=True)
     write_depth_sweep(output, result)
@@ -3263,6 +4991,17 @@ def _direct_http_bench_command(
     max_tokens = getattr(args, "max_tokens", None)
     if max_tokens is not None and test_name != "long_code_uncapped":
         command.extend(["--max-tokens", str(int(max_tokens))])
+    headers_json = getattr(args, "headers_json", None)
+    if headers_json:
+        command.extend(["--headers-json", str(headers_json)])
+    metadata_json = getattr(args, "metadata_json", None)
+    if metadata_json:
+        command.extend(["--metadata-json", str(metadata_json)])
+    cache_mode = getattr(args, "cache_mode", None)
+    if cache_mode and str(cache_mode) != "default":
+        command.extend(["--cache-mode", str(cache_mode)])
+    if not bool(getattr(args, "strict_mlx_fork_assert", False)):
+        command.append("--no-strict-mlx-fork-assert")
     return command
 
 
@@ -3501,20 +5240,211 @@ def _nightly_tasks(args: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _bench_suite_is_quick(args: Any) -> bool:
+    return bool(getattr(args, "quick", False))
+
+
+def _client_contract_task(label: str, client: str, *, max_tokens: int) -> dict[str, Any]:
+    return {
+        "label": label,
+        "suite": "flappy",
+        "max_tokens": max_tokens,
+        "profile": "sustained",
+        "strict": False,
+        "strict_cold": False,
+        "harness": "direct-http",
+        "category": "client_contract",
+        "client": client,
+        "headers": {"x-mtplx-client": client},
+        "metadata": {
+            "mtplx_bench_client": client,
+            "mtplx_bench_lane": "quick-suite-client-contract",
+        },
+        "warn_gates": {
+            "tok_s_ge": 35.0,
+            "last64_over_first64_ge": 0.80,
+        },
+        "must": [
+            "request client hint reaches the app-compatible server path",
+            "quality validators pass",
+            "no hidden cap or malformed output regression in the response text",
+        ],
+    }
+
+
+def _quick_suite_tasks(args: Any) -> list[dict[str, Any]]:
+    sustained_profile = get_profile(
+        getattr(args, "profile", None) or DEFAULT_PROFILE_NAME
+    ).name
+    return [
+        {
+            "label": "short-context-384",
+            "suite": "flappy",
+            "max_tokens": 384,
+            "profile": sustained_profile,
+            "strict": False,
+            "strict_cold": False,
+            "harness": "direct-http",
+            "category": "short_context_speed",
+            "warn_gates": {
+                "tok_s_ge": 45.0,
+                "last64_over_first64_ge": 0.85,
+            },
+            "must": [
+                "quality validators pass",
+                "first useful app-style response stays above the comfort floor",
+            ],
+        },
+        {
+            "label": "long-tool-history-1536",
+            "suite": "python_modules_long",
+            "max_tokens": 1536,
+            "profile": sustained_profile,
+            "strict": False,
+            "strict_cold": False,
+            "harness": "direct-http",
+            "category": "long_tool_history",
+            "warn_gates": {
+                "tok_s_ge": 35.0,
+                "last64_over_first64_ge": 0.80,
+                "late_verify_ms_le": 120.0,
+            },
+            "must": [
+                "large coding prompt validates cleanly",
+                "late verify cost does not collapse the tail",
+            ],
+        },
+        _client_contract_task("opencode-contract-1024", "opencode", max_tokens=1024),
+        _client_contract_task("pi-contract-1024", "pi", max_tokens=1024),
+        _client_contract_task("hermes-contract-1024", "hermes", max_tokens=1024),
+    ]
+
+
+def _bench_suite_tasks(args: Any) -> list[dict[str, Any]]:
+    return _quick_suite_tasks(args) if _bench_suite_is_quick(args) else _nightly_tasks(args)
+
+
+def _bench_suite_exactness_contexts(args: Any) -> str:
+    configured = str(
+        getattr(args, "nightly_exactness_contexts", BENCH_SUITE_FULL_EXACTNESS_CONTEXTS)
+        or BENCH_SUITE_FULL_EXACTNESS_CONTEXTS
+    )
+    if _bench_suite_is_quick(args) and configured == BENCH_SUITE_FULL_EXACTNESS_CONTEXTS:
+        return BENCH_SUITE_QUICK_EXACTNESS_CONTEXTS
+    return configured
+
+
+def _apply_bench_suite_task(child: Any, task: dict[str, Any]) -> None:
+    child.suite = task["suite"]
+    child.max_tokens = task["max_tokens"]
+    child.profile = task["profile"]
+    child.strict = task["strict"]
+    child.strict_cold = task["strict_cold"]
+    child.harness = task["harness"]
+    child.headers_json = (
+        json.dumps(task["headers"], sort_keys=True) if task.get("headers") else None
+    )
+    child.metadata_json = (
+        json.dumps(task["metadata"], sort_keys=True) if task.get("metadata") else None
+    )
+    child.cache_mode = task.get("cache_mode")
+
+
+def _bench_suite_task_gates(
+    task: dict[str, Any],
+    envelope: dict[str, Any],
+    *,
+    exit_code: int,
+) -> dict[str, bool]:
+    runtime = envelope.get("runtime") or {}
+    trace = envelope.get("decode_trace") or {}
+    quality = envelope.get("quality") or {}
+    warn = task.get("warn_gates") or {}
+
+    def number_at(source: dict[str, Any], key: str) -> float | None:
+        value = source.get(key)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    tok_s = number_at(runtime, "tok_s") or number_at(runtime, "mean_tok_s")
+    last64_ratio = number_at(trace, "last64_over_first64")
+    late_verify_ms = number_at(trace, "late_verify_ms") or number_at(
+        runtime, "late_verify_ms"
+    )
+    gates = {
+        "exit_zero": int(exit_code) == 0,
+        "quality_passed": bool(quality.get("passed")),
+    }
+    if "tok_s_ge" in warn:
+        gates["tok_s_ge_warn_floor"] = bool(
+            tok_s is not None and tok_s >= float(warn["tok_s_ge"])
+        )
+    if "last64_over_first64_ge" in warn:
+        gates["last64_over_first64_ge_warn_floor"] = bool(
+            last64_ratio is not None
+            and last64_ratio >= float(warn["last64_over_first64_ge"])
+        )
+    if "late_verify_ms_le" in warn:
+        gates["late_verify_ms_le_warn_floor"] = bool(
+            late_verify_ms is not None and late_verify_ms <= float(warn["late_verify_ms_le"])
+        )
+    return gates
+
+
+def _bench_suite_task_status(gates: dict[str, bool]) -> str:
+    if not gates.get("exit_zero") or not gates.get("quality_passed"):
+        return "FAIL"
+    return "PASS" if all(gates.values()) else "WARN"
+
+
+def _bench_suite_model(args: Any) -> str:
+    model = getattr(args, "model", None) or DEFAULT_CHAMPION
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if "model" not in cli_flags and is_verified_default_model_ref(model):
+        selection = select_default_model()
+        to_dict = getattr(selection, "to_dict", None)
+        args._mtplx_default_model_selection = (
+            to_dict() if callable(to_dict) else dict(vars(selection))
+        )
+        return str(selection.model)
+    return str(model)
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
 def _cmd_bench_nightly(args: Any) -> int:
-    model = args.model or DEFAULT_CHAMPION
-    run_id = args.run_id or f"cli-nightly-{time.strftime('%Y%m%d-%H%M%S')}"
-    output = Path(args.output or Path("outputs/cli/nightly") / run_id / "summary.json")
+    model = _bench_suite_model(args)
+    action_name = _bench_suite_action_name(args)
+    default_prefix = "cli-suite" if action_name == "bench suite" else "cli-nightly"
+    run_id = args.run_id or f"{default_prefix}-{time.strftime('%Y%m%d-%H%M%S')}"
+    tasks = _bench_suite_tasks(args)
+    default_root = Path(
+        "outputs/cli/suite"
+        if action_name == "bench suite"
+        else "outputs/cli/nightly"
+    )
+    output = Path(args.output or default_root / run_id / "summary.json")
     task_root = Path(args.output_dir or output.parent)
-    tasks = _nightly_tasks(args)
+    rows_jsonl = output.parent / "rows.jsonl"
     exactness_output = output.parent / "phase0h-full-exactness.json"
+    exactness_contexts = _bench_suite_exactness_contexts(args)
     exactness_cmd = [
         "qa",
         "exactness",
         "--model",
         model,
         "--contexts",
-        str(getattr(args, "nightly_exactness_contexts", "64,2048,6144,10240")),
+        exactness_contexts,
         "--output",
         str(exactness_output),
     ]
@@ -3523,12 +5453,7 @@ def _cmd_bench_nightly(args: Any) -> int:
         for task in tasks:
             child = type("BenchArgs", (), vars(args).copy())()
             child.model = model
-            child.suite = task["suite"]
-            child.max_tokens = task["max_tokens"]
-            child.profile = task["profile"]
-            child.strict = task["strict"]
-            child.strict_cold = task["strict_cold"]
-            child.harness = task["harness"]
+            _apply_bench_suite_task(child, task)
             child.run_id = f"{run_id}-{task['label']}"
             child.output_dir = str(task_root)
             dry_tasks.append(
@@ -3556,12 +5481,18 @@ def _cmd_bench_nightly(args: Any) -> int:
         _print(
             {
                 "dry_run": True,
-                "action": "bench nightly",
+                "action": action_name,
+                "quick": _bench_suite_is_quick(args),
+                "status": "PLAN",
                 "model": model,
+                "default_model_selection": getattr(
+                    args, "_mtplx_default_model_selection", None
+                ),
                 "run_id": run_id,
                 "tasks": dry_tasks,
                 "full_exactness_command": exactness_cmd,
                 "output": str(output),
+                "rows_jsonl": str(rows_jsonl),
                 "policy": {
                     "fanmax_counts_for_product_gate": False,
                     "cold_floor_tok_s": 59.0,
@@ -3577,29 +5508,36 @@ def _cmd_bench_nightly(args: Any) -> int:
     for task in tasks:
         child = type("BenchArgs", (), vars(args).copy())()
         child.model = model
-        child.suite = task["suite"]
-        child.max_tokens = task["max_tokens"]
-        child.profile = task["profile"]
-        child.strict = task["strict"]
-        child.strict_cold = task["strict_cold"]
-        child.harness = task["harness"]
+        _apply_bench_suite_task(child, task)
         child.fanmax = False
         child.run_id = f"{run_id}-{task['label']}"
         child.output_dir = str(task_root)
-        code = _cmd_bench_run(child)
+        env_updates = task.get("env") or {}
+        if env_updates:
+            with _temporary_env({str(k): str(v) for k, v in env_updates.items()}):
+                code = _cmd_bench_run(child)
+        else:
+            code = _cmd_bench_run(child)
         envelope_path = task_root / child.run_id / "envelope.json"
         envelope = (
             json.loads(envelope_path.read_text(encoding="utf-8"))
             if envelope_path.exists()
             else {}
         )
+        task_gates = _bench_suite_task_gates(task, envelope, exit_code=code)
+        task_status = _bench_suite_task_status(task_gates)
         results.append(
             {
                 "label": task["label"],
                 "suite": task["suite"],
                 "max_tokens": task["max_tokens"],
                 "profile": task["profile"],
+                "category": task.get("category"),
+                "client": task.get("client"),
                 "exit_code": code,
+                "status": task_status,
+                "gates": task_gates,
+                "must": task.get("must") or [],
                 "envelope": envelope,
                 "envelope_path": str(envelope_path),
             }
@@ -3611,7 +5549,7 @@ def _cmd_bench_nightly(args: Any) -> int:
             "--model",
             model,
             "--contexts",
-            str(getattr(args, "nightly_exactness_contexts", "64,2048,6144,10240")),
+            exactness_contexts,
             "--attention-impl",
             str(getattr(args, "exactness_attention_impl", "mlx_vector_paged")),
             "--block-size",
@@ -3638,6 +5576,8 @@ def _cmd_bench_nightly(args: Any) -> int:
         bool((row.get("envelope") or {}).get("quality", {}).get("passed"))
         for row in results
     )
+    task_failures_absent = all(row.get("status") != "FAIL" for row in results)
+    task_warnings_absent = all(row.get("status") == "PASS" for row in results)
     cold_tok_s = ((cold.get("envelope") or {}).get("runtime") or {}).get("tok_s")
     f6_tok_s = ((flappy_6k.get("envelope") or {}).get("runtime") or {}).get("tok_s")
     f10_tok_s = ((flappy_10k.get("envelope") or {}).get("runtime") or {}).get("tok_s")
@@ -3656,13 +5596,20 @@ def _cmd_bench_nightly(args: Any) -> int:
         ),
         "quality_passed": quality_passed,
         "no_fan_product_gate": not bool(getattr(args, "fanmax", False)),
+        "task_failures_absent": task_failures_absent,
+        "task_warnings_absent": task_warnings_absent,
     }
     summary = {
-        "action": "bench nightly",
+        "action": action_name,
+        "quick": _bench_suite_is_quick(args),
         "run_id": run_id,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "model": model,
+        "default_model_selection": getattr(
+            args, "_mtplx_default_model_selection", None
+        ),
         "tasks": results,
+        "rows_jsonl": str(rows_jsonl),
         "full_exactness": {
             "returncode": exact_proc.returncode,
             "passed": exact_proc.returncode == 0,
@@ -3671,6 +5618,7 @@ def _cmd_bench_nightly(args: Any) -> int:
         },
         "gates": gates,
         "passed": all(gates.values()),
+        "status": _bench_suite_status(gates),
         "policy": {
             "fanmax_counts_for_product_gate": False,
             "cold_floor_tok_s": 59.0,
@@ -3678,18 +5626,23 @@ def _cmd_bench_nightly(args: Any) -> int:
             "sustained_first_stage_tok_s": 45.0,
         },
     }
+    _write_jsonl(rows_jsonl, results)
     write_json(output, summary)
     _print(
         {
-            "action": "bench nightly",
+            "action": action_name,
+            "status": summary["status"],
+            "quick": summary["quick"],
             "run_id": run_id,
             "output": str(output),
+            "rows_jsonl": str(rows_jsonl),
             "passed": summary["passed"],
             "gates": gates,
             "task_outputs": [
                 {
                     "label": row["label"],
                     "exit_code": row["exit_code"],
+                    "status": row["status"],
                     "envelope": row["envelope_path"],
                 }
                 for row in results
@@ -3701,6 +5654,28 @@ def _cmd_bench_nightly(args: Any) -> int:
     if getattr(args, "strict", False) and not summary["passed"]:
         worst_exit = max(worst_exit, EXIT_STRICT_GATE)
     return worst_exit
+
+
+def _bench_suite_action_name(args: Any) -> str:
+    return (
+        "bench suite"
+        if getattr(args, "bench_action", None) == "suite"
+        else "bench nightly"
+    )
+
+
+def _bench_suite_status(gates: dict[str, Any]) -> str:
+    if all(bool(value) for value in gates.values()):
+        return "PASS"
+    hard_gates = (
+        "full_exactness_passed",
+        "quality_passed",
+        "no_fan_product_gate",
+        "task_failures_absent",
+    )
+    if any(key in gates and not bool(gates.get(key)) for key in hard_gates):
+        return "FAIL"
+    return "WARN"
 
 
 def _load_benchmark_json(path: str | Path) -> dict[str, Any]:
@@ -3982,9 +5957,19 @@ def _cmd_bench_compare(args: Any) -> int:
     return worst_exit
 
 
-def _http_json(url: str, *, timeout: float = 15.0) -> dict[str, Any]:
+def _http_json(
+    url: str,
+    *,
+    timeout: float = 15.0,
+    api_key: str | None = None,
+) -> dict[str, Any]:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+            headers["X-API-Key"] = api_key
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         return {"ok": False, "error": str(exc), "url": url}
@@ -5052,11 +7037,21 @@ def _openwebui_docker_command(
         f"{int(webui_port)}:8080",
         "--add-host=host.docker.internal:host-gateway",
         "-e",
+        "ENABLE_OLLAMA_API=False",
+        "-e",
         "ENABLE_OPENAI_API=True",
         "-e",
-        f"OPENAI_API_BASE_URL={_openwebui_docker_api_base_url(mtplx_port)}",
+        f"OPENAI_API_BASE_URLS={_openwebui_docker_api_base_url(mtplx_port)}",
         "-e",
-        f"OPENAI_API_KEY={api_key}",
+        f"OPENAI_API_KEYS={api_key}",
+        "-e",
+        "ENABLE_TITLE_GENERATION=False",
+        "-e",
+        "ENABLE_TAGS_GENERATION=False",
+        "-e",
+        "ENABLE_FOLLOW_UP_GENERATION=False",
+        "-e",
+        "ENABLE_AUTOCOMPLETE_GENERATION=False",
     ]
     if single_user:
         command.extend(["-e", "WEBUI_AUTH=False"])
@@ -5079,6 +7074,76 @@ def _open_browser_url(url: str) -> None:
         webbrowser.open(url, new=2, autoraise=True)
     except Exception as exc:
         _print_serve_start_line(f"warning: could not open browser automatically: {exc}")
+
+
+def _dashboard_url(host: str, port: int) -> str:
+    return _server_url(host, port) + "/dashboard/"
+
+
+def cmd_dashboard_public(args: Any) -> int:
+    """Open the live MTPLX dashboard in the browser.
+
+    The dashboard is mounted at ``/dashboard`` on the running MTPLX server.
+    This command is a thin opener: probe ``/health`` to confirm the server
+    is up, then ``webbrowser.open`` the dashboard URL. It deliberately
+    does *not* import MLX or start a server; if MTPLX isn't running it
+    tells the user how to start it.
+    """
+
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = int(getattr(args, "port", 8000))
+    timeout = float(getattr(args, "timeout", 2.5))
+    json_output = bool(getattr(args, "json", False))
+
+    base = _server_url(host, port)
+    health_url = f"{base}/health"
+    dashboard_url = _dashboard_url(host, port)
+
+    health = _http_json(health_url, timeout=timeout)
+    server_up = bool(
+        isinstance(health, dict)
+        and "error" not in health
+        and health.get("ok")
+    )
+
+    payload: dict[str, Any] = {
+        "command": "dashboard",
+        "ok": server_up,
+        "dashboard_url": dashboard_url,
+        "health_url": health_url,
+        "host": host,
+        "port": port,
+    }
+    if server_up:
+        payload["model"] = health.get("model")
+        profile = health.get("profile")
+        payload["profile"] = (
+            profile.get("name") if isinstance(profile, dict) else None
+        )
+    else:
+        payload["error"] = "MTPLX server is not reachable"
+        payload["detail"] = (
+            health.get("error") if isinstance(health, dict) else None
+        )
+
+    if json_output:
+        _print(payload)
+    elif server_up:
+        print(f"MTPLX dashboard: {dashboard_url}")
+        if payload.get("model"):
+            print(f"model: {payload['model']}")
+        print("opening in your browser...")
+    else:
+        print(f"error: MTPLX server is not reachable at {base}")
+        print("try: mtplx start  (then re-run `mtplx dashboard`)")
+        print("try: mtplx quickstart --host 127.0.0.1 --port 8000")
+
+    if not server_up:
+        return 1
+
+    if not bool(getattr(args, "no_browser", False)):
+        _open_browser_url(dashboard_url)
+    return 0
 
 
 def _connect_host_for_bind(host: str) -> str:
@@ -5124,25 +7189,119 @@ def _active_mlx_fork_status(
         for parent in [path.parent, *path.parents]:
             if expected_fragment in parent.name or expected_fragment in str(parent):
                 try:
+                    # Bounded timeout: hung git (lock contention,
+                    # zombie pickaxe process, slow disk) must not
+                    # block daemon startup forever. Matches
+                    # `prefill_bench.py`. Hash is diagnostic only.
                     commit = subprocess.check_output(
                         ["git", "-C", str(parent), "rev-parse", "--short", "HEAD"],
                         text=True,
                         stderr=subprocess.DEVNULL,
+                        timeout=2.0,
                     ).strip()
-                except Exception:
+                except (
+                    subprocess.SubprocessError,
+                    FileNotFoundError,
+                    OSError,
+                ):
                     commit = None
                 break
-    ok = expected_fragment in str(path) and (
+    path_active = expected_fragment in str(path)
+    commit_matches = expected_commit is None or commit in {None, expected_commit}
+    ok = path_active and (
         expected_commit is None or commit in {None, expected_commit}
     )
     return {
         "ok": ok,
+        "path_active": path_active,
+        "commit_matches": commit_matches,
         "path": str(path),
         "version": version,
         "expected_path_fragment": expected_fragment,
         "expected_commit": expected_commit,
         "observed_commit": commit,
     }
+
+
+def _env_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_fast_mlx_source_path(candidate: Path) -> Path | None:
+    expanded = candidate.expanduser()
+    if (expanded / "mlx").is_dir():
+        python_dir = expanded
+    elif (expanded / "python" / "mlx").is_dir():
+        python_dir = expanded / "python"
+    else:
+        return None
+    if any((python_dir / "mlx").glob("core*.so")):
+        return python_dir.resolve()
+    return None
+
+
+def _fast_mlx_source_candidates(expected_fragment: str) -> list[Path]:
+    candidates: list[Path] = []
+    explicit = os.environ.get("MTPLX_FAST_MLX_SOURCE_PATH")
+    if explicit:
+        candidates.append(Path(explicit))
+    home = Path.home()
+    for root in (
+        repo_root(),
+        home / "Documents" / "MTPLX",
+    ):
+        candidates.extend(
+            [
+                root
+                / "outputs"
+                / "mlx-source-worktrees"
+                / f"{expected_fragment}-build"
+                / "python",
+                root / "REFERENCES:TOOLS" / expected_fragment / "python",
+            ]
+        )
+    return candidates
+
+
+def _discover_fast_mlx_source_path(profile: Any) -> Path | None:
+    if _env_truthy(os.environ.get("MTPLX_DISABLE_FAST_MLX_AUTODISCOVERY")):
+        return None
+    expected_fragment = getattr(profile, "required_mlx_fork_fragment", None)
+    if not expected_fragment:
+        return None
+    expected_commit = getattr(profile, "required_mlx_fork_commit", None)
+    active = _active_mlx_fork_status(
+        expected_fragment=expected_fragment,
+        expected_commit=expected_commit,
+    )
+    if active.get("path_active"):
+        return None
+    seen: set[str] = set()
+    for candidate in _fast_mlx_source_candidates(str(expected_fragment)):
+        normalized = _normalize_fast_mlx_source_path(candidate)
+        if normalized is None:
+            continue
+        normalized_text = str(normalized)
+        if normalized_text in seen:
+            continue
+        seen.add(normalized_text)
+        if (
+            os.environ.get("MTPLX_FAST_MLX_SOURCE_PATH")
+            or str(expected_fragment) in normalized_text
+        ):
+            return normalized
+    return None
+
+
+def _prepend_pythonpath(env: dict[str, str], path: Path) -> None:
+    path_text = str(path)
+    existing = env.get("PYTHONPATH", "")
+    parts = [part for part in existing.split(os.pathsep) if part]
+    if path_text in parts:
+        return
+    env["PYTHONPATH"] = (
+        path_text if not existing else path_text + os.pathsep + existing
+    )
 
 
 def _apple_hardware_context() -> dict[str, Any]:
@@ -5417,6 +7576,90 @@ def _server_command_name(args: Any) -> str:
     return "quickstart"
 
 
+_SECRET_COMMAND_VALUE_FLAGS = {"--api-key"}
+_SECRET_ENV_NAME_PARTS = ("API_KEY", "AUTH", "PASSWORD", "SECRET", "TOKEN")
+
+
+def _redact_command_tokens(cmd: list[str]) -> list[str]:
+    redacted: list[str] = []
+    redact_next = False
+    for raw_token in cmd:
+        token = str(raw_token)
+        if redact_next:
+            redacted.append("[redacted]")
+            redact_next = False
+            continue
+        for flag in _SECRET_COMMAND_VALUE_FLAGS:
+            prefix = flag + "="
+            if token.startswith(prefix):
+                redacted.append(prefix + "[redacted]")
+                break
+        else:
+            redacted.append(token)
+            if token in _SECRET_COMMAND_VALUE_FLAGS:
+                redact_next = True
+    return redacted
+
+
+def _serve_dry_run_env_delta(env: dict[str, str]) -> dict[str, str]:
+    delta: dict[str, str] = {}
+    for key, value in sorted(env.items()):
+        if not key.startswith("MTPLX_"):
+            continue
+        if os.environ.get(key) == value:
+            continue
+        if any(part in key.upper() for part in _SECRET_ENV_NAME_PARTS):
+            delta[key] = "[redacted]"
+        else:
+            delta[key] = str(value)
+    return delta
+
+
+def _serve_dry_run_payload(
+    args: Any,
+    *,
+    runtime_model: str,
+    profile_name: str,
+    model_id: str,
+    generation_mode: str,
+    cmd: list[str],
+    env: dict[str, str],
+) -> dict[str, Any]:
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = int(getattr(args, "port", 8000))
+    base_url = _server_url(host, port)
+    argv = _redact_command_tokens(cmd)
+    payload: dict[str, Any] = {
+        "dry_run": True,
+        "target": "server",
+        "command": _server_command_name(args),
+        "model": str(runtime_model),
+        "model_id": str(model_id),
+        "profile": str(profile_name),
+        "host": host,
+        "port": port,
+        "api_base_url": f"{base_url}/v1",
+        "chat_url": _chat_url(host, port),
+        "fan_mode": str(getattr(args, "fan_mode", "default") or "default"),
+        "generation_mode": str(generation_mode),
+        "depth": int(getattr(args, "depth", 3)),
+        "argv": argv,
+        "server_command": shlex.join(argv),
+        "env": _serve_dry_run_env_delta(env),
+    }
+    if bool(getattr(args, "download", False)):
+        payload["download_requested"] = True
+    return payload
+
+
+def _print_serve_dry_run_human(payload: dict[str, Any]) -> None:
+    _print_serve_start_line("MTPLX quickstart dry run")
+    _print_serve_start_line(f"Model: {payload['model']}")
+    _print_serve_start_line(f"OpenAI API Base URL: {payload['api_base_url']}")
+    _print_serve_start_line("Server command:")
+    _print_serve_start_line(f"  {payload['server_command']}")
+
+
 def _serve_should_onboard(args: Any) -> bool:
     """Return whether bare interactive ``mtplx serve`` should run setup."""
 
@@ -5427,7 +7670,7 @@ def _serve_should_onboard(args: Any) -> bool:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return False
     cli_flags = getattr(args, "_cli_flags", set()) or set()
-    if {"model", "model-id", "profile", "max"} & set(cli_flags):
+    if {"model", "model-id", "profile", "max", "fan-mode"} & set(cli_flags):
         return False
     return True
 
@@ -5437,8 +7680,12 @@ def _model_ref_from_public_model_id(model_id: str | None) -> str | None:
     if not text:
         return None
     key = text.replace("_", "-").lower()
+    lookup_keys = [key]
     if key.startswith("mtplx/"):
-        key = key.split("/", 1)[1]
+        lookup_keys.append(key.split("/", 1)[1])
+    sanitized_key = re.sub(r"[^a-z0-9.-]+", "-", key).strip("-.")
+    if sanitized_key:
+        lookup_keys.append(sanitized_key)
     mapping = {
         DEFAULT_PUBLIC_MODEL_ID.lower(): DEFAULT_HF_MODEL_ID,
         DEFAULT_HF_MODEL_ID.lower(): DEFAULT_HF_MODEL_ID,
@@ -5453,8 +7700,31 @@ def _model_ref_from_public_model_id(model_id: str | None) -> str | None:
         QUALITY_PUBLIC_MODEL_ID.lower(): QUALITY_HF_MODEL_ID,
         QUALITY_HF_MODEL_ID.lower(): QUALITY_HF_MODEL_ID,
         Path(QUALITY_HF_MODEL_ID).name.lower(): QUALITY_HF_MODEL_ID,
+        QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+        QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+        Path(QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID).name.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+        QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        Path(QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID).name.lower(): QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
+        Path(QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID).name.lower(): QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        Path(QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID).name.lower(): QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
+        Path(QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID).name.lower(): QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+        Path(QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID).name.lower(): QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+        "qwen3.6-35b-a3b-mtplx-official4-cyankiwimtp-cleanrecipe": QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
     }
-    return mapping.get(key)
+    for candidate in lookup_keys:
+        model_ref = mapping.get(candidate)
+        if model_ref:
+            return model_ref
+    return None
 
 
 def _apply_model_id_as_model_default(args: Any, *, has_explicit_model: bool) -> bool:
@@ -5473,21 +7743,60 @@ def _apply_model_id_as_model_default(args: Any, *, has_explicit_model: bool) -> 
     return True
 
 
+def _resolve_runtime_options_on_args(
+    args: Any,
+    *,
+    printer: Callable[[str], None],
+) -> int | None:
+    try:
+        resolved_key = resolve_api_key(
+            explicit_api_key=getattr(args, "api_key", None),
+            api_key_file=getattr(args, "api_key_file", None),
+        )
+    except (OSError, ValueError) as exc:
+        printer(f"error: {exc}")
+        return 2
+    setattr(args, "api_key", resolved_key.value)
+    setattr(args, "api_key_source", resolved_key.source)
+    try:
+        kv_mode = normalize_paged_kv_quantization(
+            getattr(args, "paged_kv_quantization", None)
+        )
+    except ValueError as exc:
+        printer(f"error: {exc}")
+        return 2
+    setattr(args, "paged_kv_quantization", kv_mode)
+    return None
+
+
 def cmd_serve_public(args: Any) -> int:
+    dry_run = bool(getattr(args, "dry_run", False))
+    quiet_json = dry_run and bool(getattr(args, "json", False))
+    runtime_options_error = _resolve_runtime_options_on_args(
+        args,
+        printer=_print_serve_start_line,
+    )
+    if runtime_options_error is not None:
+        return runtime_options_error
+    try:
+        fan_mode = _fan_mode_from_args(args)
+    except ValueError as exc:
+        _print_serve_start_line(f"error: {exc}")
+        return 2
     api_key = getattr(args, "api_key", None)
     if not _is_localhost_bind(getattr(args, "host", None)) and not api_key:
         payload = {
-            "error": "--api-key is required when --host is not localhost",
+            "error": "--api-key or --api-key-file is required when --host is not localhost",
             "host": getattr(args, "host", None),
         }
         if getattr(args, "json", False):
             _print(payload)
         else:
-            print("error: --api-key is required when --host is not localhost")
+            print("error: --api-key or --api-key-file is required when --host is not localhost")
             print(f"host: {getattr(args, 'host', None)}")
             server_command = _server_command_name(args)
             print(f"try: mtplx {server_command} --host 127.0.0.1")
-            print(f"try: mtplx {server_command} --host 0.0.0.0 --api-key $MTPLX_AUTH")
+            print(f"try: mtplx {server_command} --host 0.0.0.0 --api-key-file ~/.mtplx/api-key")
         return 2
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     _apply_model_id_as_model_default(
@@ -5520,17 +7829,25 @@ def cmd_serve_public(args: Any) -> int:
         if chosen_profile:
             args.profile = chosen_profile
         args.max = bool(choice.get("max"))
+        args.fan_mode = FAN_MODE_MAX if args.max else "default"
         args.open_browser = bool(choice.get("open_browser"))
         args._onboarded = True
     depth_error = _validate_public_depth(args, printer=_print_serve_start_line)
     if depth_error is not None:
         return depth_error
+    generation_mode = _generation_mode_from_args(args)
+    fan_mode = _fan_mode_from_args(args)
+    if generation_mode == GENERATION_MODE_MTP and getattr(args, "load_mtp", True) is False:
+        _print_serve_start_line("error: --generation-mode mtp requires --load-mtp")
+        _print_serve_start_line("try: mtplx serve --generation-mode ar --no-load-mtp")
+        return 2
     args.model_id = _public_model_id_for_args(
         args,
         str(getattr(args, "model", "")),
     )
-    _print_serve_start_banner(args)
-    if _port_is_busy(
+    if not quiet_json:
+        _print_serve_start_banner(args)
+    if not dry_run and _port_is_busy(
         str(getattr(args, "host", "127.0.0.1")), int(getattr(args, "port", 8000))
     ):
         if bool(getattr(args, "quickstart_pi", False)):
@@ -5538,7 +7855,7 @@ def cmd_serve_public(args: Any) -> int:
                 str(getattr(args, "host", "127.0.0.1")),
                 int(getattr(args, "port", 8000)),
             )
-            health = _http_json(base + "/health", timeout=1.5)
+            health = _http_json(base + "/health", timeout=1.5, api_key=api_key)
             if health.get("ok"):
                 from mtplx.pi import pi_launch_command, pi_model_ref
 
@@ -5563,7 +7880,7 @@ def cmd_serve_public(args: Any) -> int:
                 str(getattr(args, "host", "127.0.0.1")),
                 int(getattr(args, "port", 8000)),
             )
-            health = _http_json(base + "/health", timeout=1.5)
+            health = _http_json(base + "/health", timeout=1.5, api_key=api_key)
             if health.get("ok"):
                 model_id = (
                     health.get("model")
@@ -5590,7 +7907,7 @@ def cmd_serve_public(args: Any) -> int:
                 str(getattr(args, "host", "127.0.0.1")),
                 int(getattr(args, "port", 8000)),
             )
-            health = _http_json(base + "/health", timeout=1.5)
+            health = _http_json(base + "/health", timeout=1.5, api_key=api_key)
             if health.get("ok"):
                 model_id = (
                     health.get("model")
@@ -5610,7 +7927,7 @@ def cmd_serve_public(args: Any) -> int:
                 str(getattr(args, "host", "127.0.0.1")),
                 int(getattr(args, "port", 8000)),
             )
-            health = _http_json(base + "/health", timeout=1.5)
+            health = _http_json(base + "/health", timeout=1.5, api_key=api_key)
             if health.get("ok"):
                 from mtplx.swival import shell_swival_command
 
@@ -5634,12 +7951,51 @@ def cmd_serve_public(args: Any) -> int:
                     "Use the existing server, or stop that terminal with Ctrl-C to restart."
                 )
                 return 0
+        if bool(getattr(args, "quickstart_hermes", False)):
+            base = _server_url(
+                str(getattr(args, "host", "127.0.0.1")),
+                int(getattr(args, "port", 8000)),
+            )
+            health = _http_json(base + "/health", timeout=1.5, api_key=api_key)
+            if health.get("ok"):
+                command = str(getattr(args, "hermes_launch_command", "") or "").strip()
+                model_id = health.get("model") or getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID
+                _print_serve_start_line("MTPLX is already running.")
+                _print_serve_start_line(f"OpenAI API Base URL: {base}/v1")
+                _print_serve_start_line(f"Hermes model: {model_id}")
+                if command:
+                    from mtplx.pi import launch_pi_in_terminal
+
+                    result = launch_pi_in_terminal(command)
+                    if result.get("ok"):
+                        _print_serve_start_line("Opening Hermes Agent in Terminal...")
+                    else:
+                        _print_serve_start_line(
+                            f"Could not open Hermes automatically: {result.get('error')}"
+                        )
+                        _print_serve_start_line(f"Manual fallback: {command}")
+                else:
+                    _print_serve_start_line(
+                        "Open Hermes manually with the MTPLX profile."
+                    )
+                _print_serve_start_line(
+                    "Use the existing server, or stop that terminal with Ctrl-C to restart."
+                )
+                return 0
         _print_serve_start_line(f"error: port {int(args.port)} is already in use")
-        _print_serve_start_line("try: mtplx status")
+        try:
+            from mtplx.daemon_client import classify_port_occupant, port_busy_advice
+
+            occupant = classify_port_occupant(
+                str(getattr(args, "host", "127.0.0.1")),
+                int(getattr(args, "port", 8000)),
+                api_key=api_key,
+            )
+            for line in port_busy_advice(occupant, port=int(args.port)):
+                _print_serve_start_line(line)
+        except Exception:
+            _print_serve_start_line("try: mtplx status")
         server_command = _server_command_name(args)
-        _print_serve_start_line(
-            f"try: stop the old mtplx {server_command} terminal with Ctrl-C"
-        )
         profile_arg = (
             f" --profile {getattr(args, 'profile')}"
             if getattr(args, "profile", None)
@@ -5652,7 +8008,7 @@ def cmd_serve_public(args: Any) -> int:
         return 2
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     cache_dir = getattr(args, "cache_dir", None)
-    if bool(getattr(args, "download", False)):
+    if bool(getattr(args, "download", False)) and not dry_run:
         try:
             runtime_model, resolution = _quickstart_resolve_model(
                 args.model,
@@ -5710,16 +8066,26 @@ def cmd_serve_public(args: Any) -> int:
     if gate_exit is not None:
         _print_model_gate_error(inspection, printer=_print_serve_start_line)
         return gate_exit
-    _apply_model_contract_depth_default(args, inspection)
+    _apply_model_contract_depth_default(args, inspection, profile)
+    _apply_backend_serve_defaults(args, inspection)
+    model_id = _public_model_id_for_args(args, str(runtime_model))
+    args.model_id = model_id
+    _apply_qwen36_35b_optimized_speed_defaults(args, model_id)
+    backend_descriptor = descriptor_from_inspection(inspection)
     draft_lm_head = _model_draft_lm_head_spec(inspection, profile) or {
         "bits": 4,
         "group_size": 64,
         "mode": "affine",
     }
     draft_sampler = _model_draft_sampler_spec(inspection, profile)
+    draft_sampler_override = _explicit_draft_sampler_override(args, draft_sampler)
+    if draft_sampler_override is not None:
+        draft_sampler = draft_sampler_override
     strict_fast_path = bool(getattr(args, "strict_fast_path", False))
     relax_mlx_fork_assert = False
-    if profile.required_mlx_fork_fragment:
+    if profile.required_mlx_fork_fragment and not _inspection_is_gemma4_assistant(
+        inspection
+    ):
         fork_status = _active_mlx_fork_status(
             expected_fragment=profile.required_mlx_fork_fragment,
             expected_commit=profile.required_mlx_fork_commit,
@@ -5754,15 +8120,16 @@ def cmd_serve_public(args: Any) -> int:
                 )
                 return 2
             relax_mlx_fork_assert = True
-    model_id = _public_model_id_for_args(args, str(runtime_model))
-    args.model_id = model_id
-    _print_serve_handoff(args, runtime_model, profile.name)
+    if not quiet_json:
+        _print_serve_handoff(args, runtime_model, profile.name)
     cmd = [
         sys.executable,
         "-m",
         "mtplx.server.openai",
         "--model",
         runtime_model,
+        "--backend-id",
+        backend_descriptor.backend_id,
         "--host",
         args.host,
         "--port",
@@ -5770,17 +8137,19 @@ def cmd_serve_public(args: Any) -> int:
         "--depth",
         str(args.depth),
         "--generation-mode",
-        _generation_mode_from_args(args),
+        generation_mode,
         "--profile",
         profile.name,
         "--reasoning-mode",
         _reasoning_mode(args, default="auto"),
         "--preserve-thinking",
-        _preserve_thinking_policy(args),
+        _pi_preserve_thinking_policy(args)
+        if bool(getattr(args, "quickstart_pi", False))
+        else _preserve_thinking_policy(args),
         "--verify-strategy",
-        "capture_commit",
+        str(getattr(args, "verify_strategy", "capture_commit") or "capture_commit"),
         "--verify-core",
-        "linear-gdn-from-conv-tape",
+        str(getattr(args, "verify_core", "linear-gdn-from-conv-tape") or "linear-gdn-from-conv-tape"),
         "--draft-lm-head-bits",
         str(draft_lm_head["bits"]),
         "--draft-lm-head-group-size",
@@ -5791,11 +8160,108 @@ def cmd_serve_public(args: Any) -> int:
         str(getattr(args, "rate_limit", 0)),
         "--stream-interval",
         str(getattr(args, "stream_interval", 1)),
+        "--scheduler-mode",
+        str(getattr(args, "scheduler_mode", "serial") or "serial"),
+        "--batching-preset",
+        str(getattr(args, "batching_preset", "latency") or "latency"),
         "--warmup-tokens",
         str(getattr(args, "warmup_tokens", 16)),
         "--model-id",
         str(model_id),
+        "--paged-kv-quantization",
+        str(getattr(args, "paged_kv_quantization", "off") or "off"),
+        "--fan-mode",
+        fan_mode,
     ]
+    for attr, flag in (
+        ("max_active_requests", "--max-active-requests"),
+        ("decode_batch_max", "--decode-batch-max"),
+        ("batch_wait_ms", "--batch-wait-ms"),
+        ("prefill_chunk_tokens", "--prefill-chunk-tokens"),
+    ):
+        value = getattr(args, attr, None)
+        if value is not None:
+            cmd.extend([flag, str(value)])
+    context_window = getattr(args, "context_window", None)
+    if context_window is not None:
+        cmd.extend(["--context-window", str(context_window)])
+    mtp_adapter = getattr(args, "mtp_adapter", None)
+    if mtp_adapter:
+        cmd.extend(["--mtp-adapter", str(mtp_adapter)])
+    if bool(getattr(args, "merge_mtp_adapter", False)):
+        cmd.append("--merge-mtp-adapter")
+    mtp_quant_bits = getattr(args, "mtp_quant_bits", None)
+    if mtp_quant_bits is not None:
+        cmd.extend(["--mtp-quant-bits", str(mtp_quant_bits)])
+        cmd.extend(
+            [
+                "--mtp-quant-group-size",
+                str(getattr(args, "mtp_quant_group_size", 64) or 64),
+            ]
+        )
+        cmd.extend(
+            [
+                "--mtp-quant-mode",
+                str(getattr(args, "mtp_quant_mode", "affine") or "affine"),
+            ]
+        )
+    if bool(getattr(args, "experimental_mtp_cohorts", False)):
+        cmd.append("--experimental-mtp-cohorts")
+    ssd_session_cache = str(getattr(args, "ssd_session_cache", "off") or "off")
+    cmd.extend(["--ssd-session-cache", ssd_session_cache])
+    ssd_dir = getattr(args, "ssd_session_cache_dir", None)
+    if ssd_dir:
+        cmd.extend(["--ssd-session-cache-dir", str(ssd_dir)])
+    ssd_max_size = getattr(args, "ssd_session_cache_max_size", None)
+    if ssd_max_size:
+        cmd.extend(["--ssd-session-cache-max-size", str(ssd_max_size)])
+    ssd_min_prefix = getattr(args, "ssd_session_cache_min_prefix_tokens", None)
+    if ssd_min_prefix is not None:
+        cmd.extend(["--ssd-session-cache-min-prefix-tokens", str(ssd_min_prefix)])
+    adaptive_policy = str(getattr(args, "adaptive_policy", "none") or "none")
+    if adaptive_policy != "none":
+        cmd.extend(["--adaptive-policy", adaptive_policy])
+        cmd.extend(
+            [
+                "--adaptive-min-depth",
+                str(getattr(args, "adaptive_min_depth", 1)),
+            ]
+        )
+        if adaptive_policy == "streak":
+            for attr, flag in (
+                ("adaptive_start_depth", "--adaptive-start-depth"),
+                ("adaptive_increase_after", "--adaptive-increase-after"),
+                ("adaptive_decrease_after", "--adaptive-decrease-after"),
+            ):
+                cmd.extend([flag, str(getattr(args, attr))])
+        elif adaptive_policy == "expected_value":
+            for attr, flag in (
+                ("adaptive_ev_base_depth", "--adaptive-ev-base-depth"),
+                ("adaptive_ev_accept_priors", "--adaptive-ev-accept-priors"),
+                ("adaptive_ev_draft_cost_s", "--adaptive-ev-draft-cost-s"),
+                (
+                    "adaptive_ev_extra_verify_cost_s",
+                    "--adaptive-ev-extra-verify-cost-s",
+                ),
+                ("adaptive_ev_baseline_tok_s", "--adaptive-ev-baseline-tok-s"),
+                ("adaptive_ev_safety_margin", "--adaptive-ev-safety-margin"),
+                ("adaptive_ev_margin_center", "--adaptive-ev-margin-center"),
+                ("adaptive_ev_margin_scale", "--adaptive-ev-margin-scale"),
+                ("adaptive_ev_confidence_weight", "--adaptive-ev-confidence-weight"),
+                (
+                    "adaptive_ev_min_extra_accept_probability",
+                    "--adaptive-ev-min-extra-accept-probability",
+                ),
+                (
+                    "adaptive_ev_warmup_full_depth_cycles",
+                    "--adaptive-ev-warmup-full-depth-cycles",
+                ),
+                (
+                    "adaptive_ev_exploration_interval",
+                    "--adaptive-ev-exploration-interval",
+                ),
+            ):
+                cmd.extend([flag, str(getattr(args, attr))])
     if draft_sampler is not None:
         cmd.extend(
             [
@@ -5807,8 +8273,21 @@ def cmd_serve_public(args: Any) -> int:
                 str(int(draft_sampler["top_k"])),
             ]
         )
+    if getattr(args, "tool_prompt_mode", None):
+        cmd.extend(["--tool-prompt-mode", str(args.tool_prompt_mode)])
+    if getattr(args, "chat_template_profile", None):
+        cmd.extend(["--chat-template-profile", str(args.chat_template_profile)])
+    if getattr(args, "chat_template_path", None):
+        cmd.extend(["--chat-template-path", str(args.chat_template_path)])
     if bool(getattr(args, "open_browser", False)):
         cmd.append("--open-browser")
+    if bool(getattr(args, "open_dashboard", False)):
+        cmd.append("--open-dashboard")
+    if bool(getattr(args, "enable_thermal_poll", False)):
+        cmd.append("--enable-thermal-poll")
+    app_launch_id = str(getattr(args, "app_launch_id", "") or "").strip()
+    if app_launch_id:
+        cmd.extend(["--app-launch-id", app_launch_id])
     if bool(getattr(args, "quickstart_pi", False)):
         from mtplx.pi import pi_launch_command
 
@@ -5826,18 +8305,31 @@ def cmd_serve_public(args: Any) -> int:
         cmd.extend(["--launch-opencode", "--server-console"])
     if bool(getattr(args, "quickstart_swival", False)):
         cmd.append("--server-console")
+    if bool(getattr(args, "quickstart_hermes", False)):
+        cmd.extend(["--launch-hermes", "--server-console"])
+        hermes_launch_command = str(getattr(args, "hermes_launch_command", "") or "").strip()
+        if hermes_launch_command:
+            cmd.extend(["--hermes-launch-command", hermes_launch_command])
     if bool(getattr(args, "stock_ar", False)):
         cmd.append("--stock-ar")
+    elif getattr(args, "load_mtp", True) is False:
+        cmd.append("--no-load-mtp")
     if relax_mlx_fork_assert:
         cmd.append("--no-strict-mlx-fork-assert")
-    if api_key:
+    api_key_source = str(getattr(args, "api_key_source", "none") or "none")
+    api_key_file = getattr(args, "api_key_file", None)
+    if api_key and api_key_source == "flag":
         cmd.extend(["--api-key", str(api_key)])
+    elif api_key and api_key_source == "file" and api_key_file:
+        cmd.extend(["--api-key-file", str(api_key_file)])
     if getattr(args, "max_response_tokens", None) is not None:
         cmd.extend(["--max-response-tokens", str(args.max_response_tokens)])
     if getattr(args, "temperature", None) is not None:
         cmd.extend(["--temperature", str(args.temperature)])
     if getattr(args, "top_p", None) is not None:
         cmd.extend(["--top-p", str(args.top_p)])
+    if getattr(args, "top_k", None) is not None:
+        cmd.extend(["--top-k", str(args.top_k)])
     if getattr(args, "reasoning", None) is not None:
         reasoning_mode = _reasoning_mode(args, default="auto")
         if reasoning_mode == "on":
@@ -5846,15 +8338,55 @@ def cmd_serve_public(args: Any) -> int:
             cmd.append("--no-enable-thinking")
     if getattr(args, "reasoning_parser", None):
         cmd.extend(["--reasoning-parser", str(args.reasoning_parser)])
+    if getattr(args, "reasoning_effort", None):
+        cmd.extend(["--reasoning-effort", str(args.reasoning_effort)])
     if not getattr(args, "stats_footer", True):
         cmd.append("--no-stats-footer")
     if getattr(args, "strict_warmup", False):
         cmd.append("--strict-warmup")
-    if getattr(args, "max", False):
+    child_env_base = os.environ.copy()
+    child_env_base.update(
+        paged_kv_quantization_env(
+            getattr(args, "paged_kv_quantization", "off") or "off"
+        )
+    )
+    _apply_ram_session_cache_env(child_env_base, args)
+    if app_launch_id:
+        child_env_base["MTPLX_APP_LAUNCH_ID"] = app_launch_id
+    if bool(getattr(args, "quickstart_pi", False)):
+        _apply_pi_history_budget_env_defaults(child_env_base)
+    if bool(getattr(args, "quickstart_opencode", False)):
+        _apply_opencode_memory_env_defaults(child_env_base)
+    if bool(getattr(args, "quickstart_hermes", False)):
+        _apply_hermes_memory_env_defaults(child_env_base)
+    if fan_mode in {FAN_MODE_MAX, FAN_MODE_SMART}:
+        child_env_base["MTPLX_FAN_MODE"] = fan_mode
+    if fan_mode == FAN_MODE_MAX:
+        child_env_base["MTPLX_MAX_REQUESTED"] = "1"
+    fast_mlx_source = _discover_fast_mlx_source_path(profile)
+    if fast_mlx_source is not None:
+        _prepend_pythonpath(child_env_base, fast_mlx_source)
+        child_env_base["MTPLX_FAST_MLX_SOURCE_PATH_ACTIVE"] = str(fast_mlx_source)
+    if dry_run:
+        payload = _serve_dry_run_payload(
+            args,
+            runtime_model=runtime_model,
+            profile_name=profile.name,
+            model_id=str(model_id),
+            generation_mode=generation_mode,
+            cmd=cmd,
+            env=child_env_base,
+        )
+        if bool(getattr(args, "json", False)):
+            _print(payload)
+        else:
+            _print_serve_dry_run_human(payload)
+        return 0
+    if fan_mode == FAN_MODE_MAX:
         from mtplx.thermal import MaxSession
 
         def _emit(line: str) -> None:
-            print(line, file=sys.stderr, flush=True)
+            _safe_serve_watchdog_log(line)
 
         max_session = MaxSession(log=_emit)
         if not max_session.start():
@@ -5865,30 +8397,216 @@ def cmd_serve_public(args: Any) -> int:
             actionable = verified.get("actionable")
             if actionable:
                 _emit(f"[max]   action: {actionable}")
+            if bool(getattr(args, "require_max_fans", False)):
+                _emit("[max] strict startup requested; refusing to load the model.")
+                _emit("")
+                return 2
             _emit("[max] continuing the server WITHOUT fan boost.")
             _emit("")
             args.max = False  # don't lie to the watchdog about fan state
+            args.fan_mode = "default"
+            child_env_base.pop("MTPLX_FAN_MODE", None)
+            child_env_base.pop("MTPLX_MAX_REQUESTED", None)
+            if "--fan-mode" in cmd:
+                try:
+                    cmd[cmd.index("--fan-mode") + 1] = "default"
+                except Exception:
+                    pass
         # Only spin up the idle watchdog when verification confirmed fans
         # are actually pinned. If args.max was just disabled above, fall
         # through to the no-fan-control path.
         if getattr(args, "max", False):
-            child_env = os.environ.copy()
-            child_env["MTPLX_FAN_MODE"] = "max"
+            child_env = child_env_base.copy()
+            child_env["MTPLX_FAN_MODE"] = FAN_MODE_MAX
+            child_env["MTPLX_MAX_ACTUAL_RAMP_VERIFIED"] = "1"
+            child_env["MTPLX_MAX_VERIFIED_AT"] = str(time.time())
+            try:
+                child_env["MTPLX_MAX_VERIFIED_JSON"] = json.dumps(
+                    max_session.thermal.get("verified") or {},
+                    sort_keys=True,
+                    default=str,
+                )
+            except Exception:
+                pass
             idle_minutes = int(getattr(args, "max_idle_min", 15))
             watchdog = _MaxIdleWatchdog(
                 host=str(getattr(args, "host", "127.0.0.1")),
                 port=int(getattr(args, "port", 8000)),
                 idle_seconds=max(60, idle_minutes * 60),
+                api_key=getattr(args, "api_key", None),
             )
             watchdog.start()
+            app_parent_pid = _app_parent_pid_from_env(child_env)
             try:
-                proc = subprocess.run(cmd, env=child_env, cwd=repo_root(), check=False)
-                return int(proc.returncode)
+                return _run_server_child_with_app_parent_watchdog(
+                    cmd,
+                    env=child_env,
+                    cwd=repo_root(),
+                    app_parent_pid=app_parent_pid,
+                )
             finally:
                 watchdog.stop()
                 max_session.stop()  # belt-and-suspenders alongside atexit
-    os.execvpe(sys.executable, cmd, os.environ.copy())
+    app_parent_pid = _app_parent_pid_from_env(child_env_base)
+    if app_parent_pid is not None:
+        return _run_server_child_with_app_parent_watchdog(
+            cmd,
+            env=child_env_base,
+            cwd=repo_root(),
+            app_parent_pid=app_parent_pid,
+        )
+    os.execvpe(sys.executable, cmd, child_env_base)
     return 0
+
+
+def _app_parent_pid_from_env(env: dict[str, str]) -> int | None:
+    raw = str(env.get("MTPLX_APP_PARENT_PID") or "").strip()
+    if not raw:
+        return None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    if pid <= 1 or pid == os.getpid():
+        return None
+    return pid
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        proc = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "stat="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=0.5,
+            check=False,
+        )
+    except Exception:
+        return True
+    if proc.returncode != 0:
+        return False
+    state = proc.stdout.strip()
+    return "Z" not in state
+
+
+def _terminate_server_child(proc: subprocess.Popen[Any], *, grace_s: float) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=max(0.1, float(grace_s)))
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if proc.poll() is not None:
+        return
+    try:
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=0.5)
+        return
+    except (subprocess.TimeoutExpired, ProcessLookupError):
+        pass
+    if proc.poll() is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _safe_serve_watchdog_log(message: str) -> None:
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _run_server_child_with_app_parent_watchdog(
+    cmd: list[str],
+    *,
+    env: dict[str, str],
+    cwd: Path,
+    app_parent_pid: int | None,
+    poll_seconds: float = 1.0,
+    shutdown_grace_s: float = 5.0,
+) -> int:
+    """Run the real server under the serve wrapper.
+
+    Native MTPLXApp launches use the product CLI wrapper, not
+    ``mtplx.server.openai`` directly, because the wrapper owns model
+    resolution and max-fan lifecycle hooks. When the GUI disappears by
+    normal quit, force quit, or crash, this watchdog makes the wrapper stop the
+    child daemon so the wrapper's existing ``MaxSession`` cleanup can restore
+    fans.
+    """
+
+    if app_parent_pid is not None and not _pid_is_alive(app_parent_pid):
+        _safe_serve_watchdog_log(
+            "[mtplx] app parent is gone; refusing to leave an app-owned daemon running.",
+        )
+        return 130
+
+    proc = subprocess.Popen(cmd, env=env, cwd=cwd)
+    stop = threading.Event()
+    triggered = [False]
+    received_signal: list[int | None] = [None]
+    thread: threading.Thread | None = None
+    previous_handlers: dict[int, Any] = {}
+
+    def handle_shutdown_signal(signum: int, _frame: Any) -> None:
+        if received_signal[0] is None:
+            received_signal[0] = signum
+            _safe_serve_watchdog_log(
+                f"[mtplx] serve wrapper received signal {signum}; stopping child daemon.",
+            )
+            _terminate_server_child(proc, grace_s=shutdown_grace_s)
+
+    if app_parent_pid is not None:
+
+        def watch_parent() -> None:
+            while not stop.wait(max(0.05, float(poll_seconds))):
+                if proc.poll() is not None:
+                    return
+                if _pid_is_alive(app_parent_pid):
+                    continue
+                triggered[0] = True
+                _safe_serve_watchdog_log("[mtplx] app parent exited; stopping app-owned daemon.")
+                _terminate_server_child(proc, grace_s=shutdown_grace_s)
+                return
+
+        thread = threading.Thread(
+            target=watch_parent,
+            name="mtplx-app-parent-watchdog",
+            daemon=True,
+        )
+        thread.start()
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, handle_shutdown_signal)
+        returncode = int(proc.wait())
+    finally:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+        stop.set()
+        if thread is not None:
+            thread.join(timeout=1.0)
+
+    if received_signal[0] is not None:
+        return 128 + int(received_signal[0])
+    if triggered[0] and returncode < 0:
+        return 130
+    return returncode
 
 
 class _MaxIdleWatchdog:
@@ -5900,11 +8618,18 @@ class _MaxIdleWatchdog:
     """
 
     def __init__(
-        self, *, host: str, port: int, idle_seconds: int, poll_seconds: int = 30
+        self,
+        *,
+        host: str,
+        port: int,
+        idle_seconds: int,
+        poll_seconds: int = 30,
+        api_key: str | None = None,
     ) -> None:
         self.url = f"http://{host}:{port}/health"
         self.idle_seconds = int(idle_seconds)
         self.poll_seconds = max(1, int(poll_seconds))
+        self.api_key = api_key
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._is_max = True  # the parent set fans to max before spawning us
@@ -5929,7 +8654,10 @@ class _MaxIdleWatchdog:
         last_started_at: float | None = None
         last_active = time.time()
         while not self._stop.wait(self.poll_seconds):
-            payload = _http_json(self.url, timeout=2.0)
+            if self.api_key:
+                payload = _http_json(self.url, timeout=2.0, api_key=self.api_key)
+            else:
+                payload = _http_json(self.url, timeout=2.0)
             if not payload.get("ok"):
                 continue
             current = int(payload.get("requests_completed") or 0)
@@ -5973,6 +8701,7 @@ class _MaxIdleWatchdog:
 def _generate_one_shot_public(
     args: Any, *, command: str
 ) -> tuple[int, dict[str, Any], list[Any]]:
+    fan_mode = _fan_mode_from_args(args)
     prompt = getattr(args, "prompt", None) or getattr(args, "prompt_arg", None)
     if not prompt:
         raise SystemExit(f"mtplx {command} requires a prompt")
@@ -6022,7 +8751,7 @@ def _generate_one_shot_public(
 
     max_session: Any | None = None
     thermal: dict[str, Any] | None = None
-    if getattr(args, "max", False):
+    if fan_mode == FAN_MODE_MAX:
         from mtplx.thermal import MaxSession
 
         def _emit(line: str) -> None:
@@ -6095,29 +8824,44 @@ def _generate_one_shot_public(
         sampler = SamplerConfig(
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k
         )
-        if generation_mode == GENERATION_MODE_AR:
-            out = generate_ar(
-                rt,
-                prompt_ids,
-                max_tokens=max_tokens_value,
-                sampler=sampler,
-                seed=args.seed,
-            )
-        else:
-            out = generate_mtpk(
-                rt,
-                prompt_ids,
-                max_tokens=max_tokens_value,
-                sampler=sampler,
-                draft_sampler=_draft_sampler_from_spec(draft_sampler),
-                speculative_depth=args.depth,
-                seed=args.seed,
-                mtp_hidden_variant="post_norm",
-                mtp_cache_policy="persistent",
-                mtp_history_policy="committed",
-                verify_strategy="capture_commit",
-                verify_core="linear-gdn-from-conv-tape",
-            )
+        smart_fans = None
+        smart_request_id = None
+        if fan_mode == FAN_MODE_SMART:
+            from mtplx.thermal import SmartFanController
+
+            def _emit_smart(line: str) -> None:
+                print(line, file=sys.stderr, flush=True)
+
+            smart_fans = SmartFanController(log=_emit_smart)
+            smart_request_id = f"cli-{command}-{int(time.time() * 1000)}"
+            smart_fans.begin_request(smart_request_id)
+        try:
+            if generation_mode == GENERATION_MODE_AR:
+                out = generate_ar(
+                    rt,
+                    prompt_ids,
+                    max_tokens=max_tokens_value,
+                    sampler=sampler,
+                    seed=args.seed,
+                )
+            else:
+                out = generate_mtpk(
+                    rt,
+                    prompt_ids,
+                    max_tokens=max_tokens_value,
+                    sampler=sampler,
+                    draft_sampler=_draft_sampler_from_spec(draft_sampler),
+                    speculative_depth=args.depth,
+                    seed=args.seed,
+                    mtp_hidden_variant="post_norm",
+                    mtp_cache_policy="persistent",
+                    mtp_history_policy="committed",
+                    verify_strategy="capture_commit",
+                    verify_core="linear-gdn-from-conv-tape",
+                )
+        finally:
+            if smart_fans is not None and smart_request_id is not None:
+                smart_fans.end_request(smart_request_id, wait_for_restore=True)
     finally:
         if max_session is not None:
             max_session.stop()
@@ -6868,7 +9612,16 @@ def _quickstart_generate(
     )
     seed = int(getattr(args, "seed", 0)) + turn_index
     generation_mode = _generation_mode_from_args(args)
+    fan_mode = _fan_mode_from_args(args)
+    smart_fans = None
+    smart_request_id = None
     try:
+        if fan_mode == FAN_MODE_SMART:
+            from mtplx.thermal import SmartFanController
+
+            smart_fans = SmartFanController(log=_quickstart_line)
+            smart_request_id = f"terminal-{turn_index}-{int(time.time() * 1000)}"
+            smart_fans.begin_request(smart_request_id)
         if generation_mode == GENERATION_MODE_AR:
             out = generate_ar(
                 rt,
@@ -6895,6 +9648,8 @@ def _quickstart_generate(
                 token_callback=record_tokens,
             )
     finally:
+        if smart_fans is not None and smart_request_id is not None:
+            smart_fans.end_request(smart_request_id, wait_for_restore=False)
         if terminal_streamer is not None:
             terminal_streamer.finish()
     stats = {
@@ -7002,12 +9757,413 @@ def _public_model_id_for_args(args: Any, model_ref: str | None) -> str:
     )
 
 
-def _quickstart_openwebui_payload(args: Any) -> dict[str, Any]:
+def _batching_command_suffix(args: Any) -> str:
+    parts: list[str] = []
+    scheduler_mode = str(getattr(args, "scheduler_mode", "serial") or "serial")
+    batching_preset = str(getattr(args, "batching_preset", "latency") or "latency")
+    if scheduler_mode != "serial":
+        parts.extend(["--scheduler-mode", shlex.quote(scheduler_mode)])
+    if batching_preset != "latency":
+        parts.extend(["--batching-preset", shlex.quote(batching_preset)])
+    for attr, flag in (
+        ("max_active_requests", "--max-active-requests"),
+        ("decode_batch_max", "--decode-batch-max"),
+        ("batch_wait_ms", "--batch-wait-ms"),
+        ("prefill_chunk_tokens", "--prefill-chunk-tokens"),
+    ):
+        value = getattr(args, attr, None)
+        if value is not None:
+            parts.extend([flag, shlex.quote(str(value))])
+    if bool(getattr(args, "experimental_mtp_cohorts", False)):
+        parts.append("--experimental-mtp-cohorts")
+    ssd_session_cache = str(getattr(args, "ssd_session_cache", "off") or "off")
+    if ssd_session_cache != "off":
+        parts.extend(["--ssd-session-cache", shlex.quote(ssd_session_cache)])
+        ssd_dir = getattr(args, "ssd_session_cache_dir", None)
+        if ssd_dir:
+            parts.extend(["--ssd-session-cache-dir", shlex.quote(str(ssd_dir))])
+        ssd_max_size = getattr(args, "ssd_session_cache_max_size", None)
+        if ssd_max_size:
+            parts.extend(["--ssd-session-cache-max-size", shlex.quote(str(ssd_max_size))])
+        ssd_min_prefix = getattr(args, "ssd_session_cache_min_prefix_tokens", None)
+        if ssd_min_prefix is not None:
+            parts.extend(
+                [
+                    "--ssd-session-cache-min-prefix-tokens",
+                    shlex.quote(str(ssd_min_prefix)),
+                ]
+            )
+    paged_kv_quantization = str(
+        getattr(args, "paged_kv_quantization", "off") or "off"
+    )
+    if paged_kv_quantization != "off":
+        parts.extend(["--paged-kv-quantization", shlex.quote(paged_kv_quantization)])
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _api_key_command_suffix(args: Any) -> str:
+    api_key = str(getattr(args, "api_key", "") or "").strip()
+    api_key_source = str(getattr(args, "api_key_source", "none") or "none")
+    api_key_file = str(getattr(args, "api_key_file", "") or "").strip()
+    if api_key_source == "file" and api_key_file:
+        return f"--api-key-file {shlex.quote(api_key_file)} "
+    if api_key == "mtplx-local":
+        return "--api-key mtplx-local "
+    if api_key and api_key_source in {"flag", "none"}:
+        return "--api-key $MTPLX_API_KEY "
+    return ""
+
+
+def _api_key_display_value(value: str | None) -> str:
+    if not value:
+        return ""
+    if value == "mtplx-local":
+        return value
+    return "<configured>"
+
+
+def _redact_secret_from_payload(value: Any, secret: str | None) -> Any:
+    if not secret or secret == "mtplx-local":
+        return value
+    if isinstance(value, str):
+        return "<configured>" if value == secret else value
+    if isinstance(value, list):
+        return [_redact_secret_from_payload(item, secret) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _redact_secret_from_payload(item, secret)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _hermes_yaml_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _hermes_dotenv_quote(value: str) -> str:
+    return json.dumps(str(value))
+
+
+def _hermes_home() -> Path:
+    return Path.home() / ".hermes"
+
+
+def _hermes_profile_dir() -> Path:
+    return _hermes_home() / "profiles" / HERMES_PROFILE_NAME
+
+
+def _hermes_workspace_path(args: Any) -> str:
+    workspace = str(os.environ.get("HERMES_WORKSPACE") or "").strip()
+    if workspace:
+        return str(Path(workspace).expanduser())
+    return str(Path.cwd())
+
+
+def _hermes_launch_command(*, model_id: str, source: str = "mtplx-cli") -> str:
+    parts = [
+        "hermes",
+        "-p",
+        HERMES_PROFILE_NAME,
+        "chat",
+        "--model",
+        model_id,
+        "--toolsets",
+        HERMES_CODING_TOOLSETS_TEXT,
+        "--yolo",
+        "--source",
+        source,
+    ]
+    return _shell_join(parts)
+
+
+def _hermes_terminal_command(*, model_id: str, workspace_path: str) -> str:
+    profile_dir = _hermes_profile_dir()
+    root_channel_dir = _hermes_home() / "channel_directory.json"
+    profile_channel_dir = profile_dir / "channel_directory.json"
+    commands = [
+        f"cd {_shell_join([workspace_path])}",
+        (
+            f"if [ -f {_shell_join([str(root_channel_dir)])} ]; then "
+            f"cp {_shell_join([str(root_channel_dir)])} "
+            f"{_shell_join([str(profile_channel_dir)])}; "
+            f"chmod 600 {_shell_join([str(profile_channel_dir)])} 2>/dev/null || true; fi"
+        ),
+        f"export HERMES_HOME={_shell_join([str(profile_dir)])}",
+        f"exec {_hermes_launch_command(model_id=model_id)}",
+    ]
+    return "; ".join(commands)
+
+
+def _hermes_config_yaml(
+    *,
+    model_id: str,
+    base_url: str,
+    api_key: str,
+    workspace_path: str,
+) -> str:
+    return (
+        "model:\n"
+        f"  default: {_hermes_yaml_quote(model_id)}\n"
+        "  provider: custom\n"
+        f"  base_url: {_hermes_yaml_quote(base_url)}\n"
+        f"  api_key: {_hermes_yaml_quote(api_key)}\n"
+        "  api_mode: chat_completions\n"
+        "toolsets:\n"
+        + "".join(f"  - {toolset}\n" for toolset in HERMES_CODING_TOOLSETS)
+        + "agent:\n"
+        f"  system_prompt: {_hermes_yaml_quote(HERMES_SYSTEM_PROMPT)}\n"
+        "  max_turns: 200\n"
+        "  tool_use_enforcement: auto\n"
+        "terminal:\n"
+        "  backend: local\n"
+        f"  cwd: {_hermes_yaml_quote(workspace_path)}\n"
+        "  timeout: 180\n"
+        "  persistent_shell: true\n"
+        "display:\n"
+        "  streaming: true\n"
+        "  show_reasoning: true\n"
+        "  tool_progress: all\n"
+    )
+
+
+def _hermes_dotenv(
+    *,
+    model_id: str,
+    base_url: str,
+    api_key: str,
+    workspace_path: str,
+) -> str:
+    return (
+        f"OPENAI_BASE_URL={_hermes_dotenv_quote(base_url)}\n"
+        f"CUSTOM_BASE_URL={_hermes_dotenv_quote(base_url)}\n"
+        f"OPENAI_API_KEY={_hermes_dotenv_quote(api_key)}\n"
+        f"HERMES_MODEL={_hermes_dotenv_quote(model_id)}\n"
+        f"HERMES_INFERENCE_MODEL={_hermes_dotenv_quote(model_id)}\n"
+        "HERMES_INFERENCE_PROVIDER=custom\n"
+        "HERMES_YOLO_MODE=1\n"
+        f"HERMES_MTPLX_TOOLSETS={_hermes_dotenv_quote(HERMES_CODING_TOOLSETS_TEXT)}\n"
+        f"HERMES_MTPLX_CAPABILITIES={_hermes_dotenv_quote(HERMES_CAPABILITY_SUMMARY)}\n"
+        f"HERMES_MTPLX_MESSAGING_NOTE={_hermes_dotenv_quote(HERMES_MESSAGING_SETUP_HINT)}\n"
+        f"HERMES_MTPLX_GATEWAY_STATUS_COMMAND={_hermes_dotenv_quote(HERMES_GATEWAY_STATUS_COMMAND)}\n"
+        f"HERMES_MTPLX_GATEWAY_TRUTH_NOTE={_hermes_dotenv_quote(HERMES_GATEWAY_TRUTH_HINT)}\n"
+        f"HERMES_WORKSPACE={_hermes_dotenv_quote(workspace_path)}\n"
+        f"TERMINAL_CWD={_hermes_dotenv_quote(workspace_path)}\n"
+    )
+
+
+def _write_if_changed(path: Path, text: str, *, mode: int = 0o600) -> bool:
+    existing = None
+    if path.exists():
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except OSError:
+            existing = None
+    changed = existing != text
+    if changed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    try:
+        path.chmod(mode)
+    except OSError:
+        pass
+    return changed
+
+
+def _sync_hermes_profile(
+    *,
+    model_id: str,
+    base_url: str,
+    api_key: str,
+    workspace_path: str,
+) -> dict[str, Any]:
+    profile_dir = _hermes_profile_dir()
+    config_path = profile_dir / "config.yaml"
+    env_path = profile_dir / ".env"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    config_changed = _write_if_changed(
+        config_path,
+        _hermes_config_yaml(
+            model_id=model_id,
+            base_url=base_url,
+            api_key=api_key,
+            workspace_path=workspace_path,
+        ),
+    )
+    env_changed = _write_if_changed(
+        env_path,
+        _hermes_dotenv(
+            model_id=model_id,
+            base_url=base_url,
+            api_key=api_key,
+            workspace_path=workspace_path,
+        ),
+    )
+    did_mirror_channels = False
+    root_channel_dir = _hermes_home() / "channel_directory.json"
+    profile_channel_dir = profile_dir / "channel_directory.json"
+    if root_channel_dir.exists():
+        try:
+            shutil.copy2(root_channel_dir, profile_channel_dir)
+            profile_channel_dir.chmod(0o600)
+            did_mirror_channels = True
+        except OSError:
+            did_mirror_channels = False
+    return {
+        "profile_name": HERMES_PROFILE_NAME,
+        "profile_path": str(profile_dir),
+        "config_path": str(config_path),
+        "env_path": str(env_path),
+        "did_change": config_changed or env_changed or did_mirror_channels,
+        "did_mirror_channels": did_mirror_channels,
+    }
+
+
+def _apply_ram_session_cache_env(env: dict[str, str], args: Any) -> None:
+    policy = str(getattr(args, "ram_session_cache_policy", "") or "").strip().lower()
+    if not policy or policy == "target-default":
+        return
+    if policy == "minimal":
+        env["MTPLX_SESSION_BLOCK_PREFIX_RESTORE"] = "0"
+        env["MTPLX_SESSION_BANK_MAX_ENTRIES"] = "1"
+        env["MTPLX_SESSION_BANK_MAX_BYTES"] = "1G"
+        env["MTPLX_SESSION_BANK_PER_SESSION_BYTES"] = "1G"
+        return
+    if policy != "bounded":
+        return
+    block_prefix_restore = getattr(args, "ram_session_block_prefix_restore", None)
+    env["MTPLX_SESSION_BLOCK_PREFIX_RESTORE"] = (
+        "1" if block_prefix_restore is not False else "0"
+    )
+    env["MTPLX_SESSION_BANK_MAX_ENTRIES"] = str(
+        int(getattr(args, "ram_session_cache_max_entries", None) or 4)
+    )
+    env["MTPLX_SESSION_BANK_MAX_BYTES"] = str(
+        getattr(args, "ram_session_cache_max_size", None) or "8G"
+    )
+    env["MTPLX_SESSION_BANK_PER_SESSION_BYTES"] = str(
+        getattr(args, "ram_session_cache_per_session_max_size", None) or "4G"
+    )
+
+
+def _adaptive_command_suffix(args: Any) -> str:
+    parts: list[str] = []
+    policy = str(getattr(args, "adaptive_policy", "none") or "none")
+    if policy == "none":
+        return ""
+    parts.extend(["--adaptive-policy", shlex.quote(policy)])
+    parts.extend(
+        [
+            "--adaptive-min-depth",
+            shlex.quote(str(getattr(args, "adaptive_min_depth", 1))),
+        ]
+    )
+    if policy == "streak":
+        for attr, flag in (
+            ("adaptive_start_depth", "--adaptive-start-depth"),
+            ("adaptive_increase_after", "--adaptive-increase-after"),
+            ("adaptive_decrease_after", "--adaptive-decrease-after"),
+        ):
+            parts.extend([flag, shlex.quote(str(getattr(args, attr)))])
+    elif policy == "expected_value":
+        for attr, flag in (
+            ("adaptive_ev_base_depth", "--adaptive-ev-base-depth"),
+            ("adaptive_ev_accept_priors", "--adaptive-ev-accept-priors"),
+            ("adaptive_ev_draft_cost_s", "--adaptive-ev-draft-cost-s"),
+            ("adaptive_ev_extra_verify_cost_s", "--adaptive-ev-extra-verify-cost-s"),
+            ("adaptive_ev_baseline_tok_s", "--adaptive-ev-baseline-tok-s"),
+            ("adaptive_ev_safety_margin", "--adaptive-ev-safety-margin"),
+            ("adaptive_ev_margin_center", "--adaptive-ev-margin-center"),
+            ("adaptive_ev_margin_scale", "--adaptive-ev-margin-scale"),
+            ("adaptive_ev_confidence_weight", "--adaptive-ev-confidence-weight"),
+            (
+                "adaptive_ev_min_extra_accept_probability",
+                "--adaptive-ev-min-extra-accept-probability",
+            ),
+            (
+                "adaptive_ev_warmup_full_depth_cycles",
+                "--adaptive-ev-warmup-full-depth-cycles",
+            ),
+            ("adaptive_ev_exploration_interval", "--adaptive-ev-exploration-interval"),
+        ):
+            parts.extend([flag, shlex.quote(str(getattr(args, attr)))])
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _reasoning_command_suffix(
+    args: Any,
+    *,
+    default: str = "auto",
+    include_mode: bool = True,
+) -> str:
+    parts: list[str] = []
+    reasoning_mode = _reasoning_mode(args, default=default)
+    if include_mode and getattr(args, "reasoning", None) is not None:
+        parts.extend(["--reasoning", shlex.quote(reasoning_mode)])
+    reasoning_parser = getattr(args, "reasoning_parser", None)
+    if reasoning_parser:
+        parts.extend(["--reasoning-parser", shlex.quote(str(reasoning_parser))])
+    reasoning_effort = getattr(args, "reasoning_effort", None)
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if reasoning_effort and (
+        str(reasoning_effort) != "auto" or "reasoning-effort" in cli_flags
+    ):
+        parts.extend(["--reasoning-effort", shlex.quote(str(reasoning_effort))])
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _fan_mode_command_suffix(args: Any) -> str:
+    mode = _fan_mode_from_args(args)
+    return f"--fan-mode {shlex.quote(mode)} "
+
+
+def _server_sampler_command_suffix(args: Any, *, include_draft: bool) -> str:
+    parts: list[str] = []
+    for attr, flag in (
+        ("temperature", "--default-temperature"),
+        ("top_p", "--default-top-p"),
+        ("top_k", "--top-k"),
+    ):
+        value = getattr(args, attr, None)
+        if value is not None:
+            parts.extend([flag, shlex.quote(str(value))])
+    if include_draft:
+        for attr, flag in (
+            ("draft_temperature", "--draft-temperature"),
+            ("draft_top_p", "--draft-top-p"),
+            ("draft_top_k", "--draft-top-k"),
+        ):
+            value = getattr(args, attr, None)
+            if value is not None:
+                parts.extend([flag, shlex.quote(str(value))])
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _bridge_prompt_command_suffix(args: Any) -> str:
+    parts: list[str] = []
+    tool_prompt_mode = getattr(args, "tool_prompt_mode", None)
+    if tool_prompt_mode:
+        parts.extend(["--tool-prompt-mode", shlex.quote(str(tool_prompt_mode))])
+    chat_template_profile = getattr(args, "chat_template_profile", None)
+    if chat_template_profile:
+        parts.extend(["--chat-template-profile", shlex.quote(str(chat_template_profile))])
+    chat_template_path = getattr(args, "chat_template_path", None)
+    if chat_template_path:
+        parts.extend(["--chat-template-path", shlex.quote(str(chat_template_path))])
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _quickstart_openwebui_payload(
+    args: Any,
+    *,
+    inspection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     host = str(getattr(args, "host", "127.0.0.1"))
     port = int(getattr(args, "port", 8000))
     model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
     base = f"http://{_connect_host_for_bind(host)}:{port}"
     profile = str(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+    context_window = _inspection_context_window(inspection)
     return {
         "integration": "openwebui",
         "server_url": base,
@@ -7015,13 +10171,18 @@ def _quickstart_openwebui_payload(args: Any) -> dict[str, Any]:
         "api_base_url": base + "/v1",
         "chat_url": base + "/",
         "model_id": model_id,
+        "context_window": context_window,
         "api_key": "not required for localhost",
         "server_command": (
             f"mtplx quickstart --host {host} --port {port} "
             f"--model {shlex.quote(str(getattr(args, 'model', DEFAULT_RUNTIME_MODEL_DIR)))} "
             f"--profile {profile} "
-            f"{'--max ' if bool(getattr(args, 'max', False)) else ''}"
+            f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
+            f"{_batching_command_suffix(args)} "
+            f"{_server_sampler_command_suffix(args, include_draft=True)} "
+            f"{_reasoning_command_suffix(args)} "
+            f"{_bridge_prompt_command_suffix(args)} "
             "--no-stats-footer --open-browser"
         ),
         "openwebui_steps": [
@@ -7030,6 +10191,21 @@ def _quickstart_openwebui_payload(args: Any) -> dict[str, Any]:
             f"Model: {model_id}",
         ],
     }
+
+
+def _pi_sampler_temperature(args: Any) -> float:
+    return float(getattr(args, "temperature", 0.6))
+
+
+def _pi_sampler_top_p(args: Any) -> float:
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if "top-p" in cli_flags or "default-top-p" in cli_flags:
+        return float(getattr(args, "top_p", 0.95))
+    return 0.95
+
+
+def _pi_sampler_top_k(args: Any) -> int:
+    return int(getattr(args, "top_k", 20))
 
 
 def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str, Any]:
@@ -7047,6 +10223,11 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
     model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
     base_url = f"http://{_connect_host_for_bind(host)}:{port}/v1"
     api_key = str(getattr(args, "api_key", None) or PI_LOCAL_API_KEY)
+    pi_temperature = _pi_sampler_temperature(args)
+    pi_top_p = _pi_sampler_top_p(args)
+    pi_top_k = _pi_sampler_top_k(args)
+    pi_preserve_thinking = _pi_preserve_thinking_policy(args)
+    api_key_command_suffix = _api_key_command_suffix(args) or "--api-key mtplx-local "
     provider = build_pi_provider_config(
         base_url=base_url,
         model_id=model_id,
@@ -7060,9 +10241,9 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
         "api_base_url": base_url,
         "model_id": model_id,
         "model_ref": pi_model_ref(model_id),
-        "api_key": api_key,
+        "api_key": _api_key_display_value(api_key),
         "config_path": str(pi_models_json_path()),
-        "provider": provider,
+        "provider": _redact_secret_from_payload(provider, api_key),
         "no_hidden_max_tokens": "maxTokens"
         not in json.dumps(provider.get("models", [])),
         "launch_command": pi_launch_command(model_id),
@@ -7077,9 +10258,16 @@ def _quickstart_pi_payload(args: Any, *, write_config: bool = False) -> dict[str
             f"mtplx quickstart --host {host} --port {port} "
             f"--model {shlex.quote(str(getattr(args, 'model', DEFAULT_RUNTIME_MODEL_DIR)))} "
             f"--profile {str(getattr(args, 'profile', None) or DEFAULT_PROFILE_NAME)} "
-            f"{'--max ' if bool(getattr(args, 'max', False)) else ''}"
+            f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
-            f"--api-key {shlex.quote(api_key)} --no-stats-footer"
+            f"{_batching_command_suffix(args)} "
+            f"--default-temperature {pi_temperature} "
+            f"--default-top-p {pi_top_p} --top-k {pi_top_k} "
+            f"--draft-temperature {pi_temperature} "
+            f"--draft-top-p {pi_top_p} --draft-top-k {pi_top_k} "
+            f"--preserve-thinking {pi_preserve_thinking} "
+            f"{_reasoning_command_suffix(args)} "
+            f"{api_key_command_suffix}--no-stats-footer"
         ),
         "pi_steps": [
             f"Pi config: {pi_models_json_path()}",
@@ -7140,14 +10328,74 @@ def _quickstart_opencode_payload(
     model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
     base_url = f"http://{_connect_host_for_bind(host)}:{port}/v1"
     context_window = _inspection_context_window(inspection)
+    reasoning_mode = _reasoning_mode(args, default="auto")
+    enable_thinking = reasoning_mode != "off"
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    default_tool_prompt_mode = str(
+        OPENCODE_FAIR_BATCHING_DEFAULTS.get("tool_prompt_mode")
+        or "hybrid"
+    )
+    tool_prompt_mode = (
+        str(
+            getattr(args, "tool_prompt_mode", default_tool_prompt_mode)
+            or default_tool_prompt_mode
+        )
+        if "tool-prompt-mode" in cli_flags
+        else default_tool_prompt_mode
+    )
+    chat_template_profile = str(
+        getattr(args, "chat_template_profile", OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT)
+        or OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT
+    )
+    opencode_max_response_tokens = getattr(args, "max_response_tokens", None)
+    max_response_suffix = (
+        f"--max-response-tokens {int(opencode_max_response_tokens)} "
+        if opencode_max_response_tokens is not None
+        else ""
+    )
+    api_key_suffix = _api_key_command_suffix(args)
+    profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+    generation_mode = _generation_mode_from_args(args)
+    target_sampler = {
+        "temperature": float(getattr(args, "temperature", 0.6)),
+        "top_p": float(getattr(args, "top_p", 0.95)),
+        "top_k": int(getattr(args, "top_k", 20)),
+    }
+    draft_sampler = (
+        _model_draft_sampler_spec(inspection, profile)
+        if inspection is not None
+        else None
+    )
+    draft_sampler_source = "model_contract_or_profile" if draft_sampler is not None else None
+    draft_sampler_override = _explicit_draft_sampler_override(args, draft_sampler)
+    if draft_sampler_override is not None:
+        draft_sampler = draft_sampler_override
+        draft_sampler_source = "explicit_cli"
+    sampler_suffix = (
+        f"--depth {int(getattr(args, 'depth', 3))} "
+        f"--temperature {target_sampler['temperature']} "
+        f"--top-p {target_sampler['top_p']} "
+        f"--top-k {target_sampler['top_k']} "
+    )
+    draft_sampler_suffix = (
+        (
+            f"--draft-temperature {float(draft_sampler['temperature'])} "
+            f"--draft-top-p {float(draft_sampler['top_p'])} "
+            f"--draft-top-k {int(draft_sampler['top_k'])} "
+        )
+        if draft_sampler is not None and generation_mode == GENERATION_MODE_MTP
+        else ""
+    )
     provider_fragment = build_opencode_provider_config(
         base_url=base_url,
         model_id=model_id,
         model_name=f"MTPLX {model_id}",
+        api_key=getattr(args, "api_key", None),
         context_window=context_window,
         output_limit=context_window,
-        enable_thinking=True,
+        enable_thinking=enable_thinking,
         top_p=float(getattr(args, "top_p", 0.95)),
+        top_k=int(getattr(args, "top_k", 20)),
     )
     payload = {
         "integration": "opencode",
@@ -7157,13 +10405,26 @@ def _quickstart_opencode_payload(
         "model_id": model_id,
         "model_ref": opencode_model_ref(model_id),
         "config_path": str(opencode_config_path()),
-        "provider": provider_fragment["provider"]["mtplx"],
-        "config": provider_fragment,
+        "provider": _redact_secret_from_payload(
+            provider_fragment["provider"]["mtplx"],
+            getattr(args, "api_key", None),
+        ),
+        "config": _redact_secret_from_payload(
+            provider_fragment,
+            getattr(args, "api_key", None),
+        ),
         "detected": detect_opencode_desktop(),
         "context_window": context_window,
         "output_limit": context_window,
-        "reasoning_field": "reasoning_content",
+        "transport_headers": {"x-mtplx-client": "opencode"},
+        "reasoning_field": None,
         "no_hidden_max_tokens": True,
+        "tool_prompt_mode": tool_prompt_mode,
+        "chat_template_profile": chat_template_profile,
+        "mtp_depth": int(getattr(args, "depth", 3)),
+        "target_sampler": target_sampler,
+        "draft_sampler": draft_sampler,
+        "draft_sampler_source": draft_sampler_source,
         "server_console": True,
         "server_controls": [
             "/reasoning on|off|auto|status",
@@ -7175,15 +10436,25 @@ def _quickstart_opencode_payload(
             f"mtplx start opencode --host {host} --port {port} "
             f"--model {shlex.quote(str(getattr(args, 'model', DEFAULT_RUNTIME_MODEL_DIR)))} "
             f"--profile {str(getattr(args, 'profile', None) or DEFAULT_PROFILE_NAME)} "
-            f"{'--max ' if bool(getattr(args, 'max', False)) else ''}"
-            f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
-            "--reasoning on --no-stats"
+            f"{_fan_mode_command_suffix(args)}"
+            f"{'--no-mtp ' if generation_mode == GENERATION_MODE_AR else ''}"
+            f"{api_key_suffix}"
+            f"{_batching_command_suffix(args)} "
+            f"{_adaptive_command_suffix(args)} "
+            f"{sampler_suffix}"
+            f"{draft_sampler_suffix}"
+            f"{max_response_suffix}"
+            f"--tool-prompt-mode {tool_prompt_mode} "
+            f"--chat-template-profile {chat_template_profile} "
+            f"--reasoning {reasoning_mode} "
+            f"{_reasoning_command_suffix(args, default='auto', include_mode=False)} --no-stats"
         ),
         "opencode_steps": [
             f"OpenCode config: {opencode_config_path()}",
+            "Transport header: x-mtplx-client=opencode",
             f"Model in OpenCode: {opencode_model_ref(model_id)}",
             f"OpenAI-compatible API base URL: {base_url}",
-            "Reasoning stream field: reasoning_content",
+            "Reasoning is controlled by MTPLX server settings.",
         ],
     }
     if write_config:
@@ -7191,10 +10462,12 @@ def _quickstart_opencode_payload(
             base_url=base_url,
             model_id=model_id,
             model_name=f"MTPLX {model_id}",
+            api_key=getattr(args, "api_key", None),
             context_window=context_window,
             output_limit=context_window,
-            enable_thinking=True,
+            enable_thinking=enable_thinking,
             top_p=float(getattr(args, "top_p", 0.95)),
+            top_k=int(getattr(args, "top_k", 20)),
         )
     return payload
 
@@ -7247,8 +10520,9 @@ def _quickstart_swival_payload(
             f"mtplx start swival --host {host} --port {port} "
             f"--model {shlex.quote(str(getattr(args, 'model', DEFAULT_RUNTIME_MODEL_DIR)))} "
             f"--profile {str(getattr(args, 'profile', None) or DEFAULT_PROFILE_NAME)} "
-            f"{'--max ' if bool(getattr(args, 'max', False)) else ''}"
+            f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
+            f"{_batching_command_suffix(args)} "
             "--no-stats"
         ),
         "swival_steps": [
@@ -7257,6 +10531,96 @@ def _quickstart_swival_payload(
             "Provider: generic",
         ],
     }
+
+
+def _quickstart_hermes_payload(
+    args: Any,
+    *,
+    write_config: bool = False,
+    inspection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = int(getattr(args, "port", 8000))
+    model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
+    server_url = f"http://{_connect_host_for_bind(host)}:{port}"
+    base_url = server_url.rstrip("/") + "/v1"
+    api_key = str(getattr(args, "api_key", None) or HERMES_LOCAL_API_KEY)
+    workspace_path = _hermes_workspace_path(args)
+    context_window = _inspection_context_window(inspection)
+    launch_command = _hermes_launch_command(model_id=model_id)
+    terminal_command = _hermes_terminal_command(
+        model_id=model_id,
+        workspace_path=workspace_path,
+    )
+    api_key_suffix = _api_key_command_suffix(args) or "--api-key mtplx-local "
+    payload = {
+        "integration": "hermes",
+        "server_url": server_url,
+        "base_url": base_url,
+        "api_base_url": base_url,
+        "model_id": model_id,
+        "profile_name": HERMES_PROFILE_NAME,
+        "profile_path": str(_hermes_profile_dir()),
+        "config_path": str(_hermes_profile_dir() / "config.yaml"),
+        "env_path": str(_hermes_profile_dir() / ".env"),
+        "workspace_path": workspace_path,
+        "toolsets": list(HERMES_CODING_TOOLSETS),
+        "toolsets_arg": HERMES_CODING_TOOLSETS_TEXT,
+        "capability_summary": HERMES_CAPABILITY_SUMMARY,
+        "context_window": context_window,
+        "api_key": _api_key_display_value(api_key),
+        "detected": {
+            "installed": shutil.which("hermes") is not None,
+            "path": shutil.which("hermes"),
+        },
+        "launch_command": launch_command,
+        "terminal_command": terminal_command,
+        "gateway_status_command": HERMES_GATEWAY_STATUS_COMMAND,
+        "messaging_setup": HERMES_MESSAGING_SETUP_HINT,
+        "server_console": True,
+        "server_controls": [
+            "/reasoning on|off|auto|status",
+            "/mtp on|off|status",
+            "/stats",
+            "/help",
+        ],
+        "server_command": (
+            f"mtplx start hermes --host {host} --port {port} "
+            f"--model {shlex.quote(str(getattr(args, 'model', DEFAULT_RUNTIME_MODEL_DIR)))} "
+            f"--profile {str(getattr(args, 'profile', None) or DEFAULT_PROFILE_NAME)} "
+            f"{_fan_mode_command_suffix(args)}"
+            f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
+            f"{api_key_suffix}"
+            f"--scheduler-mode {str(getattr(args, 'scheduler_mode', 'serial'))} "
+            f"--batching-preset {str(getattr(args, 'batching_preset', 'latency'))} "
+            f"{_batching_command_suffix(args)} "
+            f"{_adaptive_command_suffix(args)} "
+            f"--temperature {float(getattr(args, 'temperature', 0.6))} "
+            f"--top-p {float(getattr(args, 'top_p', 1.0))} "
+            f"--top-k {int(getattr(args, 'top_k', 20))} "
+            f"--draft-temperature {float(getattr(args, 'draft_temperature', 0.6))} "
+            f"--draft-top-p {float(getattr(args, 'draft_top_p', 1.0))} "
+            f"--draft-top-k {int(getattr(args, 'draft_top_k', 20))} "
+            f"--tool-prompt-mode {str(getattr(args, 'tool_prompt_mode', 'hybrid'))} "
+            f"--chat-template-profile {str(getattr(args, 'chat_template_profile', OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT))} "
+            f"--reasoning {_reasoning_mode(args, default='auto')} "
+            f"{_reasoning_command_suffix(args, default='auto', include_mode=False)} --no-stats"
+        ),
+        "hermes_steps": [
+            f"Hermes profile: {_hermes_profile_dir()}",
+            f"OpenAI-compatible API base URL: {base_url}",
+            f"Run Hermes: {launch_command}",
+            "Tools: " + HERMES_CODING_TOOLSETS_TEXT,
+        ],
+    }
+    if write_config:
+        payload["config_write"] = _sync_hermes_profile(
+            model_id=model_id,
+            base_url=base_url,
+            api_key=api_key,
+            workspace_path=workspace_path,
+        )
+    return payload
 
 
 def _quickstart_print_openwebui_handoff(args: Any, *, runtime_model: str) -> None:
@@ -7320,13 +10684,21 @@ def _quickstart_print_opencode_handoff(
     config_path = config_write.get("config_path") or opencode.get("config_path")
     backup_path = config_write.get("backup_path")
     _quickstart_line(f"      OpenCode config: {config_path}")
+    _quickstart_line("      MTPLX client header: x-mtplx-client=opencode")
     if backup_path:
         _quickstart_line(
             f"      Backed up unreadable old OpenCode config: {backup_path}"
         )
     _quickstart_line(f"      OpenCode model: {opencode.get('model_ref')}")
     _quickstart_line(f"      API base URL: {opencode.get('api_base_url')}")
-    _quickstart_line("      Reasoning: raw reasoning_content stream")
+    _quickstart_line(
+        "      Reasoning: "
+        + (
+            "enabled on the MTPLX server"
+            if _reasoning_mode(args, default="auto") == "on"
+            else "controlled by MTPLX server settings"
+        )
+    )
     _quickstart_line("      Response cap: none hidden by MTPLX")
     _quickstart_line(f"      Loading model: {runtime_model}")
     _quickstart_line("      Keep this terminal open for the MTPLX server.")
@@ -7364,6 +10736,32 @@ def _quickstart_print_swival_handoff(
     _quickstart_line(
         f"      Run Swival in another terminal: {swival.get('launch_command')}"
     )
+    _quickstart_line()
+
+
+def _quickstart_print_hermes_handoff(
+    args: Any,
+    *,
+    runtime_model: str,
+    hermes: dict[str, Any],
+) -> None:
+    config_write = (
+        hermes.get("config_write")
+        if isinstance(hermes.get("config_write"), dict)
+        else {}
+    )
+    config_path = config_write.get("config_path") or hermes.get("config_path")
+    env_path = config_write.get("env_path") or hermes.get("env_path")
+    _quickstart_line("[2/3] Connecting MTPLX to Hermes Agent...")
+    _quickstart_line(f"      Hermes profile: {hermes.get('profile_name')}")
+    _quickstart_line(f"      Hermes config: {config_path}")
+    _quickstart_line(f"      Hermes env: {env_path}")
+    _quickstart_line(f"      Hermes tools: {hermes.get('toolsets_arg')}")
+    _quickstart_line(f"      API base URL: {hermes.get('api_base_url')}")
+    _quickstart_line(f"      Loading model: {runtime_model}")
+    _quickstart_line("      Keep this terminal open for the MTPLX server.")
+    _quickstart_line("      Hermes will open automatically when MTPLX is ready.")
+    _quickstart_line(f"      Manual fallback: {hermes.get('launch_command')}")
     _quickstart_line()
 
 
@@ -7433,15 +10831,163 @@ def _quickstart_require_pi_cli(args: Any) -> bool:
     return True
 
 
+def _quickstart_apply_local_model_defaults(
+    args: Any,
+    *,
+    model: str,
+) -> dict[str, Any] | None:
+    model_path = Path(str(model)).expanduser()
+    if not model_path.exists():
+        return None
+    inspection, gate_exit = _model_gate(
+        str(model_path),
+        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
+        yes=bool(getattr(args, "yes", False)),
+    )
+    profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+    _apply_model_contract_depth_default(args, inspection, profile)
+    _apply_backend_serve_defaults(args, inspection)
+    if gate_exit is not None:
+        return inspection
+    return inspection
+
+
+def _quickstart_served_model_id(args: Any, runtime_model: str) -> str:
+    model_id = _public_model_id_for_args(args, str(runtime_model))
+    args.model_id = model_id
+    return model_id
+
+
+def _with_batching_args(target: Any, source: Any) -> Any:
+    for attr, default in (
+        ("scheduler_mode", "serial"),
+        ("batching_preset", "latency"),
+        ("max_active_requests", None),
+        ("decode_batch_max", None),
+        ("batch_wait_ms", None),
+        ("prefill_chunk_tokens", None),
+        ("experimental_mtp_cohorts", False),
+        ("ssd_session_cache", "off"),
+        ("ssd_session_cache_dir", None),
+        ("ssd_session_cache_max_size", "100GB"),
+        ("ssd_session_cache_min_prefix_tokens", 512),
+    ):
+        setattr(target, attr, getattr(source, attr, default))
+    return target
+
+
+def _with_server_policy_args(target: Any, source: Any) -> Any:
+    setattr(target, "_cli_flags", getattr(source, "_cli_flags", set()) or set())
+    _with_batching_args(target, source)
+    for attr, default in (
+        ("api_key_file", None),
+        ("api_key_source", "none"),
+        ("paged_kv_quantization", "off"),
+        ("tool_prompt_mode", "hybrid"),
+        ("chat_template_profile", "local_qwen36"),
+        ("chat_template_path", None),
+        ("adaptive_policy", "none"),
+        ("adaptive_min_depth", 1),
+        ("adaptive_start_depth", 1),
+        ("adaptive_increase_after", 4),
+        ("adaptive_decrease_after", 1),
+        ("adaptive_ev_base_depth", 2),
+        ("adaptive_ev_accept_priors", "0.92,0.64,0.32"),
+        ("adaptive_ev_draft_cost_s", 0.0048),
+        ("adaptive_ev_extra_verify_cost_s", 0.006),
+        ("adaptive_ev_baseline_tok_s", 40.0),
+        ("adaptive_ev_safety_margin", 0.10),
+        ("adaptive_ev_margin_center", 1.0),
+        ("adaptive_ev_margin_scale", 2.0),
+        ("adaptive_ev_confidence_weight", 0.35),
+        ("adaptive_ev_min_extra_accept_probability", 0.18),
+        ("adaptive_ev_warmup_full_depth_cycles", 4),
+        ("adaptive_ev_exploration_interval", 32),
+    ):
+        setattr(target, attr, getattr(source, attr, default))
+    return target
+
+
+def _apply_opencode_fair_defaults(args: Any) -> None:
+    """Make ``mtplx start opencode`` choose the coding-agent fair lane by default."""
+
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if (
+        "scheduler-mode" in cli_flags
+        and str(getattr(args, "scheduler_mode", "") or "") == "serial"
+    ):
+        return
+    for attr, value in OPENCODE_FAIR_BATCHING_DEFAULTS.items():
+        flag = attr.replace("_", "-")
+        if flag in cli_flags:
+            continue
+        setattr(args, attr, value)
+
+
+def _apply_hermes_latency_defaults(args: Any) -> None:
+    """Make ``mtplx start hermes`` match the native app's foreground agent lane."""
+
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    for attr, value in HERMES_LATENCY_DEFAULTS.items():
+        flag = attr.replace("_", "-")
+        if flag in cli_flags:
+            continue
+        setattr(args, attr, value)
+
+
+def _apply_opencode_memory_env_defaults(env: dict[str, str]) -> None:
+    for key, value in _opencode_memory_env_defaults().items():
+        env.setdefault(key, value)
+
+
+def _apply_hermes_memory_env_defaults(env: dict[str, str]) -> None:
+    total_ram = _detect_total_ram_bytes_for_opencode_defaults()
+    high_memory = (
+        total_ram is not None
+        and total_ram >= _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES
+    )
+    env.setdefault("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE", "async_per_head")
+    env.setdefault("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT", "32768")
+    env.setdefault("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_Q", "3")
+    env.setdefault("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MAX_Q", "5")
+    env.setdefault("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", "1")
+    env.setdefault(
+        "MTPLX_SESSION_BANK_MAX_ENTRIES",
+        _OPENCODE_HIGH_MEMORY_MAX_ENTRIES if high_memory else _OPENCODE_DEFAULT_MAX_ENTRIES,
+    )
+    env.setdefault(
+        "MTPLX_SESSION_BANK_MAX_BYTES",
+        _OPENCODE_HIGH_MEMORY_MAX_BYTES if high_memory else "8G",
+    )
+    env.setdefault(
+        "MTPLX_SESSION_BANK_PER_SESSION_BYTES",
+        _OPENCODE_HIGH_MEMORY_PER_SESSION_BYTES if high_memory else "4G",
+    )
+    env.setdefault("MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S", "30.0")
+    env.setdefault("MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS", "4096")
+    env.setdefault("MTPLX_LAZY_BONUS_VERIFY", "1")
+    env.setdefault("MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER", "1")
+    env.setdefault("MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE", "1")
+    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_TOTAL_MAX_LINES", "72")
+    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_MIN_LINES_PER_FILE", "8")
+    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS", "120")
+    env.setdefault("MTPLX_READ_ONLY_INSPECTION_FORCE_ANSWER_AFTER_TOOLS", "12")
+    env.setdefault("MTPLX_TOOL_PROMPT_MODE", "hybrid")
+    env.setdefault("MTPLX_CHAT_TEMPLATE_PROFILE", OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT)
+    env.setdefault("MTPLX_CLIENT", "hermes")
+
+
 def _quickstart_run_openwebui(
     args: Any, *, runtime_model: str, inspection: dict[str, Any]
 ) -> int:
+    model_id = _quickstart_served_model_id(args, runtime_model)
     _quickstart_print_openwebui_handoff(args, runtime_model=runtime_model)
+    open_dashboard = bool(getattr(args, "open_dashboard", False))
     serve_args = SimpleNamespace(
         model=runtime_model,
         cache_dir=getattr(args, "cache_dir", None),
         profile=getattr(args, "profile", None) or DEFAULT_PROFILE_NAME,
-        model_id=getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID,
+        model_id=model_id,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=True,
         host=str(getattr(args, "host", "127.0.0.1")),
@@ -7455,34 +11001,46 @@ def _quickstart_run_openwebui(
         max_response_tokens=getattr(args, "max_response_tokens", None),
         temperature=float(getattr(args, "temperature", 0.6)),
         top_p=float(getattr(args, "top_p", 0.95)),
+        top_k=int(getattr(args, "top_k", 20)),
+        draft_temperature=getattr(args, "draft_temperature", None),
+        draft_top_p=getattr(args, "draft_top_p", None),
+        draft_top_k=getattr(args, "draft_top_k", None),
         reasoning=getattr(args, "reasoning", None),
         preserve_thinking=_preserve_thinking_policy(args),
         reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),
         strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
         quickstart_openwebui=True,
         open_browser=True,
+        open_dashboard=open_dashboard,
+        enable_thermal_poll=bool(getattr(args, "enable_thermal_poll", False)),
+        fan_mode=getattr(args, "fan_mode", "default"),
         max=bool(getattr(args, "max", False)),
         max_idle_min=int(getattr(args, "max_idle_min", 15)),
     )
-    return cmd_serve_public(serve_args)
+    return cmd_serve_public(_with_server_policy_args(serve_args, args))
 
 
 def _quickstart_run_pi(
     args: Any, *, runtime_model: str, inspection: dict[str, Any]
 ) -> int:
+    model_id = _quickstart_served_model_id(args, runtime_model)
     if not getattr(args, "api_key", None):
         from mtplx.pi import PI_LOCAL_API_KEY
 
         args.api_key = PI_LOCAL_API_KEY
     pi = _quickstart_pi_payload(args, write_config=True)
     _quickstart_print_pi_handoff(args, runtime_model=runtime_model, pi=pi)
+    pi_temperature = _pi_sampler_temperature(args)
+    pi_top_p = _pi_sampler_top_p(args)
+    pi_top_k = _pi_sampler_top_k(args)
     serve_args = SimpleNamespace(
         model=runtime_model,
         cache_dir=getattr(args, "cache_dir", None),
         profile=getattr(args, "profile", None) or DEFAULT_PROFILE_NAME,
-        model_id=getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID,
+        model_id=model_id,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=True,
         host=str(getattr(args, "host", "127.0.0.1")),
@@ -7494,28 +11052,53 @@ def _quickstart_run_pi(
         stream_interval=int(getattr(args, "stream_interval", 1)),
         warmup_tokens=int(getattr(args, "warmup_tokens", 16)),
         max_response_tokens=getattr(args, "max_response_tokens", None),
-        temperature=float(getattr(args, "temperature", 0.6)),
-        top_p=float(getattr(args, "top_p", 0.95)),
+        temperature=pi_temperature,
+        top_p=pi_top_p,
+        top_k=pi_top_k,
+        draft_temperature=pi_temperature,
+        draft_top_p=pi_top_p,
+        draft_top_k=pi_top_k,
         reasoning=getattr(args, "reasoning", None),
-        preserve_thinking=_preserve_thinking_policy(args),
+        preserve_thinking=_pi_preserve_thinking_policy(args),
         reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),
         strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
         quickstart_openwebui=False,
         quickstart_pi=True,
         open_browser=False,
+        open_dashboard=bool(getattr(args, "open_dashboard", False)),
+        enable_thermal_poll=bool(getattr(args, "enable_thermal_poll", False)),
+        fan_mode=getattr(args, "fan_mode", "default"),
         max=bool(getattr(args, "max", False)),
         max_idle_min=int(getattr(args, "max_idle_min", 15)),
     )
-    return cmd_serve_public(serve_args)
+    return cmd_serve_public(_with_server_policy_args(serve_args, args))
 
 
 def _quickstart_run_opencode(
     args: Any, *, runtime_model: str, inspection: dict[str, Any]
 ) -> int:
-    if _reasoning_mode(args, default="auto") in {"auto", "on"}:
-        args.reasoning = "on"
+    model_id = _quickstart_served_model_id(args, runtime_model)
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    default_tool_prompt_mode = str(
+        OPENCODE_FAIR_BATCHING_DEFAULTS.get("tool_prompt_mode")
+        or "hybrid"
+    )
+    opencode_tool_prompt_mode = (
+        str(
+            getattr(args, "tool_prompt_mode", default_tool_prompt_mode)
+            or default_tool_prompt_mode
+        )
+        if "tool-prompt-mode" in cli_flags
+        else default_tool_prompt_mode
+    )
+    opencode_chat_template_profile = str(
+        getattr(args, "chat_template_profile", OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT)
+        or OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT
+    )
+    opencode_max_response_tokens = getattr(args, "max_response_tokens", None)
     opencode = _quickstart_opencode_payload(
         args,
         write_config=True,
@@ -7530,7 +11113,7 @@ def _quickstart_run_opencode(
         model=runtime_model,
         cache_dir=getattr(args, "cache_dir", None),
         profile=getattr(args, "profile", None) or DEFAULT_PROFILE_NAME,
-        model_id=getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID,
+        model_id=model_id,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=True,
         host=str(getattr(args, "host", "127.0.0.1")),
@@ -7541,12 +11124,20 @@ def _quickstart_run_opencode(
         rate_limit=int(getattr(args, "rate_limit", 0)),
         stream_interval=int(getattr(args, "stream_interval", 1)),
         warmup_tokens=int(getattr(args, "warmup_tokens", 16)),
-        max_response_tokens=getattr(args, "max_response_tokens", None),
+        max_response_tokens=opencode_max_response_tokens,
         temperature=float(getattr(args, "temperature", 0.6)),
         top_p=float(getattr(args, "top_p", 0.95)),
-        reasoning="on",
+        top_k=int(getattr(args, "top_k", 20)),
+        draft_temperature=getattr(args, "draft_temperature", None),
+        draft_top_p=getattr(args, "draft_top_p", None),
+        draft_top_k=getattr(args, "draft_top_k", None),
+        reasoning=getattr(args, "reasoning", None),
         preserve_thinking=_preserve_thinking_policy(args),
         reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
+        tool_prompt_mode=opencode_tool_prompt_mode,
+        chat_template_profile=opencode_chat_template_profile,
+        chat_template_path=getattr(args, "chat_template_path", None),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),
         strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
@@ -7554,15 +11145,19 @@ def _quickstart_run_opencode(
         quickstart_pi=False,
         quickstart_opencode=True,
         open_browser=False,
+        open_dashboard=bool(getattr(args, "open_dashboard", False)),
+        enable_thermal_poll=bool(getattr(args, "enable_thermal_poll", False)),
+        fan_mode=getattr(args, "fan_mode", "default"),
         max=bool(getattr(args, "max", False)),
         max_idle_min=int(getattr(args, "max_idle_min", 15)),
     )
-    return cmd_serve_public(serve_args)
+    return cmd_serve_public(_with_server_policy_args(serve_args, args))
 
 
 def _quickstart_run_swival(
     args: Any, *, runtime_model: str, inspection: dict[str, Any]
 ) -> int:
+    model_id = _quickstart_served_model_id(args, runtime_model)
     swival = _quickstart_swival_payload(args, inspection=inspection)
     _quickstart_print_swival_handoff(
         args,
@@ -7573,7 +11168,7 @@ def _quickstart_run_swival(
         model=runtime_model,
         cache_dir=getattr(args, "cache_dir", None),
         profile=getattr(args, "profile", None) or DEFAULT_PROFILE_NAME,
-        model_id=getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID,
+        model_id=model_id,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=True,
         host=str(getattr(args, "host", "127.0.0.1")),
@@ -7587,9 +11182,14 @@ def _quickstart_run_swival(
         max_response_tokens=getattr(args, "max_response_tokens", None),
         temperature=float(getattr(args, "temperature", 0.6)),
         top_p=float(getattr(args, "top_p", 0.95)),
+        top_k=int(getattr(args, "top_k", 20)),
+        draft_temperature=getattr(args, "draft_temperature", None),
+        draft_top_p=getattr(args, "draft_top_p", None),
+        draft_top_k=getattr(args, "draft_top_k", None),
         reasoning=getattr(args, "reasoning", None),
         preserve_thinking=_preserve_thinking_policy(args),
         reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
         stats_footer=False,
         strict_warmup=bool(getattr(args, "strict_warmup", False)),
         strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
@@ -7598,17 +11198,334 @@ def _quickstart_run_swival(
         quickstart_opencode=False,
         quickstart_swival=True,
         open_browser=False,
+        open_dashboard=bool(getattr(args, "open_dashboard", False)),
+        enable_thermal_poll=bool(getattr(args, "enable_thermal_poll", False)),
+        fan_mode=getattr(args, "fan_mode", "default"),
         max=bool(getattr(args, "max", False)),
         max_idle_min=int(getattr(args, "max_idle_min", 15)),
     )
-    return cmd_serve_public(serve_args)
+    return cmd_serve_public(_with_server_policy_args(serve_args, args))
+
+
+def _quickstart_run_hermes(
+    args: Any, *, runtime_model: str, inspection: dict[str, Any]
+) -> int:
+    model_id = _quickstart_served_model_id(args, runtime_model)
+    if not getattr(args, "api_key", None):
+        args.api_key = HERMES_LOCAL_API_KEY
+    hermes = _quickstart_hermes_payload(
+        args,
+        write_config=True,
+        inspection=inspection,
+    )
+    _quickstart_print_hermes_handoff(
+        args,
+        runtime_model=runtime_model,
+        hermes=hermes,
+    )
+    serve_args = SimpleNamespace(
+        model=runtime_model,
+        cache_dir=getattr(args, "cache_dir", None),
+        profile=getattr(args, "profile", None) or DEFAULT_PROFILE_NAME,
+        model_id=model_id,
+        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
+        yes=True,
+        host=str(getattr(args, "host", "127.0.0.1")),
+        port=int(getattr(args, "port", 8000)),
+        api_key=getattr(args, "api_key", None),
+        depth=int(getattr(args, "depth", 3)),
+        no_mtp=bool(getattr(args, "no_mtp", False)),
+        rate_limit=int(getattr(args, "rate_limit", 0)),
+        stream_interval=int(getattr(args, "stream_interval", 1)),
+        warmup_tokens=int(getattr(args, "warmup_tokens", 16)),
+        max_response_tokens=getattr(args, "max_response_tokens", None),
+        temperature=float(getattr(args, "temperature", 0.6)),
+        top_p=float(getattr(args, "top_p", 1.0)),
+        top_k=int(getattr(args, "top_k", 20)),
+        draft_temperature=getattr(args, "draft_temperature", 0.6),
+        draft_top_p=getattr(args, "draft_top_p", 1.0),
+        draft_top_k=getattr(args, "draft_top_k", 20),
+        reasoning=getattr(args, "reasoning", "auto"),
+        preserve_thinking=getattr(args, "preserve_thinking", "auto"),
+        reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
+        tool_prompt_mode=getattr(args, "tool_prompt_mode", "hybrid"),
+        chat_template_profile=getattr(
+            args,
+            "chat_template_profile",
+            OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT,
+        ),
+        chat_template_path=getattr(args, "chat_template_path", None),
+        stats_footer=False,
+        strict_warmup=bool(getattr(args, "strict_warmup", False)),
+        strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
+        quickstart_openwebui=False,
+        quickstart_pi=False,
+        quickstart_opencode=False,
+        quickstart_swival=False,
+        quickstart_hermes=True,
+        hermes_launch_command=hermes.get("terminal_command"),
+        open_browser=False,
+        open_dashboard=bool(getattr(args, "open_dashboard", False)),
+        enable_thermal_poll=bool(getattr(args, "enable_thermal_poll", False)),
+        fan_mode=getattr(args, "fan_mode", "default"),
+        max=bool(getattr(args, "max", False)),
+        max_idle_min=int(getattr(args, "max_idle_min", 15)),
+    )
+    return cmd_serve_public(_with_server_policy_args(serve_args, args))
+
+
+def _quickstart_print_dashboard_handoff(args: Any, *, runtime_model: str) -> None:
+    from mtplx.ui import pretty_path
+
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = int(getattr(args, "port", 8000))
+    dashboard_url = _dashboard_url(host, port)
+    _quickstart_line("[2/3] Starting local MTPLX server for the live dashboard...")
+    _quickstart_line(f"      Loading model: {pretty_path(str(runtime_model))}")
+    _quickstart_line(f"      Dashboard URL: {dashboard_url}")
+    _quickstart_line(
+        "      Keep this terminal open. Drive load from any client "
+        "(Web UI, Pi, OpenCode, hippo, OpenAI SDK)."
+    )
+    _quickstart_line()
+
+
+def _quickstart_run_dashboard(
+    args: Any, *, runtime_model: str, inspection: dict[str, Any]
+) -> int:
+    model_id = _quickstart_served_model_id(args, runtime_model)
+    _quickstart_print_dashboard_handoff(args, runtime_model=runtime_model)
+    serve_args = SimpleNamespace(
+        model=runtime_model,
+        cache_dir=getattr(args, "cache_dir", None),
+        profile=getattr(args, "profile", None) or DEFAULT_PROFILE_NAME,
+        model_id=model_id,
+        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
+        yes=True,
+        host=str(getattr(args, "host", "127.0.0.1")),
+        port=int(getattr(args, "port", 8000)),
+        api_key=getattr(args, "api_key", None),
+        depth=int(getattr(args, "depth", 3)),
+        no_mtp=bool(getattr(args, "no_mtp", False)),
+        rate_limit=int(getattr(args, "rate_limit", 0)),
+        stream_interval=int(getattr(args, "stream_interval", 1)),
+        warmup_tokens=int(getattr(args, "warmup_tokens", 16)),
+        max_response_tokens=getattr(args, "max_response_tokens", None),
+        temperature=float(getattr(args, "temperature", 0.6)),
+        top_p=float(getattr(args, "top_p", 0.95)),
+        top_k=int(getattr(args, "top_k", 20)),
+        draft_temperature=getattr(args, "draft_temperature", None),
+        draft_top_p=getattr(args, "draft_top_p", None),
+        draft_top_k=getattr(args, "draft_top_k", None),
+        reasoning=getattr(args, "reasoning", None),
+        preserve_thinking=_preserve_thinking_policy(args),
+        reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
+        stats_footer=False,
+        strict_warmup=bool(getattr(args, "strict_warmup", False)),
+        strict_fast_path=bool(getattr(args, "strict_fast_path", False)),
+        # Bypass the busy-port openwebui short-circuit; the dashboard target
+        # always wants a fresh server in the foreground so the user sees
+        # logs while driving load from another terminal.
+        quickstart_openwebui=False,
+        quickstart_pi=False,
+        quickstart_opencode=False,
+        quickstart_swival=False,
+        open_browser=False,
+        open_dashboard=True,
+        enable_thermal_poll=bool(getattr(args, "enable_thermal_poll", False)),
+        fan_mode=getattr(args, "fan_mode", "default"),
+        max=bool(getattr(args, "max", False)),
+        max_idle_min=int(getattr(args, "max_idle_min", 15)),
+    )
+    return cmd_serve_public(_with_server_policy_args(serve_args, args))
+
+
+# Targets that spawn a local server and therefore need a usable port.
+_QUICKSTART_SPAWNING_TARGETS = frozenset(
+    {"openwebui", "pi", "opencode", "swival", "hermes", "dashboard"}
+)
+
+
+def _quickstart_autoselect_busy_port(
+    args: Any,
+    *,
+    target: str,
+    cli_flags: set[str],
+) -> None:
+    """Auto-bump a default port held by a non-MTPLX app.
+
+    Only fires for spawning targets when the user did not pass ``--port``.
+    A healthy MTPLX daemon on the port is left alone: the downstream
+    "MTPLX is already running" reuse path attaches to it instead of
+    spawning a duplicate.
+    """
+
+    if target not in _QUICKSTART_SPAWNING_TARGETS or "port" in cli_flags:
+        return
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = int(getattr(args, "port", 8000))
+    try:
+        from mtplx.daemon_client import (
+            PORT_FOREIGN,
+            classify_port_occupant,
+            find_free_port,
+        )
+
+        occupant = classify_port_occupant(host, port)
+        if occupant.kind != PORT_FOREIGN:
+            return
+        free_port = find_free_port(host, port + 1)
+    except Exception:
+        return
+    if free_port is None:
+        return
+    _quickstart_line(
+        f"Port {port} is in use by another app — using port {free_port} instead."
+    )
+    args.port = free_port
+
+
+def _attach_api_key(daemon: Any) -> str | None:
+    env_key = str(os.environ.get("MTPLX_API_KEY") or "").strip()
+    if env_key:
+        return env_key
+    if not getattr(daemon, "api_key_required", False):
+        return None
+    try:
+        from mtplx.app_settings import read_app_settings
+
+        settings = read_app_settings()
+    except Exception:
+        return None
+    return settings.api_key if settings is not None else None
+
+
+def _run_attach_chat_for_args(daemon: Any, args: Any) -> int:
+    from mtplx.daemon_client import run_attach_chat
+
+    prompt = getattr(args, "prompt", None)
+    return run_attach_chat(
+        daemon,
+        api_key=_attach_api_key(daemon),
+        prompt=str(prompt) if prompt else None,
+    )
+
+
+def _quickstart_attach_to_daemon(info: dict[str, Any], args: Any) -> int:
+    """Resolve an onboarding attach request into a live chat session."""
+
+    from mtplx.daemon_client import fetch_daemon_health
+
+    host = str(info.get("host") or "127.0.0.1")
+    port = int(info.get("port") or 8000)
+    daemon = fetch_daemon_health(host, port)
+    if daemon is None:
+        _quickstart_line(f"error: the running server on port {port} went away")
+        _quickstart_line(f"try: {_start_invocation(args)}")
+        return 1
+    return _run_attach_chat_for_args(daemon, args)
+
+
+def _daemon_runs_model(daemon: Any, runtime_model: str) -> bool:
+    model_path = getattr(daemon, "model_path", None)
+    if model_path and str(model_path) == str(runtime_model):
+        return True
+    daemon_model = getattr(daemon, "model", None)
+    if not daemon_model:
+        return False
+    try:
+        from mtplx.default_models import public_model_id_for_ref
+
+        return public_model_id_for_ref(runtime_model) == str(daemon_model)
+    except Exception:
+        return False
+
+
+def _terminal_chat_attach_guard(args: Any, *, runtime_model: str) -> int | None:
+    """Never double-load: route terminal chat through a running daemon.
+
+    Returns an exit code when the request was fully handled (attached,
+    cancelled, or refused), or ``None`` when in-process loading should
+    proceed (no daemon, or the user chose to stop it).
+    """
+
+    try:
+        from mtplx.daemon_client import detect_attachable_daemon
+
+        daemon = detect_attachable_daemon()
+    except Exception:
+        return None
+    if daemon is None or not getattr(daemon, "model", None):
+        return None
+    same_model = _daemon_runs_model(daemon, runtime_model)
+    owner = "the MTPLX app" if daemon.owned_by_app else "another terminal"
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if not interactive or bool(getattr(args, "yes", False)):
+        if same_model or not bool(getattr(args, "_model_explicit", False)):
+            _quickstart_line(
+                f"MTPLX is already running (model: {daemon.model}, "
+                f"port {daemon.port}, started by {owner})."
+            )
+            _quickstart_line(
+                "Attaching to the running server instead of loading a second copy."
+            )
+            return _run_attach_chat_for_args(daemon, args)
+        _quickstart_line(
+            f"error: an MTPLX server is already running on port {daemon.port} "
+            f"with model {daemon.model}"
+        )
+        _quickstart_line(
+            "Loading a different model alongside it would double memory use."
+        )
+        _quickstart_line(f"try: mtplx stop --port {daemon.port}")
+        _quickstart_line("try: mtplx start cli   # chat with the running model")
+        return 2
+    _quickstart_line()
+    _quickstart_line(
+        f"MTPLX is already running (model: {daemon.model}, port {daemon.port}, "
+        f"started by {owner})."
+    )
+    _quickstart_line("Loading another copy here would double memory use.")
+    _quickstart_line("  1. Chat with the running model (recommended)")
+    _quickstart_line("  2. Stop that server and load here")
+    _quickstart_line("  3. Cancel")
+    while True:
+        try:
+            answer = input("  Type 1-3 and press Enter [default 1]: ").strip() or "1"
+        except (EOFError, KeyboardInterrupt):
+            _quickstart_line()
+            return 130
+        if answer in {"1", "2", "3"}:
+            break
+    if answer == "1":
+        return _run_attach_chat_for_args(daemon, args)
+    if answer == "3":
+        _quickstart_line("cancelled")
+        return 0
+    from mtplx.daemon_client import stop_daemon
+
+    _quickstart_line(f"Stopping the server on port {daemon.port}...")
+    result = stop_daemon(daemon.host, daemon.port)
+    if not result.get("ok"):
+        _quickstart_line(
+            f"error: could not stop the server ({result.get('reason')})"
+        )
+        return 1
+    _quickstart_line("Server stopped.")
+    return None
 
 
 def _quickstart_run_terminal_chat(
     args: Any, *, runtime_model: str, inspection: dict[str, Any]
 ) -> int:
+    guard_exit = _terminal_chat_attach_guard(args, runtime_model=runtime_model)
+    if guard_exit is not None:
+        return guard_exit
+    fan_mode = _fan_mode_from_args(args)
     max_session: Any | None = None
-    if getattr(args, "max", False):
+    if fan_mode == FAN_MODE_MAX:
         from mtplx.thermal import MaxSession
 
         max_session = MaxSession(log=_quickstart_line)
@@ -7930,6 +11847,17 @@ def _quickstart_apply_tuned_depth(
 
 def cmd_quickstart_public(args: Any) -> int:
     raw_target = getattr(args, "target", None)
+    runtime_options_error = _resolve_runtime_options_on_args(
+        args,
+        printer=_quickstart_line,
+    )
+    if runtime_options_error is not None:
+        return runtime_options_error
+    try:
+        fan_mode = _fan_mode_from_args(args)
+    except ValueError as exc:
+        _quickstart_line(f"error: {exc}")
+        return 2
 
     # Start is the most common reason fans get blasted, so this is the
     # right place to scrub a stale --max marker left behind by a previously
@@ -7964,6 +11892,7 @@ def cmd_quickstart_public(args: Any) -> int:
     has_explicit_depth = "depth" in cli_flags
     args._explicit_depth = has_explicit_depth
     has_explicit_max = "max" in cli_flags
+    has_explicit_fan_mode = "fan-mode" in cli_flags
     has_prompt = bool(getattr(args, "prompt", None))
     is_dry_run = bool(getattr(args, "dry_run", False))
     is_yes = bool(getattr(args, "yes", False))
@@ -7978,6 +11907,7 @@ def cmd_quickstart_public(args: Any) -> int:
         or model_from_model_id
         or has_explicit_profile_flag
         or has_explicit_max
+        or has_explicit_fan_mode
         or not is_tty
     )
 
@@ -7985,10 +11915,21 @@ def cmd_quickstart_public(args: Any) -> int:
         from mtplx.ui.onboarding import run_quickstart_flow
 
         configured_model = getattr(args, "model", None)
-        choice = run_quickstart_flow(fresh=fresh, configured_model=configured_model)
+        # `--open-dashboard` / `--no-open-dashboard` on the CLI is the
+        # user explicitly skipping the wizard's companion prompt. None
+        # means "ask".
+        explicit_open_dashboard = getattr(args, "open_dashboard", None)
+        choice = run_quickstart_flow(
+            fresh=fresh,
+            configured_model=configured_model,
+            open_dashboard_override=explicit_open_dashboard,
+        )
         if choice is None:
             _quickstart_line("aborted")
             return 130
+        attach_request = choice.get("attach")
+        if isinstance(attach_request, dict):
+            return _quickstart_attach_to_daemon(attach_request, args)
         chosen_model = choice.get("model")
         if chosen_model:
             args.model = chosen_model
@@ -8009,14 +11950,25 @@ def cmd_quickstart_public(args: Any) -> int:
             args.profile = chosen_profile
         if choice.get("max"):
             args.max = True
+            args.fan_mode = FAN_MODE_MAX
         else:
             # If onboarding declined a fan-backed mode (e.g. ThermalForge
             # install was refused or failed), make sure --max from a stale
             # config or shell alias does not silently re-enable it.
             args.max = False
+            args.fan_mode = "default"
         chosen_target = choice.get("target")
         if chosen_target:
             raw_target = chosen_target
+        # Dashboard companion: wizard may say "also open the dashboard"
+        # alongside an openwebui / pi / opencode / swival target.
+        # Stash on args so the per-target _quickstart_run_* helpers below
+        # propagate it into serve_args.
+        if choice.get("open_dashboard"):
+            args.open_dashboard = True
+        elif "open_dashboard" in choice:
+            # Explicit "No" from wizard; squash any stale CLI alias.
+            args.open_dashboard = False
         # The new onboarding has already collected the user's choices, so the
         # legacy ``_quickstart_choose_model`` picker must not prompt again.
         args._onboarded = True
@@ -8024,7 +11976,8 @@ def cmd_quickstart_public(args: Any) -> int:
         # Skipped onboarding (explicit flags). If the user passed --max but
         # has no fan controller, offer to auto-install before MTPLX boots
         # rather than silently dumping the JSON warning later.
-        if has_explicit_max and is_tty:
+        fan_mode = _fan_mode_from_args(args)
+        if (has_explicit_max or has_explicit_fan_mode) and fan_mode == FAN_MODE_MAX and is_tty:
             from mtplx.thermal import detect_thermal_control
 
             detection = detect_thermal_control()
@@ -8033,6 +11986,7 @@ def cmd_quickstart_public(args: Any) -> int:
 
                 if not ensure_thermal_control_installed():
                     args.max = False
+                    args.fan_mode = "default"
 
     if raw_target is None:
         raw_target = "cli" if has_prompt else "web"
@@ -8047,6 +12001,10 @@ def cmd_quickstart_public(args: Any) -> int:
         target = "opencode"
     elif raw_target in {"swival", "sv"}:
         target = "swival"
+    elif raw_target in {"hermes", "hermes-agent"}:
+        target = "hermes"
+    elif raw_target in {"dashboard", "live-dashboard", "live"}:
+        target = "dashboard"
     else:
         target = raw_target
     if target not in QUICKSTART_TARGETS:
@@ -8056,8 +12014,16 @@ def cmd_quickstart_public(args: Any) -> int:
         return 2
     if target == "opencode" and "port" not in cli_flags:
         args.port = 18083
+    if target == "opencode":
+        _apply_opencode_fair_defaults(args)
     if target == "swival" and "port" not in cli_flags:
         args.port = 18084
+    if target == "hermes" and "port" not in cli_flags:
+        args.port = 18085
+    if target == "hermes":
+        _apply_hermes_latency_defaults(args)
+    if not getattr(args, "dry_run", False):
+        _quickstart_autoselect_busy_port(args, target=target, cli_flags=cli_flags)
     depth_error = _validate_public_depth(args, printer=_quickstart_line)
     if depth_error is not None:
         return depth_error
@@ -8072,12 +12038,31 @@ def cmd_quickstart_public(args: Any) -> int:
     args.model = model
     cache_dir = getattr(args, "cache_dir", None)
     if getattr(args, "dry_run", False):
+        dry_run_inspection = _quickstart_apply_local_model_defaults(
+            args,
+            model=model,
+        )
         openwebui = (
-            _quickstart_openwebui_payload(args) if target == "openwebui" else None
+            _quickstart_openwebui_payload(args, inspection=dry_run_inspection)
+            if target == "openwebui"
+            else None
         )
         pi = _quickstart_pi_payload(args) if target == "pi" else None
-        opencode = _quickstart_opencode_payload(args) if target == "opencode" else None
-        swival = _quickstart_swival_payload(args) if target == "swival" else None
+        opencode = (
+            _quickstart_opencode_payload(args, inspection=dry_run_inspection)
+            if target == "opencode"
+            else None
+        )
+        swival = (
+            _quickstart_swival_payload(args, inspection=dry_run_inspection)
+            if target == "swival"
+            else None
+        )
+        hermes = (
+            _quickstart_hermes_payload(args, inspection=dry_run_inspection)
+            if target == "hermes"
+            else None
+        )
         payload = {
             "action": _start_command_name(args),
             "target": target,
@@ -8093,6 +12078,18 @@ def cmd_quickstart_public(args: Any) -> int:
             "pi": pi,
             "opencode": opencode,
             "swival": swival,
+            "hermes": hermes,
+            # The dashboard target *always* opens the dashboard (that's what
+            # it's for). Otherwise honor the explicit user/wizard choice,
+            # but only for server-spawning targets — terminal/CLI has no
+            # server so there's nothing to attach to.
+            "open_dashboard": (
+                True
+                if target == "dashboard"
+                else bool(getattr(args, "open_dashboard", False))
+                and target in {"openwebui", "pi", "opencode", "swival", "hermes"}
+            ),
+            "enable_thermal_poll": bool(getattr(args, "enable_thermal_poll", False)),
             "stats_visible": bool(getattr(args, "show_stats", True)),
             "next": (
                 _start_invocation(args)
@@ -8103,6 +12100,8 @@ def cmd_quickstart_public(args: Any) -> int:
                 if target == "opencode"
                 else _start_invocation(args, " pi")
                 if target == "pi"
+                else _start_invocation(args, " hermes")
+                if target == "hermes"
                 else _start_invocation(args, " cli")
             ),
         }
@@ -8145,6 +12144,10 @@ def cmd_quickstart_public(args: Any) -> int:
             elif target == "pi":
                 _quickstart_line(
                     f"then: write Pi config -> start local server -> run {pi['launch_command']}"
+                )
+            elif target == "hermes":
+                _quickstart_line(
+                    f"then: write Hermes profile -> start local server -> run {hermes['launch_command']}"
                 )
             else:
                 _quickstart_line(
@@ -8267,7 +12270,9 @@ def cmd_quickstart_public(args: Any) -> int:
                     json_output=bool(getattr(args, "json", False)),
                 )
                 return gate_exit
-            _apply_model_contract_depth_default(args, inspection)
+            profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+            _apply_model_contract_depth_default(args, inspection, profile)
+            _apply_backend_serve_defaults(args, inspection)
             _quickstart_apply_tuned_depth(
                 args,
                 runtime_model=runtime_model,
@@ -8294,6 +12299,16 @@ def cmd_quickstart_public(args: Any) -> int:
             if target == "swival":
                 args.model = runtime_model
                 return _quickstart_run_swival(
+                    args, runtime_model=runtime_model, inspection=inspection
+                )
+            if target == "hermes":
+                args.model = runtime_model
+                return _quickstart_run_hermes(
+                    args, runtime_model=runtime_model, inspection=inspection
+                )
+            if target == "dashboard":
+                args.model = runtime_model
+                return _quickstart_run_dashboard(
                     args, runtime_model=runtime_model, inspection=inspection
                 )
             return _quickstart_run_terminal_chat(
@@ -8328,7 +12343,9 @@ def cmd_quickstart_public(args: Any) -> int:
             json_output=bool(getattr(args, "json", False)),
         )
         return gate_exit
-    _apply_model_contract_depth_default(args, inspection)
+    profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+    _apply_model_contract_depth_default(args, inspection, profile)
+    _apply_backend_serve_defaults(args, inspection)
     _quickstart_apply_tuned_depth(
         args,
         runtime_model=runtime_model,
@@ -8356,6 +12373,16 @@ def cmd_quickstart_public(args: Any) -> int:
     if target == "swival":
         args.model = runtime_model
         return _quickstart_run_swival(
+            args, runtime_model=runtime_model, inspection=inspection
+        )
+    if target == "hermes":
+        args.model = runtime_model
+        return _quickstart_run_hermes(
+            args, runtime_model=runtime_model, inspection=inspection
+        )
+    if target == "dashboard":
+        args.model = runtime_model
+        return _quickstart_run_dashboard(
             args, runtime_model=runtime_model, inspection=inspection
         )
     return _quickstart_run_terminal_chat(
@@ -8427,7 +12454,11 @@ def cmd_integrate_public(args: Any) -> int:
             mtplx_port=int(args.port),
             webui_port=int(getattr(args, "webui_port", 3000) or 3000),
             single_user=bool(getattr(args, "single_user", False)),
-            api_key=str(getattr(args, "api_key", None) or "mtplx-local"),
+            api_key=(
+                f"${args.api_key_env}"
+                if getattr(args, "api_key", None)
+                else "mtplx-local"
+            ),
         )
         payload = {
             "integration": "openwebui",
@@ -8455,6 +12486,7 @@ def cmd_integrate_public(args: Any) -> int:
             "notes": [
                 "Use the /v1 base URL as the OpenAI-compatible endpoint.",
                 "Dockerized Open WebUI must use host.docker.internal, not 127.0.0.1, to reach MTPLX on the Mac host.",
+                "The Docker command disables Open WebUI's Ollama probe and background title/tag/follow-up/autocomplete generations so MTPLX only serves the chat turn.",
                 "Keep --no-stats-footer enabled for UI clients.",
             ],
         }
@@ -8485,6 +12517,7 @@ def cmd_integrate_public(args: Any) -> int:
             },
         }
     elif action == "opencode":
+        api_key_suffix = _api_key_command_suffix(args)
         payload = {
             "integration": "opencode",
             "server_url": server_url,
@@ -8494,7 +12527,7 @@ def cmd_integrate_public(args: Any) -> int:
             "config_path": "~/.config/opencode/opencode.json",
             "server_command": (
                 f"mtplx quickstart --profile sustained --host {args.host} --port {args.port} "
-                "--reasoning on --no-stats-footer"
+                f"{api_key_suffix}--reasoning auto --no-stats-footer"
             ),
             "config": {
                 "provider": {
@@ -8503,19 +12536,23 @@ def cmd_integrate_public(args: Any) -> int:
                         "name": "MTPLX (local)",
                         "options": {
                             "baseURL": api_base_url,
-                            "apiKey": str(
-                                getattr(args, "api_key", None) or "mtplx-local"
+                            "apiKey": (
+                                f"${args.api_key_env}"
+                                if getattr(args, "api_key", None)
+                                else "mtplx-local"
                             ),
                             "timeout": False,
                             "chunkTimeout": 900000,
+                            "headers": {
+                                "x-mtplx-client": "opencode",
+                            },
                         },
                         "models": {
                             model_id: {
                                 "name": "MTPLX local",
-                                "reasoning": True,
-                                "interleaved": {"field": "reasoning_content"},
+                                "reasoning": False,
                                 "tool_call": True,
-                                "temperature": True,
+                                "temperature": False,
                                 "limit": {
                                     "context": 262144,
                                     "output": 262144,
@@ -8523,9 +12560,6 @@ def cmd_integrate_public(args: Any) -> int:
                                 "modalities": {
                                     "input": ["text"],
                                     "output": ["text"],
-                                },
-                                "options": {
-                                    "enable_thinking": True,
                                 },
                             }
                         },
@@ -8535,9 +12569,9 @@ def cmd_integrate_public(args: Any) -> int:
                 "small_model": f"mtplx/{model_id}",
             },
             "notes": [
-                "OpenCode's UI setting says reasoning summaries, but this config uses the raw interleaved reasoning_content stream.",
-                "Do not add OpenAI reasoningSummary/reasoningEffort fields for MTPLX; those are provider-summary controls, not Qwen raw thinking.",
-                "MTPLX now defaults reasoning on, and this config also sends enable_thinking=true explicitly for tool-active requests.",
+                "OpenCode identifies itself with x-mtplx-client, but MTPLX owns reasoning and sampler policy.",
+                "Do not add OpenAI reasoningSummary/reasoningEffort fields for MTPLX; those are client-side overrides.",
+                "Use MTPLX server settings or --reasoning on when you intentionally want reasoning.",
             ],
         }
     elif action == "swival":
@@ -8604,7 +12638,7 @@ def cmd_integrate_public(args: Any) -> int:
             print("OpenCode:")
             print("  Config path: ~/.config/opencode/opencode.json")
             print("  Provider: mtplx")
-            print("  Reasoning: raw reasoning_content stream, enable_thinking=true")
+            print("  Reasoning: controlled by MTPLX server settings")
         elif action == "swival":
             print("Swival:")
             print(f"  {payload.get('launch_command')}")
@@ -8973,6 +13007,53 @@ def _architecture_qa_fixtures() -> list[dict[str, Any]]:
             },
         },
         {
+            "label": "step3p7-contract-gated",
+            "config": {
+                "architectures": ["Step3p7ForConditionalGeneration"],
+                "model_type": "step3p7",
+                "num_nextn_predict_layers": 3,
+                "num_hidden_layers": 45,
+            },
+            "contract": "step3p5-mtp",
+            "safetensors": {
+                "model.safetensors": [
+                    "model.layers.45.enorm.weight",
+                    "model.layers.46.hnorm.weight",
+                    "model.layers.47.transformer.shared_head.output.weight",
+                ]
+            },
+            "expect": {
+                "tier": "verified",
+                "arch_id": "step3p5-mtp",
+                "can_run": True,
+                "recommended_backend": "step3p5_mtp",
+                "runtime_compatibility": "native-contract-gated",
+            },
+        },
+        {
+            "label": "step3p7-family-gated",
+            "config": {
+                "architectures": ["Step3p7ForConditionalGeneration"],
+                "model_type": "step3p7",
+                "num_nextn_predict_layers": 3,
+                "num_hidden_layers": 45,
+            },
+            "safetensors": {
+                "model.safetensors": [
+                    "model.layers.45.enorm.weight",
+                    "model.layers.46.eh_proj.weight",
+                    "model.layers.47.transformer.shared_head.output.weight",
+                ]
+            },
+            "expect": {
+                "tier": "family-compatible-unverified",
+                "arch_id": "step3p5-mtp",
+                "can_run": True,
+                "recommended_backend": "step3p5_mtp",
+                "runtime_compatibility": "native-family-gated",
+            },
+        },
+        {
             "label": "gemma4-without-mtp-stays-no-mtp",
             "config": {
                 "architectures": ["Gemma4ForCausalLM"],
@@ -9071,6 +13152,7 @@ def _run_runtime_import_smoke() -> list[dict[str, Any]]:
         ("mtplx.backends.glm_mtp", "GLMMTPBackend"),
         ("mtplx.backends.mimo_mtp", "MiMoMTPBackend"),
         ("mtplx.backends.nemotron_h_mtp", "NemotronHMTPBackend"),
+        ("mtplx.backends.step3p5_mtp", "Step3p5MTPBackend"),
     ):
         try:
             module = importlib.import_module(module_name)
@@ -9107,6 +13189,7 @@ def _cmd_model_qa_architectures(args: Any) -> int:
         "glm4-moe-lite-mtp",
         "mimo-mtp",
         "nemotron-h-mtp",
+        "step3p5-mtp",
         "minimax-m2-mtp",
         "gemma-mtp",
     }
@@ -9118,6 +13201,7 @@ def _cmd_model_qa_architectures(args: Any) -> int:
         "glm4-moe-lite-mtp",
         "mimo-mtp",
         "nemotron-h-mtp",
+        "step3p5-mtp",
     }
     verified_ids = {row["arch_id"] for row in catalog if row.get("can_run_verified")}
     fixture_rows = _run_architecture_fixture_qa()
@@ -9248,7 +13332,7 @@ def cmd_model_public(args: Any) -> int:
 
 
 def cmd_config_public(args: Any) -> int:
-    from mtplx.config import load_user_config, user_config_path
+    from mtplx.config import CONFIG_VALUE_KEYS, load_user_config, user_config_path
     from mtplx.profiles import resolve_profile_name
 
     path = user_config_path(getattr(args, "config", None))
@@ -9263,29 +13347,59 @@ def cmd_config_public(args: Any) -> int:
     if args.config_action != "set":
         raise SystemExit(f"unknown config action: {args.config_action}")
     current = load_user_config(path)
-    values = {
-        "model": current.model,
-        "model_dir": current.model_dir,
-        "profile": current.profile,
-        "thermal_control": current.thermal_control,
-    }
+    values = {key: getattr(current, key) for key in CONFIG_VALUE_KEYS}
     key = str(args.key).strip()
     if key not in values:
         raise SystemExit(
-            "config set key must be one of: model, model_dir, profile, thermal_control"
+            "config set key must be one of: " + ", ".join(CONFIG_VALUE_KEYS)
         )
     value = str(args.value).strip()
     if key == "profile":
         value = resolve_profile_name(value)
     if key == "thermal_control" and value not in {"auto", "none"}:
         raise SystemExit("thermal_control must be auto or none")
+    if key == "paged_kv_quantization":
+        value = normalize_paged_kv_quantization(value)
+    if key == "scheduler_mode" and value not in {
+        "serial",
+        "cooperative",
+        "ar_batch",
+        "mtp_cohort_experimental",
+    }:
+        raise SystemExit("scheduler_mode must be serial, cooperative, ar_batch, or mtp_cohort_experimental")
+    if key == "batching_preset" and value not in {"solo", "latency", "agent", "throughput"}:
+        raise SystemExit("batching_preset must be solo, latency, agent, or throughput")
+    if key == "ssd_session_cache" and value not in {"off", "on", "write-only"}:
+        raise SystemExit("ssd_session_cache must be off, on, or write-only")
+    if key == "ram_session_cache_policy" and value not in {"target-default", "minimal", "bounded"}:
+        raise SystemExit("ram_session_cache_policy must be target-default, minimal, or bounded")
+    if key == "reasoning" and value not in {"auto", "on", "off"}:
+        raise SystemExit("reasoning must be auto, on, or off")
+    if key == "reasoning_effort" and value not in {"auto", "low", "medium", "high"}:
+        raise SystemExit("reasoning_effort must be auto, low, medium, or high")
+    if key in {
+        "max_active_requests",
+        "decode_batch_max",
+        "prefill_chunk_tokens",
+        "ssd_session_cache_min_prefix_tokens",
+        "ram_session_cache_max_entries",
+        "context_window",
+        "top_k",
+    }:
+        value = int(value)
+        if value < 1:
+            raise SystemExit(f"{key} must be >= 1")
+    if key in {"batch_wait_ms", "temperature", "top_p"}:
+        value = float(value)
+    if key in {"experimental_mtp_cohorts", "ram_session_block_prefix_restore"}:
+        value = _parse_config_bool(value, key=key)
     values[key] = value
     if not getattr(args, "dry_run", False):
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = ["# MTPLX user configuration"]
-        for item_key in ("model", "model_dir", "profile", "thermal_control"):
+        for item_key in CONFIG_VALUE_KEYS:
             item_value = values.get(item_key)
-            if item_value:
+            if item_value is not None:
                 lines.append(f"{item_key} = {json.dumps(item_value)}")
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     payload = {
@@ -9296,6 +13410,15 @@ def cmd_config_public(args: Any) -> int:
     }
     _print(payload)
     return 0
+
+
+def _parse_config_bool(value: str, *, key: str) -> bool:
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(f"{key} must be true or false")
 
 
 def _source_contains(path: Path, needle: str) -> bool:

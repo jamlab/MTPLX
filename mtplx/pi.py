@@ -105,7 +105,7 @@ def build_pi_provider_config(
     model_config: dict[str, Any] = {
         "id": str(model_id),
         "name": model_name or f"MTPLX {model_id}",
-        "reasoning": False,
+        "reasoning": True,
         "input": ["text"],
         "contextWindow": int(context_window),
         "cost": {
@@ -123,6 +123,9 @@ def build_pi_provider_config(
         "api": "openai-completions",
         "apiKey": str(api_key),
         "authHeader": True,
+        "headers": {
+            "x-mtplx-client": "pi",
+        },
         "compat": {
             "supportsDeveloperRole": False,
             "supportsReasoningEffort": False,

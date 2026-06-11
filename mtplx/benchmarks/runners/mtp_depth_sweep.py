@@ -33,6 +33,26 @@ def _rate_by_depth(accepted: list[int], drafted: list[int]) -> list[float | None
     return [(a / d if d else None) for a, d in zip(accepted, drafted)]
 
 
+def _token_budget(max_tokens: int, case_max_tokens: int) -> int:
+    return min(int(max_tokens), int(case_max_tokens))
+
+
+def _hit_token_budget(generated_tokens: int, token_budget: int, finish_reason: str | None) -> bool:
+    if finish_reason == "length":
+        return True
+    return int(generated_tokens) >= int(token_budget)
+
+
+def _finish_reason_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        reason = row.get("finish_reason")
+        if not isinstance(reason, str) or not reason:
+            continue
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
 def run_mtp_depth_sweep(
     model_path: Path | str,
     prompt_suite: Path | str,
@@ -50,7 +70,10 @@ def run_mtp_depth_sweep(
     enable_thinking: bool | None = None,
     compare_ar: bool = False,
     ar_only: bool = False,
-    mtp_hidden_variant: str = "post_norm",
+    gemma4_draft_block_size: int | None = None,
+    base_hidden_variant: str | None = None,
+    mtp_hidden_variant: str | None = None,
+    concat_order: str | None = None,
     mtp_cache_policy: str = "persistent",
     mtp_history_policy: str = "cycle",
     draft_margin_threshold: float | None = None,
@@ -62,6 +85,7 @@ def run_mtp_depth_sweep(
     mtp_quant_group_size: int = 64,
     mtp_quant_mode: str = "affine",
     mtp_adapter_path: Path | str | None = None,
+    merge_mtp_adapter: bool = False,
     mtp_corrector_path: Path | str | None = None,
     mtp_corrector_blend: float | None = None,
     online_hidden_corrector_alpha: float = 0.0,
@@ -88,18 +112,32 @@ def run_mtp_depth_sweep(
     draft_lm_head_group_size: int = 64,
     draft_lm_head_mode: str = "affine",
 ) -> dict[str, Any]:
+    contract_kwargs: dict[str, Any] = {
+        "mtp_quant_bits": mtp_quant_bits,
+        "mtp_quant_group_size": mtp_quant_group_size,
+        "mtp_quant_mode": mtp_quant_mode,
+    }
+    if base_hidden_variant not in {None, "auto", "contract"}:
+        contract_kwargs["base_hidden_variant"] = str(base_hidden_variant)
+    if mtp_hidden_variant not in {None, "auto", "contract"}:
+        contract_kwargs["hidden_variant"] = str(mtp_hidden_variant)
+    if concat_order not in {None, "auto", "contract"}:
+        contract_kwargs["concat_order"] = str(concat_order)
     rt = load(
         model_path,
         mtp=True,
-        contract=MTPContract(
-            mtp_quant_bits=mtp_quant_bits,
-            mtp_quant_group_size=mtp_quant_group_size,
-            mtp_quant_mode=mtp_quant_mode,
-        ),
+        contract=MTPContract(**contract_kwargs),
         mtp_adapter=mtp_adapter_path,
+        merge_mtp_adapter=merge_mtp_adapter,
+        gemma4_draft_block_size=gemma4_draft_block_size,
     )
+    contract = getattr(rt, "contract", None)
+    is_gemma4_assistant = getattr(rt, "backend_id", None) == "gemma4_assistant"
+    resolved_base_hidden_variant = str(getattr(contract, "base_hidden_variant", "gemma4_assistant"))
+    resolved_mtp_hidden_variant = str(getattr(contract, "hidden_variant", "gemma4_assistant"))
+    resolved_concat_order = str(getattr(contract, "concat_order", "assistant_pair"))
     draft_lm_head_report: dict[str, Any] | None = None
-    if draft_lm_head_bits is not None:
+    if draft_lm_head_bits is not None and not is_gemma4_assistant:
         from mtplx.draft_lm_head import _install_draft_lm_head
 
         draft_lm_head_report = _install_draft_lm_head(
@@ -155,15 +193,24 @@ def run_mtp_depth_sweep(
     ar_rows: list[dict[str, Any]] = []
     if compare_ar:
         for index, (case, ids) in enumerate(encoded):
+            token_budget = _token_budget(max_tokens, case.max_tokens)
             generation_started_at = time.time()
             ar = generate_ar(
                 rt,
                 ids,
-                max_tokens=min(max_tokens, case.max_tokens),
+                max_tokens=token_budget,
                 sampler=sampler,
                 seed=seed + index,
             )
             generation_ended_at = time.time()
+            validations = [
+                asdict(validation)
+                for validation in validate_benchmark_output(
+                    ar.text,
+                    category=case.category,
+                    prompt_id=case.id,
+                )
+            ]
             ar_rows.append(
                 {
                     "prompt_id": case.id,
@@ -171,6 +218,13 @@ def run_mtp_depth_sweep(
                     "generation_started_at": generation_started_at,
                     "generation_ended_at": generation_ended_at,
                     "generation_window_s": generation_ended_at - generation_started_at,
+                    "token_budget": token_budget,
+                    "finish_reason": ar.finish_reason,
+                    "hit_token_budget": _hit_token_budget(
+                        ar.stats.generated_tokens,
+                        token_budget,
+                        ar.finish_reason,
+                    ),
                     "generated_tokens": ar.stats.generated_tokens,
                     "elapsed_s": ar.stats.elapsed_s,
                     "tok_s": ar.stats.tok_s,
@@ -180,6 +234,7 @@ def run_mtp_depth_sweep(
                     "prompt_eval_time_s": ar.stats.prompt_eval_time_s,
                     "tokens": ar.tokens,
                     "text": ar.text,
+                    "validations": validations,
                 }
             )
 
@@ -187,15 +242,17 @@ def run_mtp_depth_sweep(
     for depth in depth_values:
         rows = []
         for index, (case, ids) in enumerate(encoded):
+            token_budget = _token_budget(max_tokens, case.max_tokens)
             generation_started_at = time.time()
             out = generate_mtpk(
                 rt,
                 ids,
-                max_tokens=min(max_tokens, case.max_tokens),
+                max_tokens=token_budget,
                 sampler=sampler,
                 speculative_depth=depth,
                 seed=seed + index,
-                mtp_hidden_variant=mtp_hidden_variant,
+                base_hidden_variant=resolved_base_hidden_variant,
+                mtp_hidden_variant=resolved_mtp_hidden_variant,
                 mtp_cache_policy=mtp_cache_policy,
                 mtp_history_policy=mtp_history_policy,
                 draft_sampler=draft_sampler,
@@ -238,6 +295,13 @@ def run_mtp_depth_sweep(
                     "generation_started_at": generation_started_at,
                     "generation_ended_at": generation_ended_at,
                     "generation_window_s": generation_ended_at - generation_started_at,
+                    "token_budget": token_budget,
+                    "finish_reason": out.finish_reason,
+                    "hit_token_budget": _hit_token_budget(
+                        out.stats.generated_tokens,
+                        token_budget,
+                        out.finish_reason,
+                    ),
                     "generated_tokens": out.stats.generated_tokens,
                     "elapsed_s": out.stats.elapsed_s,
                     "tok_s": out.stats.tok_s,
@@ -293,6 +357,11 @@ def run_mtp_depth_sweep(
                     "verify_hidden_eval_time_s": out.stats.verify_hidden_eval_time_s,
                     "verify_joint_eval_time_s": out.stats.verify_joint_eval_time_s,
                     "verify_target_distribution_time_s": out.stats.verify_target_distribution_time_s,
+                    "target_distribution_materialized_rows": out.stats.target_distribution_materialized_rows,
+                    "target_distribution_materialized_windows": out.stats.target_distribution_materialized_windows,
+                    "target_distribution_share": out.stats.target_distribution_share,
+                    "lazy_bonus_verify_calls": out.stats.lazy_bonus_verify_calls,
+                    "lazy_bonus_commit_time_s": out.stats.lazy_bonus_commit_time_s,
                     "draft_time_s": out.stats.draft_time_s,
                     "target_forward_time_s": out.stats.target_forward_time_s,
                     "snapshot_time_s": out.stats.snapshot_time_s,
@@ -322,13 +391,28 @@ def run_mtp_depth_sweep(
             )
 
         validations = [v for row in rows for v in row["validations"]]
-        accepted_by_depth = _sum_lists(
-            [row["accepted_by_depth"] for row in rows], depth
-        )
+        finish_reasons = _finish_reason_counts(rows)
+        accepted_by_depth = _sum_lists([row["accepted_by_depth"] for row in rows], depth)
         drafted_by_depth = _sum_lists([row["drafted_by_depth"] for row in rows], depth)
         accept_probability_sum_by_depth = _sum_float_lists(
             [row["accept_probability_sum_by_depth"] for row in rows],
             depth,
+        )
+        verify_time_s = sum(row["verify_time_s"] for row in rows)
+        verify_target_distribution_time_s = sum(
+            row["verify_target_distribution_time_s"] for row in rows
+        )
+        target_distribution_rows = sum(
+            row["target_distribution_materialized_rows"] for row in rows
+        )
+        target_distribution_windows = sum(
+            row["target_distribution_materialized_windows"] for row in rows
+        )
+        lazy_bonus_verify_calls = sum(
+            row["lazy_bonus_verify_calls"] for row in rows
+        )
+        lazy_bonus_commit_time_s = sum(
+            row["lazy_bonus_commit_time_s"] for row in rows
         )
         depth_results.append(
             {
@@ -337,6 +421,10 @@ def run_mtp_depth_sweep(
                 "summary": {
                     "prompts": len(rows),
                     "generated_tokens": sum(row["generated_tokens"] for row in rows),
+                    "hit_token_budget_count": sum(
+                        1 for row in rows if row.get("hit_token_budget")
+                    ),
+                    "finish_reasons": finish_reasons,
                     "elapsed_s": sum(row["elapsed_s"] for row in rows),
                     "accepted_drafts": sum(row["accepted_drafts"] for row in rows),
                     "rejected_drafts": sum(row["rejected_drafts"] for row in rows),
@@ -408,7 +496,7 @@ def run_mtp_depth_sweep(
                         if compare_ar and rows
                         else None
                     ),
-                    "verify_time_s": sum(row["verify_time_s"] for row in rows),
+                    "verify_time_s": verify_time_s,
                     "verify_forward_time_s": sum(
                         row["verify_forward_time_s"] for row in rows
                     ),
@@ -421,8 +509,38 @@ def run_mtp_depth_sweep(
                     "verify_joint_eval_time_s": sum(
                         row["verify_joint_eval_time_s"] for row in rows
                     ),
-                    "verify_target_distribution_time_s": sum(
-                        row["verify_target_distribution_time_s"] for row in rows
+                    "verify_target_distribution_time_s": (
+                        verify_target_distribution_time_s
+                    ),
+                    "target_distribution_materialized_rows": (
+                        target_distribution_rows
+                    ),
+                    "target_distribution_materialized_windows": (
+                        target_distribution_windows
+                    ),
+                    "target_distribution_rows_per_window": (
+                        target_distribution_rows / target_distribution_windows
+                        if target_distribution_windows
+                        else None
+                    ),
+                    "verify_target_distribution_ms_per_row": (
+                        1000.0
+                        * verify_target_distribution_time_s
+                        / target_distribution_rows
+                        if target_distribution_rows
+                        else None
+                    ),
+                    "target_distribution_share": (
+                        verify_target_distribution_time_s / verify_time_s
+                        if verify_time_s
+                        else 0.0
+                    ),
+                    "lazy_bonus_verify_calls": lazy_bonus_verify_calls,
+                    "lazy_bonus_commit_time_s": lazy_bonus_commit_time_s,
+                    "lazy_bonus_commit_ms_per_call": (
+                        1000.0 * lazy_bonus_commit_time_s / lazy_bonus_verify_calls
+                        if lazy_bonus_verify_calls
+                        else None
                     ),
                     "draft_time_s": sum(row["draft_time_s"] for row in rows),
                     "target_forward_time_s": sum(
@@ -490,7 +608,9 @@ def run_mtp_depth_sweep(
         "enable_thinking": enable_thinking,
         "compare_ar": compare_ar,
         "ar_only": ar_only,
-        "mtp_hidden_variant": mtp_hidden_variant,
+        "base_hidden_variant": resolved_base_hidden_variant,
+        "mtp_hidden_variant": resolved_mtp_hidden_variant,
+        "concat_order": resolved_concat_order,
         "mtp_cache_policy": mtp_cache_policy,
         "mtp_history_policy": mtp_history_policy,
         "draft_margin_threshold": draft_margin_threshold,
@@ -499,18 +619,20 @@ def run_mtp_depth_sweep(
         "verify_core": verify_core,
         "draft_core": draft_core,
         "draft_lm_head": draft_lm_head_report,
-        "mtp_quant_bits": rt.contract.mtp_quant_bits,
-        "mtp_quant_group_size": rt.contract.mtp_quant_group_size,
-        "mtp_quant_mode": rt.contract.mtp_quant_mode,
-        "mtp_quant_policy": rt.contract.mtp_quant_policy,
+        "mtp_quant_bits": getattr(contract, "mtp_quant_bits", None),
+        "mtp_quant_group_size": getattr(contract, "mtp_quant_group_size", None),
+        "mtp_quant_mode": getattr(contract, "mtp_quant_mode", None),
+        "mtp_quant_policy": getattr(contract, "mtp_quant_policy", None),
         "mtp_adapter_path": str(mtp_adapter_path)
         if mtp_adapter_path is not None
         else None,
         "mtp_adapter_kind": (
-            rt.mtp_adapter_metadata.get("kind")
-            if rt.mtp_adapter_metadata is not None
+            (getattr(rt, "mtp_adapter_metadata", None) or {}).get("kind")
+            if getattr(rt, "mtp_adapter_metadata", None) is not None
             else None
         ),
+        "mtp_adapter_merged": bool(getattr(rt, "mtp_adapter_merge_report", None)),
+        "mtp_adapter_merge_report": getattr(rt, "mtp_adapter_merge_report", None),
         "mtp_corrector_path": str(mtp_corrector_path)
         if mtp_corrector_path is not None
         else None,

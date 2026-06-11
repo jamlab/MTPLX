@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import inspect as py_inspect
+import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .artifacts import inspect_model, load_config
-from .mtp_adapters import install_saved_mtp_lora_adapter, mtp_adapter_depth
+from .mtp_adapters import (
+    install_saved_mtp_lora_adapter,
+    merge_installed_mtp_lora_adapters,
+    mtp_adapter_depth,
+)
 from .mtp_patch import MTPContract, inject_mtp_support, validate_mtp_support
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -21,6 +29,7 @@ class MTPLXRuntime:
     contract: MTPContract
     mtp_adapter_path: Path | None = None
     mtp_adapter_metadata: dict[str, Any] | None = None
+    mtp_adapter_merge_report: dict[str, Any] | None = None
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
     _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
@@ -111,6 +120,7 @@ class MTPLXRuntime:
         input_ids,
         cache=None,
         return_hidden: bool = False,
+        hidden_variant: str | None = None,
         capture_backend: str | None = None,
     ):
         from .gdn_capture import forward_with_gdn_capture
@@ -120,6 +130,7 @@ class MTPLXRuntime:
             input_ids,
             cache=cache,
             return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
             capture_backend=capture_backend,
         )
 
@@ -130,19 +141,27 @@ class MTPLXRuntime:
         mtp_cache=None,
         concat_order: str | None = None,
         return_hidden: bool = False,
-        mtp_hidden_variant: str = "post_norm",
+        mtp_hidden_variant: str | None = None,
         mtp_depth: int | None = None,
         position_offset: int | None = None,
     ):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
         self._count("draft_mtp_calls")
+        resolved_hidden_variant = (
+            self.contract.hidden_variant
+            if mtp_hidden_variant in {None, "auto", "contract"}
+            else str(mtp_hidden_variant)
+        )
+        resolved_concat_order = (
+            self.contract.concat_order if concat_order in {None, "auto", "contract"} else concat_order
+        )
         with mtp_adapter_depth(self.model, mtp_depth):
             kwargs = {
                 "mtp_cache": mtp_cache,
-                "concat_order": concat_order,
+                "concat_order": resolved_concat_order,
                 "return_hidden": return_hidden,
-                "mtp_hidden_variant": mtp_hidden_variant,
+                "mtp_hidden_variant": resolved_hidden_variant,
                 "position_offset": position_offset,
             }
             try:
@@ -159,22 +178,41 @@ class MTPLXRuntime:
         next_token_ids,
         mtp_cache=None,
         concat_order: str | None = None,
+        mtp_hidden_variant: str | None = None,
         position_offset: int | None = None,
     ):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
         self._count("update_mtp_cache_calls")
+        resolved_hidden_variant = (
+            self.contract.hidden_variant
+            if mtp_hidden_variant in {None, "auto", "contract"}
+            else str(mtp_hidden_variant)
+        )
+        resolved_concat_order = (
+            self.contract.concat_order if concat_order in {None, "auto", "contract"} else concat_order
+        )
         update = getattr(self.model, "mtp_update_cache", None)
         if update is not None:
-            kwargs = {
-                "mtp_cache": mtp_cache,
-                "concat_order": concat_order,
-                "position_offset": position_offset,
-            }
             try:
                 params = py_inspect.signature(update).parameters
             except Exception:
                 params = {}
+            accepts_kwargs = any(
+                param.kind == py_inspect.Parameter.VAR_KEYWORD
+                for param in params.values()
+            )
+            candidates = {
+                "mtp_cache": mtp_cache,
+                "concat_order": resolved_concat_order,
+                "mtp_hidden_variant": resolved_hidden_variant,
+                "position_offset": position_offset,
+            }
+            kwargs = {
+                key: value
+                for key, value in candidates.items()
+                if accepts_kwargs or key in params
+            }
             if "mtp_depth" in params:
                 kwargs["mtp_depth"] = None
             return update(hidden_states, next_token_ids, **kwargs)
@@ -182,9 +220,9 @@ class MTPLXRuntime:
             hidden_states,
             next_token_ids,
             mtp_cache=mtp_cache,
-            concat_order=concat_order,
+            concat_order=resolved_concat_order,
             return_hidden=True,
-            mtp_hidden_variant="post_norm",
+            mtp_hidden_variant=resolved_hidden_variant,
             position_offset=position_offset,
         )
         return hidden
@@ -218,20 +256,75 @@ def load(
     mtp: bool = True,
     contract: MTPContract | None = None,
     mtp_adapter: Path | str | None = None,
+    merge_mtp_adapter: bool = False,
+    gemma4_draft_block_size: int | None = None,
+    gemma4_target_distribution_mode: str | None = None,
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support."""
-    from mlx_lm.utils import load as mlx_lm_load
-
     path = Path(model_path)
+    from .gemma4_pair import resolve_gemma4_pair_paths
+
+    gemma4_pair = resolve_gemma4_pair_paths(path)
+    if gemma4_pair is not None:
+        if mtp:
+            from .backends.gemma4_assistant import (
+                DEFAULT_DRAFT_BLOCK_SIZE,
+                Gemma4AssistantRuntimeConfig,
+                load_gemma4_assistant_pair,
+            )
+
+            metadata = gemma4_pair["metadata"]
+            benchmark = (
+                metadata.get("benchmark") if isinstance(metadata, dict) else {}
+            )
+            draft_block_size = DEFAULT_DRAFT_BLOCK_SIZE
+            if isinstance(benchmark, dict):
+                try:
+                    draft_block_size = int(
+                        benchmark.get("best_block_size") or draft_block_size
+                    )
+                except (TypeError, ValueError):
+                    draft_block_size = DEFAULT_DRAFT_BLOCK_SIZE
+            if gemma4_draft_block_size is not None:
+                draft_block_size = int(gemma4_draft_block_size)
+            runtime = load_gemma4_assistant_pair(
+                Gemma4AssistantRuntimeConfig.from_paths(
+                    target_model_path=gemma4_pair["target_model"],
+                    assistant_model_path=gemma4_pair["assistant_model"],
+                    draft_block_size=draft_block_size,
+                    target_distribution_mode=gemma4_target_distribution_mode,
+                )
+            )
+            runtime.model_path = path
+            runtime.path = path
+            runtime.bundle_path = path
+            return runtime
+        path = Path(gemma4_pair["target_model"])
     config = load_config(path)
-    model, tokenizer = mlx_lm_load(str(path))
-    contract = (contract or MTPContract()).with_config_defaults(config)
+    from .step3p5_mtp_patch import is_step3p5_mtp_config
+
+    if is_step3p5_mtp_config(config):
+        from mlx_lm.utils import load_model
+
+        tokenizer = _load_tokenizer_resilient(path, config)
+        model, _loaded_config = load_model(path)
+    else:
+        from mlx_lm.utils import load as mlx_lm_load
+
+        model, tokenizer = mlx_lm_load(str(path))
+    runtime_metadata = _load_runtime_metadata(path)
+    contract = (
+        (contract or MTPContract())
+        .with_runtime_metadata(runtime_metadata, preserve_explicit=True)
+        .with_config_defaults(config)
+    )
     mtp_enabled = False
     if mtp:
         from .deepseek_mtp_patch import inject_deepseek_mtp_support, is_deepseek_mtp_config
         from .glm_mtp_patch import inject_glm_mtp_support, is_glm_mtp_config
         from .mimo_mtp_patch import inject_mimo_mtp_support, is_mimo_mtp_config
         from .nemotron_h_mtp_patch import inject_nemotron_h_mtp_support, is_nemotron_h_mtp_config
+        from .step3p5_mtp_patch import inject_step3p5_mtp_support
 
         if is_nemotron_h_mtp_config(config):
             mtp_enabled = inject_nemotron_h_mtp_support(model, path, config, contract)
@@ -239,6 +332,8 @@ def load(
             mtp_enabled = inject_mimo_mtp_support(model, path, config, contract)
         elif is_glm_mtp_config(config):
             mtp_enabled = inject_glm_mtp_support(model, path, config, contract)
+        elif is_step3p5_mtp_config(config):
+            mtp_enabled = inject_step3p5_mtp_support(model, path, config, contract)
         elif is_deepseek_mtp_config(config):
             mtp_enabled = inject_deepseek_mtp_support(model, path, config, contract)
         else:
@@ -252,10 +347,15 @@ def load(
     configure_native_mlp(model)
     adapter_path = Path(mtp_adapter) if mtp_adapter is not None else None
     adapter_metadata = None
+    adapter_merge_report = None
     if adapter_path is not None:
         if not mtp_enabled:
             raise RuntimeError("MTP adapter requires mtp=True")
         adapter_metadata = install_saved_mtp_lora_adapter(model, adapter_path)
+        if merge_mtp_adapter:
+            adapter_merge_report = merge_installed_mtp_lora_adapters(model)
+    elif merge_mtp_adapter:
+        raise RuntimeError("merge_mtp_adapter requires mtp_adapter")
     return MTPLXRuntime(
         model,
         tokenizer,
@@ -264,8 +364,68 @@ def load(
         contract,
         mtp_adapter_path=adapter_path,
         mtp_adapter_metadata=adapter_metadata,
+        mtp_adapter_merge_report=adapter_merge_report,
     )
 
 
 def inspect(path: Path | str):
     return inspect_model(path)
+
+
+def _load_tokenizer_resilient(model_path: Path, config: dict[str, Any]) -> Any:
+    from mlx_lm.utils import load_tokenizer
+
+    try:
+        return load_tokenizer(model_path)
+    except Exception as exc:  # noqa: BLE001 - transformers raises several strict-config errors
+        logger.warning(
+            "[tokenizer] AutoTokenizer parse failed (%s); using tokenizer.json fallback",
+            exc,
+        )
+
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+    from transformers import PreTrainedTokenizerFast
+
+    tcfg_path = model_path / "tokenizer_config.json"
+    tcfg = json.loads(tcfg_path.read_text(encoding="utf-8")) if tcfg_path.exists() else {}
+    passthrough = {
+        key: tcfg[key]
+        for key in ("bos_token", "eos_token", "pad_token", "unk_token", "additional_special_tokens")
+        if key in tcfg
+    }
+    hf_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=str(model_path / "tokenizer.json"),
+        **passthrough,
+    )
+    chat_template = tcfg.get("chat_template")
+    if not chat_template:
+        jinja = model_path / "chat_template.jinja"
+        if jinja.exists():
+            chat_template = jinja.read_text(encoding="utf-8")
+    if chat_template:
+        hf_tokenizer.chat_template = chat_template
+    eos = config.get("eos_token_id")
+    if eos is None:
+        eos = (config.get("text_config") or {}).get("eos_token_id")
+    if isinstance(eos, int):
+        eos_ids = [eos]
+    elif isinstance(eos, (list, tuple)):
+        eos_ids = list(eos)
+    else:
+        eos_ids = None
+    return TokenizerWrapper(
+        hf_tokenizer,
+        eos_token_ids=eos_ids,
+        chat_template=None,
+    )
+
+
+def _load_runtime_metadata(path: Path) -> dict[str, Any] | None:
+    runtime_path = path / "mtplx_runtime.json"
+    if not runtime_path.exists():
+        return None
+    try:
+        data = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None

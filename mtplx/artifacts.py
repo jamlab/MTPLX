@@ -17,6 +17,12 @@ from .constants import (
     EXPECTED_PREQUANTIZED_MTP_KEYS,
     EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT,
     EXPECTED_MTP_TENSOR_COUNT,
+    EXPECTED_QWEN_MOE_MTP_KEYS,
+    EXPECTED_QWEN_MOE_MTP_TENSOR_COUNT,
+    EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS,
+    EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_TENSOR_COUNT,
+    EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS,
+    EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_TENSOR_COUNT,
     MULTIMODAL_SIDECARS,
 )
 from .profiles import (
@@ -24,14 +30,26 @@ from .profiles import (
     DEFAULT_HF_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
     QUALITY_HF_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
 )
 
 MTP_KEY_PREFIXES = ("mtp.", "language_model.mtp.")
 _KNOWN_PUBLIC_MODEL_ALIASES = {
+    "qwen3.5-9b-mtplx-optimized-speed": QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    "qwen3.5-9b-mtplx-optimized-speed-fp16": QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized-speed": DEFAULT_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized": LEGACY_OPTIMIZED_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized-speed-fp16": DEFAULT_FP16_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized-quality": QUALITY_HF_MODEL_ID,
+    "qwen3.6-35b-a3b-mtplx-optimized-speed": QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    "qwen3.6-35b-a3b-mtplx-optimized-speed-fp16": QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    "qwen3.6-35b-a3b-mtplx-optimized-balance": QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
+    "qwen3.6-35b-a3b-mtplx-optimized-balance-fp16": QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
 }
 
 
@@ -48,6 +66,88 @@ def is_mtp_key(key: str) -> bool:
     return any(text.startswith(prefix) for prefix in MTP_KEY_PREFIXES)
 
 
+def _num_mtp_layers(config: dict[str, Any]) -> int:
+    tcfg = text_config(config)
+    return int(
+        tcfg.get("mtp_num_hidden_layers")
+        or tcfg.get("num_nextn_predict_layers")
+        or config.get("num_nextn_predict_layers")
+        or 0
+    )
+
+
+def _qwen_moe_numbered_expert_keys(
+    config: dict[str, Any],
+    *,
+    prequantized: bool,
+) -> tuple[set[str], int, str]:
+    tcfg = text_config(config)
+    num_experts = int(tcfg.get("num_experts") or 0)
+    n_layers = max(_num_mtp_layers(config), 1)
+    keys: set[str] = {
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    }
+    for layer_index in range(n_layers):
+        base = f"mtp.layers.{layer_index}"
+        keys.update(
+            {
+                f"{base}.input_layernorm.weight",
+                f"{base}.post_attention_layernorm.weight",
+                f"{base}.self_attn.q_proj.weight",
+                f"{base}.self_attn.k_proj.weight",
+                f"{base}.self_attn.v_proj.weight",
+                f"{base}.self_attn.o_proj.weight",
+                f"{base}.self_attn.q_norm.weight",
+                f"{base}.self_attn.k_norm.weight",
+                f"{base}.mlp.gate.weight",
+                f"{base}.mlp.shared_expert.gate_proj.weight",
+                f"{base}.mlp.shared_expert.up_proj.weight",
+                f"{base}.mlp.shared_expert.down_proj.weight",
+                f"{base}.mlp.shared_expert_gate.weight",
+            }
+        )
+        for expert_index in range(num_experts):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                prefix = f"{base}.mlp.experts.{expert_index}.{proj}"
+                keys.add(f"{prefix}.weight")
+                if prequantized:
+                    keys.add(f"{prefix}.scales")
+                    keys.add(f"{prefix}.biases")
+    sidecar_format = "prequantized-mlx-affine-qwen-moe-experts" if prequantized else "bf16-qwen-moe-experts"
+    return keys, len(keys), sidecar_format
+
+
+def _has_numbered_moe_experts(keys: set[str]) -> bool:
+    marker = ".mlp.experts."
+    return any(
+        marker in key
+        and len(parts := key.split(marker, 1)[1].split(".", 1)) == 2
+        and parts[0].isdigit()
+        for key in keys
+    )
+
+
+def _expected_prequantized_keys_for_present_aux(
+    base_keys: set[str],
+    normalized_keys: set[str],
+) -> set[str]:
+    """Require complete quant triples only for modules that carry aux leaves."""
+    aux_prefixes = {
+        key.rsplit(".", 1)[0]
+        for key in normalized_keys
+        if key.endswith(".scales") or key.endswith(".biases")
+    }
+    expected = set(base_keys)
+    for prefix in aux_prefixes:
+        if f"{prefix}.weight" in base_keys:
+            expected.add(f"{prefix}.scales")
+            expected.add(f"{prefix}.biases")
+    return expected
+
+
 def _mtp_expected_key_set(
     config: dict[str, Any],
     *,
@@ -57,6 +157,47 @@ def _mtp_expected_key_set(
     prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
     quant_policy = str(mtp_quant.get("policy") or "") if isinstance(mtp_quant, dict) else ""
     normalized = {normalize_mtp_key(key) for key in keys}
+    if _is_qwen_moe_mtp_layout(config, normalized):
+        if any(".mlp.switch_mlp." in key for key in normalized):
+            has_prequantized_aux = any(
+                key.endswith(".scales") or key.endswith(".biases")
+                for key in normalized
+            )
+            if prequantized or has_prequantized_aux:
+                expected = _expected_prequantized_keys_for_present_aux(
+                    set(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS),
+                    normalized,
+                )
+                return (
+                    expected,
+                    len(expected),
+                    "prequantized-mlx-affine-qwen-moe-switch-mlx",
+                )
+            return (
+                set(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS),
+                EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_TENSOR_COUNT,
+                "bf16-qwen-moe-switch-mlx",
+            )
+        if _has_numbered_moe_experts(normalized):
+            has_prequantized_aux = any(
+                key.endswith(".scales") or key.endswith(".biases")
+                for key in normalized
+            )
+            return _qwen_moe_numbered_expert_keys(
+                config,
+                prequantized=prequantized or has_prequantized_aux,
+            )
+        if prequantized or normalized == set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS):
+            return (
+                set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS),
+                EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_TENSOR_COUNT,
+                "prequantized-mlx-affine-qwen-moe",
+            )
+        return (
+            set(EXPECTED_QWEN_MOE_MTP_KEYS),
+            EXPECTED_QWEN_MOE_MTP_TENSOR_COUNT,
+            "bf16-qwen-moe",
+        )
     if prequantized and quant_policy == "all":
         return (
             set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS),
@@ -82,6 +223,33 @@ def _mtp_expected_key_set(
             "prequantized-mlx-affine",
         )
     return set(EXPECTED_MTP_KEYS), EXPECTED_MTP_TENSOR_COUNT, "bf16"
+
+
+def _observed_sidecar_format(sidecar_format: str, tensors: tuple[TensorInfo, ...]) -> str:
+    if sidecar_format != "bf16" or not tensors:
+        return sidecar_format
+    dtypes = {tensor.dtype.upper() for tensor in tensors}
+    if dtypes == {"F16"}:
+        return "fp16"
+    return sidecar_format
+
+
+def _is_qwen_moe_mtp_layout(config: dict[str, Any], normalized_keys: set[str]) -> bool:
+    tcfg = text_config(config)
+    markers = (
+        str(config.get("model_type") or ""),
+        str(tcfg.get("model_type") or ""),
+        " ".join(str(item) for item in (config.get("architectures") or [])),
+        " ".join(str(item) for item in (tcfg.get("architectures") or [])),
+    )
+    if any("qwen3_5_moe" in marker.lower() or "qwen3_5moe" in marker.lower() for marker in markers):
+        return True
+    return any(
+        key.startswith("mtp.layers.0.mlp.experts.")
+        or key.startswith("mtp.layers.0.mlp.switch_mlp.")
+        or key.startswith("mtp.layers.0.mlp.shared_expert")
+        for key in normalized_keys
+    )
 
 
 def load_config(model_dir: Path | str) -> dict[str, Any]:
@@ -187,6 +355,12 @@ class ModelInspection:
     runtime_contract_error: str | None = None
     runtime_contract_path: str | None = None
     compatibility: dict[str, Any] = field(default_factory=dict)
+    runtime_model: str | None = None
+    assistant_model: str | None = None
+    recommended_sampler: dict[str, Any] | None = None
+    backend_status: str | None = None
+    backend_artifact: dict[str, Any] | None = None
+    gemma4_pair: dict[str, Any] | None = None
 
     @property
     def passes_primary_gate(self) -> bool:
@@ -223,6 +397,12 @@ class ModelInspection:
             "mtp": self.mtp.to_dict() if self.mtp else None,
             "runtime_contract_path": runtime_contract_path,
             "compatibility": self.compatibility,
+            "runtime_model": self.runtime_model,
+            "assistant_model": self.assistant_model,
+            "recommended_sampler": self.recommended_sampler,
+            "backend_status": self.backend_status,
+            "backend_artifact": self.backend_artifact,
+            "gemma4_pair": self.gemma4_pair,
             "mtp_supported": self.compatibility.get("mtp_supported"),
             "mtp_arch": self.compatibility.get("arch_id"),
             "recommended_backend": self.compatibility.get("recommended_backend"),
@@ -249,32 +429,30 @@ def inspect_mtp_tensors(model_dir: Path | str, config: dict[str, Any] | None = N
             expected_tensor_count=expected_count,
         )
 
-    from safetensors import safe_open
-
-    tensors: list[TensorInfo] = []
-    with safe_open(str(mtp_path), framework="np") as handle:
-        keys = sorted(handle.keys())
-        for key in keys:
-            sl = handle.get_slice(key)
-            tensors.append(
-                TensorInfo(
-                    key=key,
-                    dtype=str(sl.get_dtype()),
-                    shape=tuple(int(x) for x in sl.get_shape()),
-                )
-            )
+    tensors, tensor_error = _safetensors_header_tensor_infos(mtp_path)
+    if tensor_error:
+        return MTPInspection(
+            mtp_file=str(mtp_path),
+            exists=True,
+            sidecar_format=sidecar_format,
+            expected_tensor_count=expected_count,
+            metadata_only=True,
+            extra_keys=(tensor_error,),
+        )
 
     key_set = {normalize_mtp_key(t.key) for t in tensors}
     expected_keys, expected_count, sidecar_format = _mtp_expected_key_set(
         config or {},
         keys=tuple(key_set),
     )
+    sidecar_format = _observed_sidecar_format(sidecar_format, tuple(tensors))
     return MTPInspection(
         mtp_file=str(mtp_path),
         exists=True,
         tensor_count=len(tensors),
         sidecar_format=sidecar_format,
         expected_tensor_count=expected_count,
+        metadata_only=True,
         tensors=tuple(tensors),
         missing_expected_keys=tuple(sorted(expected_keys - key_set)),
         extra_keys=tuple(sorted(key_set - expected_keys)),
@@ -438,6 +616,46 @@ def _safetensors_header_keys(path: Path) -> tuple[tuple[str, ...], str | None]:
         return tuple(sorted(key for key in header if key != "__metadata__")), None
     except Exception as exc:
         return (), str(exc)
+
+
+def _safetensors_header_tensor_infos(
+    path: Path,
+) -> tuple[tuple[TensorInfo, ...], str | None]:
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(8)
+            if len(prefix) < 8:
+                return (), "safetensors header is shorter than 8 bytes"
+            header_len = int.from_bytes(prefix, "little")
+            if header_len > 1_000_000:
+                return (), (
+                    "safetensors header too large for metadata-only inspect: "
+                    f"{header_len + 8} bytes"
+                )
+            header = json.loads(handle.read(header_len).decode("utf-8"))
+    except Exception as exc:
+        return (), str(exc)
+
+    tensors: list[TensorInfo] = []
+    for key, payload in sorted(header.items()):
+        if key == "__metadata__":
+            continue
+        if not isinstance(payload, dict):
+            return (), f"safetensors tensor metadata for {key!r} is not an object"
+        shape = payload.get("shape")
+        if not isinstance(shape, list):
+            return (), f"safetensors tensor metadata for {key!r} has no shape"
+        try:
+            tensors.append(
+                TensorInfo(
+                    key=str(key),
+                    dtype=str(payload.get("dtype") or ""),
+                    shape=tuple(int(dim) for dim in shape),
+                )
+            )
+        except Exception as exc:
+            return (), f"safetensors tensor metadata for {key!r} is invalid: {exc}"
+    return tuple(tensors), None
 
 
 def _weight_keys_from_index_payload(payload: dict[str, Any] | None) -> tuple[str, ...]:
@@ -678,6 +896,60 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
     if repo_id is not None:
         return _inspect_hf_model(repo_id)
     model_path = Path(model_dir)
+    try:
+        from .gemma4_pair import gemma4_pair_inspection, resolve_gemma4_pair_paths
+    except Exception:
+        pair = None
+    else:
+        pair = resolve_gemma4_pair_paths(model_path)
+    if pair is not None:
+        payload = gemma4_pair_inspection(
+            model_ref=str(model_path),
+            bundle_root=pair["bundle_root"],
+            target_model=pair["target_model"],
+            assistant_model=pair["assistant_model"],
+            metadata=pair["metadata"],
+        )
+        target_config = load_config(pair["target_model"])
+        tcfg = text_config(target_config)
+        archs = target_config.get("architectures") or tcfg.get("architectures") or []
+        target_quant = (
+            target_config.get("quantization_config")
+            or target_config.get("quantization")
+            or tcfg.get("quantization_config")
+            or tcfg.get("quantization")
+            or {}
+        )
+        return ModelInspection(
+            model_dir=str(model_path),
+            source="local",
+            config_exists=True,
+            architecture=str(payload.get("architecture") or (archs[0] if archs else "Gemma4AssistantPair")),
+            model_type=str(payload.get("model_type") or "gemma4_pair"),
+            mtp_num_hidden_layers=1,
+            hidden_size=tcfg.get("hidden_size"),
+            num_hidden_layers=tcfg.get("num_hidden_layers"),
+            vocab_size=tcfg.get("vocab_size"),
+            mtp_pattern="assistant-pair",
+            quantization=target_quant,
+            sidecars={name: False for name in MULTIMODAL_SIDECARS},
+            model_files=tuple(sorted(p.name for p in Path(pair["target_model"]).glob("model*.safetensors"))),
+            runtime_model=payload.get("runtime_model"),
+            assistant_model=payload.get("assistant_model"),
+            recommended_sampler=payload.get("recommended_sampler")
+            if isinstance(payload.get("recommended_sampler"), dict)
+            else None,
+            backend_status=payload.get("backend_status"),
+            backend_artifact=payload.get("backend_artifact")
+            if isinstance(payload.get("backend_artifact"), dict)
+            else None,
+            gemma4_pair=payload.get("gemma4_pair")
+            if isinstance(payload.get("gemma4_pair"), dict)
+            else None,
+            compatibility=payload.get("compatibility")
+            if isinstance(payload.get("compatibility"), dict)
+            else {},
+        )
     config_path = model_path / "config.json"
     config_exists = config_path.exists()
     config: dict[str, Any] = json.loads(config_path.read_text()) if config_exists else {}

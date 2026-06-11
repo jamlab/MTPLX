@@ -15,6 +15,7 @@ import pytest
 from mtplx.generation import (
     _prefill_chunk_size,
     _sustained_prefill_layout,
+    prefill_chunk_size_override,
 )
 from mtplx.profiles import SUSTAINED_PREFILL_ENV
 
@@ -114,3 +115,14 @@ def test_prefill_chunk_legacy_env_back_compat(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "150000")
     assert _prefill_chunk_size() == 1536
+
+
+def test_prefill_chunk_context_override_is_request_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2048")
+
+    assert _prefill_chunk_size() == 2048
+    with prefill_chunk_size_override(8192):
+        assert _prefill_chunk_size() == 8192
+    assert _prefill_chunk_size() == 2048

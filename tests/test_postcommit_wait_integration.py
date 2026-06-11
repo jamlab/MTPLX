@@ -387,3 +387,50 @@ def test_wait_metrics_attach_to_request_observability_shape() -> None:
     pw = request_observability["postcommit_wait"]
     assert set(pw.keys()) == {"waited", "elapsed_s", "outcome", "timeout_s"}
     assert pw["outcome"] == "no_pending"
+
+
+def test_postcommit_skips_estimated_oversized_snapshot_before_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Large OpenCode histories must not spend foreground-visible time
+    materializing a SessionBank snapshot that the byte cap will reject.
+    """
+
+    class FakeBank:
+        per_session_max_bytes = 8 * 1024 * 1024 * 1024
+
+        def longest_prefix(self, _history_ids):
+            return SimpleNamespace(prefix_len=117_793, nbytes=8_227_240_960)
+
+    state = SimpleNamespace(
+        sessions=SimpleNamespace(bank=FakeBank()),
+    )
+    monkeypatch.setattr(
+        openai,
+        "_history_ids_for_postcommit",
+        lambda *_args, **_kwargs: list(range(121_704)),
+    )
+    restore_called = False
+
+    def fake_restore(*_args, **_kwargs):
+        nonlocal restore_called
+        restore_called = True
+        raise AssertionError("oversized postcommit should skip before prefill")
+
+    monkeypatch.setattr(openai, "restore_or_prefill_prompt_state", fake_restore)
+
+    outcome = openai._store_retokenized_history_snapshot(
+        state,
+        session_id="sess-int",
+        messages=[],
+        assistant_content="hello",
+        thinking_enabled=False,
+        policy_fingerprint="test-policy",
+    )
+
+    assert outcome["stored"] is False
+    assert outcome["reason"] == "estimated_oversized_snapshot"
+    assert outcome["estimated_nbytes"] > outcome["budget"]
+    assert outcome["best_prefix_len"] == 117_793
+    assert outcome["history_tokens"] == 121_704
+    assert restore_called is False

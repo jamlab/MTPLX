@@ -1,4 +1,5 @@
 from mtplx import thermal
+import subprocess
 
 
 def test_detect_thermal_control_reports_none_without_tools(monkeypatch):
@@ -29,6 +30,37 @@ def test_set_thermal_profile_without_tool_is_actionable(monkeypatch):
     assert result["profile"] == "performance"
     assert "mtplx max --install" in result["message"]
     thermal.detect_thermal_control.cache_clear()
+
+
+def test_smart_fan_controller_keeps_max_until_final_request(monkeypatch):
+    calls: list[str] = []
+
+    monkeypatch.setattr(thermal, "check_and_recover_stale_max", lambda: None)
+    monkeypatch.setattr(
+        thermal,
+        "install_max_lifecycle_hooks",
+        lambda: (lambda: calls.append("auto") or {"ok": True, "profile": "silent"}),
+    )
+    monkeypatch.setattr(
+        thermal,
+        "set_thermal_profile",
+        lambda profile: calls.append(profile) or {"ok": True, "profile": profile},
+    )
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("first")
+    controller.begin_request("second")
+
+    assert calls == ["performance"]
+    controller.end_request("first", wait_for_restore=True)
+    assert calls == ["performance"]
+
+    status = controller.end_request("second", wait_for_restore=True)
+
+    assert calls == ["performance", "auto"]
+    assert status["active"] is False
+    assert status["active_count"] == 0
+    assert status["commanded_max"] is False
 
 
 def test_thermalforge_profile_candidates_match_real_cli():
@@ -185,6 +217,58 @@ def test_install_thermal_control_source_installs_to_mtplx_bin(monkeypatch, tmp_p
     thermal.detect_thermal_control.cache_clear()
 
 
+def test_install_thermal_control_auto_uses_bundled_helper_before_source(monkeypatch, tmp_path):
+    """The macOS app ships ThermalForge in its bundle. Fresh DMG users should
+    copy that binary into MTPLX's private bin dir instead of needing git,
+    Homebrew, or Xcode command-line tools during onboarding."""
+    thermal.detect_thermal_control.cache_clear()
+    bundled_dir = tmp_path / "AppResources" / "ThermalForge"
+    bundled_dir.mkdir(parents=True)
+    bundled = bundled_dir / "thermalforge"
+    bundled.write_text("#!/bin/sh\necho bundled\n")
+    bundled.chmod(0o755)
+
+    bin_dir = tmp_path / "mtplx-bin"
+    monkeypatch.setattr(thermal, "MTPLX_THERMALFORGE_DIR", str(bin_dir))
+    monkeypatch.setattr(thermal, "MTPLX_THERMALFORGE_PATH", str(bin_dir / "thermalforge"))
+    monkeypatch.setenv(thermal.BUNDLED_THERMALFORGE_ENV, str(bundled))
+
+    invocations: list[list[str]] = []
+
+    def fake_run(command, *, timeout_s=None, cwd=None):
+        invocations.append(command)
+        return {"command": command, "returncode": 0, "ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(thermal, "_run_streaming", fake_run)
+    monkeypatch.setattr(thermal, "_run_probe", fake_run)
+    monkeypatch.setattr(
+        thermal,
+        "install_passwordless_sudoers_rule",
+        lambda **kw: {"ok": True, "step": "passwordless_sudoers", "message": "ok"},
+    )
+    monkeypatch.setattr(
+        thermal,
+        "set_thermal_profile_verified",
+        lambda profile, **kw: {"ok": True, "message": "fans pinned"},
+    )
+    monkeypatch.setattr(
+        thermal,
+        "set_thermal_profile",
+        lambda profile, **kw: {"ok": True, "profile": profile},
+    )
+
+    result = thermal.install_thermal_control(method="auto")
+
+    assert result["ok"] is True, result
+    assert result["method"] == "bundled"
+    assert result["binary"] == str(bin_dir / "thermalforge")
+    assert (bin_dir / "thermalforge").read_text() == bundled.read_text()
+    assert not any("git" in cmd[0] for cmd in invocations)
+    assert not any("swift" in cmd[0] for cmd in invocations)
+    assert result["steps"][0]["step"] == "copy_bundled_to_mtplx_bin"
+    thermal.detect_thermal_control.cache_clear()
+
+
 def test_install_thermal_control_auto_does_not_fall_back_to_homebrew(monkeypatch, tmp_path):
     """`auto` must NOT silently fall back to Homebrew. The upstream brew
     formula has been observed to fail mid-build (missing
@@ -226,6 +310,89 @@ def test_install_thermal_control_homebrew_alias_still_works(monkeypatch):
     """Backwards-compat: the old ``install_thermal_control_homebrew`` name
     still resolves (covers any external callers from earlier versions)."""
     assert thermal.install_thermal_control_homebrew is thermal.install_thermal_control
+
+
+def test_passwordless_sudoers_rule_uses_security_prompt_when_gui_sudo_fails(monkeypatch):
+    invocations: list[list[str]] = []
+
+    def fake_which(name):
+        if name == "security":
+            return "/usr/bin/security"
+        return None
+
+    def fake_subprocess_run(command, **kwargs):
+        invocations.append(command)
+        if command == ["sudo", "tee", thermal.SUDOERS_FILE]:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="",
+                stderr="sudo: a terminal is required to read the password",
+            )
+        if command[:3] == ["/usr/bin/security", "execute-with-privileges", "/bin/sh"]:
+            assert command[-3:] == [
+                thermal.SUDOERS_FILE,
+                "testuser",
+                "/tmp/mtplx-bin/thermalforge",
+            ]
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess call: {command}")
+
+    def fake_probe(command, *, timeout_s=None):
+        assert command == ["sudo", "-n", "/tmp/mtplx-bin/thermalforge", "status"]
+        return {"command": command, "returncode": 0, "ok": True, "stdout": "{}", "stderr": ""}
+
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.setattr(thermal.shutil, "which", fake_which)
+    monkeypatch.setattr(thermal.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(thermal, "_run_probe", fake_probe)
+
+    result = thermal.install_passwordless_sudoers_rule(
+        binary_path="/tmp/mtplx-bin/thermalforge"
+    )
+
+    assert result["ok"] is True, result
+    assert result["method"] == "security_execute_with_privileges"
+    assert any(
+        command[:3] == ["/usr/bin/security", "execute-with-privileges", "/bin/sh"]
+        for command in invocations
+    )
+
+
+def test_passwordless_sudoers_rule_reports_security_prompt_failure(monkeypatch):
+    def fake_which(name):
+        if name == "security":
+            return "/usr/bin/security"
+        return None
+
+    def fake_subprocess_run(command, **kwargs):
+        if command == ["sudo", "tee", thermal.SUDOERS_FILE]:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="",
+                stderr="sudo: a terminal is required to read the password",
+            )
+        if command[:3] == ["/usr/bin/security", "execute-with-privileges", "/bin/sh"]:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="",
+                stderr="The user canceled authorization.",
+            )
+        raise AssertionError(f"unexpected subprocess call: {command}")
+
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.setattr(thermal.shutil, "which", fake_which)
+    monkeypatch.setattr(thermal.subprocess, "run", fake_subprocess_run)
+
+    result = thermal.install_passwordless_sudoers_rule(
+        binary_path="/tmp/mtplx-bin/thermalforge"
+    )
+
+    assert result["ok"] is False
+    assert result["step"] == "sudo_tee"
+    assert "macOS admin authorization failed" in result["message"]
 
 
 def test_fan_summary_parses_thermalforge_status_json(monkeypatch):

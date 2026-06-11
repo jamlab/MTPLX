@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -18,15 +20,22 @@ from typing import Any, Iterator, Mapping
 
 from .session_bank import (
     CacheMissReason,
+    DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
     DEFAULT_IDLE_TTL_S,
     DEFAULT_MAX_ENTRIES,
     DEFAULT_MAX_BYTES,
     DEFAULT_PER_SESSION_MAX_BYTES,
+    DEFAULT_PREFIX_BLOCK_SIZE,
     SessionBank,
+    block_aligned_prefix_len,
 )
 
 
 logger = logging.getLogger(__name__)
+
+_HIGH_MEMORY_SESSION_BANK_THRESHOLD_BYTES = 96 * 1024**3
+_HIGH_MEMORY_PER_SESSION_MAX_BYTES = 24 * 1024**3
+_HIGH_MEMORY_MAX_ENTRIES = 16
 
 
 def _bank_bytes_from_env(name: str, default: int) -> int:
@@ -84,6 +93,58 @@ def _bank_entries_from_env(name: str, default: int) -> int:
         )
         return default
     return value
+
+
+def _detect_total_ram_bytes_for_session_bank() -> int | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        output = subprocess.check_output(
+            ["sysctl", "-n", "hw.memsize"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+        )
+        total = int(str(output).strip())
+    except Exception:
+        return None
+    return total if total > 0 else None
+
+
+def _default_max_entries() -> int:
+    total_ram = _detect_total_ram_bytes_for_session_bank()
+    if (
+        total_ram is not None
+        and total_ram >= _HIGH_MEMORY_SESSION_BANK_THRESHOLD_BYTES
+    ):
+        return _HIGH_MEMORY_MAX_ENTRIES
+    return DEFAULT_MAX_ENTRIES
+
+
+def _session_bank_max_entries() -> int:
+    raw = os.environ.get("MTPLX_SESSION_BANK_MAX_ENTRIES")
+    default = _default_max_entries()
+    if raw is None:
+        return default
+    return _bank_entries_from_env("MTPLX_SESSION_BANK_MAX_ENTRIES", default)
+
+
+def _default_per_session_max_bytes() -> int:
+    total_ram = _detect_total_ram_bytes_for_session_bank()
+    if (
+        total_ram is not None
+        and total_ram >= _HIGH_MEMORY_SESSION_BANK_THRESHOLD_BYTES
+    ):
+        return _HIGH_MEMORY_PER_SESSION_MAX_BYTES
+    return DEFAULT_PER_SESSION_MAX_BYTES
+
+
+def _session_bank_per_session_max_bytes() -> int:
+    raw = os.environ.get("MTPLX_SESSION_BANK_PER_SESSION_BYTES")
+    default = _default_per_session_max_bytes()
+    if raw is None:
+        return default
+    return _bank_bytes_from_env("MTPLX_SESSION_BANK_PER_SESSION_BYTES", default)
 
 
 @dataclass
@@ -189,23 +250,20 @@ def is_background_request(
         and current_system_hash is not None
         and current_system_hash != main_system_hash
     )
-    return bool(
-        header_task
-        or metadata_task
-        or system_mismatch
-        or is_no_history_shape(messages)
-    )
+    return bool(header_task or metadata_task or system_mismatch)
 
 
-_DEFAULT_POSTCOMMIT_WAIT_TIMEOUT_S = 2.0
+_DEFAULT_POSTCOMMIT_WAIT_TIMEOUT_S = 8.0
 _DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP = 8
 _DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS = 64
+_DEFAULT_PREFIX_BLOCK_SIZE = DEFAULT_PREFIX_BLOCK_SIZE
+_DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS = DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS
 
 
 def _postcommit_wait_timeout_s() -> float:
     """Read MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S from the environment.
 
-    Defaults to 2s. Values <= 0 disable the wait (returns 0.0). Bad values
+    Defaults to 8s. Values <= 0 disable the wait (returns 0.0). Bad values
     fall back to the default so a typo does not leave the server hanging.
     """
     raw = os.environ.get("MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S")
@@ -243,6 +301,29 @@ def _near_prefix_min_match_tokens() -> int:
     return _env_int(
         "MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS",
         _DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS,
+        minimum=1,
+    )
+
+
+def _block_prefix_restore_enabled() -> bool:
+    raw = os.environ.get("MTPLX_SESSION_BLOCK_PREFIX_RESTORE")
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _prefix_block_size() -> int:
+    return _env_int(
+        "MTPLX_SESSION_PREFIX_BLOCK_SIZE",
+        _DEFAULT_PREFIX_BLOCK_SIZE,
+        minimum=1,
+    )
+
+
+def _block_prefix_min_match_tokens() -> int:
+    return _env_int(
+        "MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS",
+        _DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
         minimum=1,
     )
 
@@ -687,6 +768,7 @@ class EngineSession:
         if expected_revision is not None and self.revision != int(expected_revision):
             return EngineSessionCommit(False, "stale_session_revision", self.prefix_len)
         current = self.committed_token_ids
+        commit_reason = "committed_retokenized_prefix"
         if current:
             if len(tokens) < len(current):
                 return EngineSessionCommit(
@@ -695,15 +777,29 @@ class EngineSession:
                     self.prefix_len,
                 )
             matched = common_prefix_len(current, tokens)
+            block_boundary = block_aligned_prefix_len(
+                matched,
+                block_size=_prefix_block_size(),
+            )
+            block_min_match = max(_prefix_block_size(), _block_prefix_min_match_tokens())
             if (
                 matched < len(current)
                 and (len(current) - matched) > _near_prefix_max_token_gap()
+                and (
+                    not _block_prefix_restore_enabled()
+                    or block_boundary < block_min_match
+                )
             ):
                 return EngineSessionCommit(
                     False,
                     "retokenized_prefix_not_extending_session",
                     self.prefix_len,
                 )
+            if (
+                matched < len(current)
+                and (len(current) - matched) > _near_prefix_max_token_gap()
+            ):
+                commit_reason = "committed_retokenized_prefix_after_block_overlap"
             if len(tokens) == len(current) and matched == len(current):
                 return EngineSessionCommit(
                     False,
@@ -717,7 +813,7 @@ class EngineSession:
         self.revision += 1
         self._record_interval_boundaries(tokens)
         self.add_boundary(boundary_kind, tokens, nbytes=nbytes)
-        return EngineSessionCommit(True, "committed_retokenized_prefix", self.prefix_len)
+        return EngineSessionCommit(True, commit_reason, self.prefix_len)
 
     def add_boundary(
         self,
@@ -793,25 +889,26 @@ class EngineSessionManager:
         *,
         bank: SessionBank | None = None,
         idle_ttl_s: float = DEFAULT_IDLE_TTL_S,
+        cold_tier: Any | None = None,
     ) -> None:
-        # Bank caps default to the constants in session_bank.py. Operators
-        # running into per-session eviction at large contexts can override
-        # via MTPLX_SESSION_BANK_PER_SESSION_BYTES (e.g. "16G" for 16 GiB)
-        # or MTPLX_SESSION_BANK_MAX_BYTES. The entry-count cap is also
-        # overridable via MTPLX_SESSION_BANK_MAX_ENTRIES (plain integer)
-        # for workloads where ~2 GB-per-entry contexts make the default of
-        # 8 the binding constraint well before the byte caps.
+        # Bank caps mostly default to the constants in session_bank.py. On
+        # 96GB+ Apple Silicon machines, the per-session default rises to the
+        # global 24GiB bank cap so exact 100k-token prefixes and retokenized
+        # follow-up histories can stay hot in RAM together without increasing
+        # the total RAM-cache budget. Operators can still override byte caps via
+        # MTPLX_SESSION_BANK_PER_SESSION_BYTES (e.g. "16G") or
+        # MTPLX_SESSION_BANK_MAX_BYTES. The entry-count cap is also overridable
+        # via MTPLX_SESSION_BANK_MAX_ENTRIES (plain integer) for workloads
+        # where ~2 GB-per-entry contexts make the default of 8 the binding
+        # constraint well before the byte caps.
         self.bank = bank or SessionBank(
-            max_entries=_bank_entries_from_env(
-                "MTPLX_SESSION_BANK_MAX_ENTRIES", DEFAULT_MAX_ENTRIES
-            ),
+            max_entries=_session_bank_max_entries(),
             max_bytes=_bank_bytes_from_env(
                 "MTPLX_SESSION_BANK_MAX_BYTES", DEFAULT_MAX_BYTES
             ),
-            per_session_max_bytes=_bank_bytes_from_env(
-                "MTPLX_SESSION_BANK_PER_SESSION_BYTES", DEFAULT_PER_SESSION_MAX_BYTES
-            ),
+            per_session_max_bytes=_session_bank_per_session_max_bytes(),
             idle_ttl_s=idle_ttl_s,
+            cold_tier=cold_tier,
         )
         self.idle_ttl_s = float(idle_ttl_s)
         self._sessions: dict[str, EngineSession] = {}
@@ -930,24 +1027,36 @@ class EngineSessionManager:
         )
         best: EngineSession | None = None
         best_matched = 0
+        block_size = _prefix_block_size()
+        block_min_match = max(block_size, _block_prefix_min_match_tokens())
         for session in self._sessions.values():
             if not session.has_pending_postcommit():
                 continue
             prefix = session.committed_token_ids
             if not prefix:
                 continue
-            if len(prefix) > len(tokens) + gap_limit:
-                continue
             matched = common_prefix_len(tokens, prefix)
             gap = len(prefix) - matched
             required_match = min(min_match, max(1, len(prefix) - gap_limit))
-            if gap < 0 or gap > gap_limit or matched < required_match:
+            safe_block = min(
+                block_aligned_prefix_len(matched, block_size=block_size),
+                len(prefix),
+                len(tokens),
+            )
+            near_match = gap >= 0 and gap <= gap_limit and matched >= required_match
+            block_match = (
+                _block_prefix_restore_enabled()
+                and safe_block >= block_min_match
+                and safe_block >= 2
+            )
+            if not near_match and not block_match:
                 continue
-            if best is None or matched > best_matched or (
-                matched == best_matched and len(prefix) > len(best.committed_token_ids)
+            candidate_matched = int(matched if near_match else safe_block)
+            if best is None or candidate_matched > best_matched or (
+                candidate_matched == best_matched and len(prefix) > len(best.committed_token_ids)
             ):
                 best = session
-                best_matched = matched
+                best_matched = candidate_matched
         return best, best_matched
 
     def nearest_prefix_session(
@@ -987,12 +1096,18 @@ class EngineSessionManager:
                 "reason": "no_existing_session_prefix",
             }
         divergence_at = None if exact else matched
+        boundary = block_aligned_prefix_len(
+            matched,
+            block_size=_prefix_block_size(),
+        )
         return {
             "prompt_len": len(tokens),
             "exact_prefix_match": bool(exact),
             "best_session_id": session.session_id,
             "best_prefix_len": len(session.committed_token_ids),
             "matched_prefix_len": int(matched),
+            "nearest_boundary_tokens": int(boundary),
+            "new_prefill_tokens": max(0, len(tokens) - int(boundary)),
             "divergence_at_token": divergence_at,
             "best_token_hash": token_hash_short(session.committed_token_ids),
             "prompt_token_hash": token_hash_short(tokens),
@@ -1024,6 +1139,18 @@ class EngineSessionManager:
             self._sessions.clear()
         bank_entries = self.bank.clear()
         return {"sessions_cleared": sessions, "bank_entries_cleared": bank_entries}
+
+    def archive_cold_tier(self) -> dict[str, Any]:
+        archive = getattr(self.bank, "archive_cold_tier", None)
+        if not callable(archive):
+            return {"archived": False, "reason": "ssd_cache_archive_unavailable"}
+        return archive()
+
+    def flush_cold_tier(self, *, timeout_s: float = 30.0) -> bool:
+        flush = getattr(self.bank, "flush_cold_tier", None)
+        if not callable(flush):
+            return True
+        return bool(flush(timeout_s=timeout_s))
 
     def list_sessions(self) -> dict[str, Any]:
         self.evict_stale()

@@ -9,6 +9,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.build/
 .venv/
 venv/
 env/
@@ -17,8 +18,9 @@ build/
 dist/
 
 # Model weights and generated artifacts
-models/
+/models/
 outputs/
+qa_runs/
 runs/
 artifacts/
 benchmark_outputs/
@@ -27,6 +29,9 @@ benchmark_outputs/
 *.bin
 *.mlx
 *.npz
+!apps/MTPLXApp/Sources/MTPLXAppCore/Resources/
+!apps/MTPLXApp/Sources/MTPLXAppCore/Resources/StepAdapters/
+!apps/MTPLXApp/Sources/MTPLXAppCore/Resources/StepAdapters/*.npz
 *.npy
 *.jsonl
 !mtplx/benchmarks/prompts/*.jsonl

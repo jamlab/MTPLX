@@ -53,6 +53,30 @@ def _make_requantized_head(module: Any, *, bits: int, group_size: int, mode: str
     import mlx.nn as nn
 
     started = time.perf_counter()
+    if (
+        int(module.bits) == int(bits)
+        and int(module.group_size) == int(group_size)
+        and str(module.mode) == str(mode)
+    ):
+        report = {
+            "original": {
+                "bits": int(module.bits),
+                "group_size": int(module.group_size),
+                "mode": str(module.mode),
+                "weight_shape": list(module.weight.shape),
+                "scales_shape": list(module.scales.shape),
+            },
+            "draft_only": {
+                "bits": int(module.bits),
+                "group_size": int(module.group_size),
+                "mode": str(module.mode),
+                "weight_shape": list(module.weight.shape),
+                "scales_shape": list(module.scales.shape),
+            },
+            "reused_existing_quantization": True,
+            "elapsed_s": time.perf_counter() - started,
+        }
+        return module, report
     dense = mx.dequantize(
         module.weight,
         module.scales,
@@ -88,6 +112,90 @@ def _make_requantized_head(module: Any, *, bits: int, group_size: int, mode: str
             "weight_shape": list(quantized.weight.shape),
             "scales_shape": list(quantized.scales.shape),
         },
+        "elapsed_s": time.perf_counter() - started,
+    }
+    return quantized, report
+
+
+def _quantize_linear_like_head(
+    module: Any,
+    *,
+    bits: int,
+    group_size: int,
+    mode: str,
+) -> tuple[Any, dict[str, Any]]:
+    import mlx.nn as nn
+
+    try:
+        from .mtp_adapters import LoRALinear
+    except Exception:  # pragma: no cover - defensive for minimal import contexts
+        LoRALinear = None  # type: ignore[assignment]
+
+    if LoRALinear is not None and isinstance(module, LoRALinear):
+        draft_base, report = _quantize_linear_like_head(
+            module.base,
+            bits=bits,
+            group_size=group_size,
+            mode=mode,
+        )
+        module.base = draft_base
+        report = {
+            "wrapper": "LoRALinear",
+            "base": report,
+            "draft_only": report["draft_only"],
+        }
+        return module, report
+    if isinstance(module, nn.QuantizedLinear):
+        return _make_requantized_head(
+            module,
+            bits=bits,
+            group_size=group_size,
+            mode=mode,
+        )
+    if isinstance(module, nn.Linear):
+        return _make_quantized_dense_head(
+            module,
+            bits=bits,
+            group_size=group_size,
+            mode=mode,
+        )
+    raise TypeError(f"head is not Linear/QuantizedLinear: {type(module)!r}")
+
+
+def _make_quantized_dense_head(module: Any, *, bits: int, group_size: int, mode: str) -> tuple[Any, dict[str, Any]]:
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    started = time.perf_counter()
+    dense = module.weight.astype(mx.bfloat16)
+    mx.eval(dense)
+    linear = nn.Linear(int(dense.shape[1]), int(dense.shape[0]), bias=("bias" in module))
+    linear.weight = dense
+    if "bias" in module:
+        linear.bias = module.bias.astype(mx.bfloat16)
+    quantized = nn.QuantizedLinear.from_linear(
+        linear,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    mx.eval(quantized.weight, quantized.scales, quantized.biases)
+    report = {
+        "source": "dense_lm_head",
+        "original": {
+            "bits": "dense",
+            "dtype": str(module.weight.dtype),
+            "weight_shape": list(module.weight.shape),
+            "scales_shape": None,
+        },
+        "draft_only": {
+            "bits": int(quantized.bits),
+            "group_size": int(quantized.group_size),
+            "mode": str(quantized.mode),
+            "weight_shape": list(quantized.weight.shape),
+            "scales_shape": list(quantized.scales.shape),
+        },
+        "reused_existing_quantization": False,
         "elapsed_s": time.perf_counter() - started,
     }
     return quantized, report
@@ -179,16 +287,54 @@ def _install_draft_lm_head(rt: Any, *, bits: int, group_size: int, mode: str) ->
     import mlx.nn as nn
 
     text = _text_model(rt.model)
+    mtp_layers = getattr(getattr(text, "mtp", None), "layers", None)
+    step_shared_heads = [
+        (idx, layer, getattr(layer, "shared_head_head", None))
+        for idx, layer in enumerate(mtp_layers or [])
+        if getattr(layer, "shared_head_head", None) is not None
+    ]
+    if step_shared_heads:
+        started = time.perf_counter()
+        reports: list[dict[str, Any]] = []
+        for idx, layer, head in step_shared_heads:
+            draft_head, report = _quantize_linear_like_head(
+                head,
+                bits=bits,
+                group_size=group_size,
+                mode=mode,
+            )
+            layer.shared_head_head = draft_head
+            reports.append({"layer": idx, **report})
+        text._mtplx_step_mtp_draft_shared_heads = {
+            "bits": int(bits),
+            "group_size": int(group_size),
+            "mode": str(mode),
+            "layers": len(reports),
+        }
+        return {
+            "source": "step_mtp_shared_head",
+            "layers": reports,
+            "elapsed_s": time.perf_counter() - started,
+        }
+
     module = getattr(text, "lm_head", None)
     if module is not None:
-        if not isinstance(module, nn.QuantizedLinear):
-            raise TypeError(f"lm_head is not QuantizedLinear: {type(module)!r}")
-        draft_head, report = _make_requantized_head(
-            module,
-            bits=bits,
-            group_size=group_size,
-            mode=mode,
-        )
+        if isinstance(module, nn.QuantizedLinear):
+            draft_head, report = _make_requantized_head(
+                module,
+                bits=bits,
+                group_size=group_size,
+                mode=mode,
+            )
+        elif isinstance(module, nn.Linear):
+            draft_head, report = _make_quantized_dense_head(
+                module,
+                bits=bits,
+                group_size=group_size,
+                mode=mode,
+            )
+        else:
+            raise TypeError(f"lm_head is not Linear/QuantizedLinear: {type(module)!r}")
     elif bool(getattr(getattr(text, "args", None), "tie_word_embeddings", False)):
         embed_tokens = getattr(getattr(text, "model", None), "embed_tokens", None)
         draft_head, report = _make_embedding_as_linear_head(

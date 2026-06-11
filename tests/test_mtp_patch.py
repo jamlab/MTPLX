@@ -2,7 +2,56 @@ from __future__ import annotations
 
 import pytest
 
-from mtplx.mtp_patch import MTPContract
+from mtplx.glm_mtp_patch import _rewrite_glm_mtp_weights
+from mtplx.mtp_patch import (
+    MTPContract,
+    _contract_with_prequantized_module_specs,
+    _contract_with_prequantized_tensor_geometry,
+    _finalize_mtp_weights,
+    _mtp_contract_for_weight_keys,
+    _prequantized_module_prefixes,
+    _stack_mtp_moe_experts,
+)
+from mtplx.constants import EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS
+
+
+class _GLMRewriteArgs:
+    n_routed_experts = 0
+
+
+def test_glm_mtp_rewrite_rejects_config_only_lm_head_payload() -> None:
+    mapped = _rewrite_glm_mtp_weights(
+        {"lm_head.weight": object()},
+        args=_GLMRewriteArgs(),
+        start_layer=47,
+        num_mtp_layers=1,
+        rewrite_mla_kv_b=False,
+    )
+
+    assert mapped == {}
+
+
+def test_glm_mtp_rewrite_shares_lm_head_only_with_real_mtp_layer_payload() -> None:
+    mapped = _rewrite_glm_mtp_weights(
+        {
+            "lm_head.weight": "head-weight",
+            "lm_head.scales": "head-scales",
+            "lm_head.biases": "head-biases",
+            "model.layers.47.enorm.weight": "enorm",
+            "model.layers.47.hnorm.weight": "hnorm",
+            "model.layers.47.eh_proj.weight": "eh-proj",
+            "model.layers.47.self_attn.q_proj.weight": "mtp-block",
+        },
+        args=_GLMRewriteArgs(),
+        start_layer=47,
+        num_mtp_layers=1,
+        rewrite_mla_kv_b=False,
+    )
+
+    assert mapped["layers.0.shared_head_head.weight"] == "head-weight"
+    assert mapped["layers.0.shared_head_head.scales"] == "head-scales"
+    assert mapped["layers.0.shared_head_head.biases"] == "head-biases"
+    assert mapped["layers.0.mtp_block.self_attn.q_proj.weight"] == "mtp-block"
 
 
 def test_mtp_contract_reads_config_quant_defaults() -> None:
@@ -25,6 +74,27 @@ def test_mtp_contract_reads_config_quant_defaults() -> None:
     assert contract.mtp_prequantized is True
 
 
+def test_mtp_contract_accepts_neutral_prequantized_int4_policy() -> None:
+    contract = MTPContract().with_config_defaults(
+        {
+            "mtplx_mtp_quantization": {
+                "policy": "prequantized-int4",
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine",
+                "prequantized": True,
+            }
+        }
+    )
+
+    contract.validate()
+
+    assert contract.mtp_quant_policy == "prequantized-int4"
+    assert contract.mtp_quant_bits == 4
+    assert contract.mtp_quant_group_size == 32
+    assert contract.mtp_prequantized is True
+
+
 def test_mtp_contract_cli_bits_override_config_bits() -> None:
     contract = MTPContract(mtp_quant_bits=8).with_config_defaults(
         {
@@ -42,6 +112,210 @@ def test_mtp_contract_cli_bits_override_config_bits() -> None:
     assert contract.mtp_quant_policy == "cyankiwi"
 
 
+def test_prequantized_mtp_config_overrides_stale_runtime_contract() -> None:
+    contract = MTPContract(mtp_quant_group_size=64).with_config_defaults(
+        {
+            "mtplx_mtp_contract": {
+                "mtp_quant_group_size": 64,
+                "mtp_quant_mode": "affine",
+            },
+            "mtplx_mtp_quantization": {
+                "policy": "cyankiwi",
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine",
+                "prequantized": True,
+            },
+        }
+    )
+
+    assert contract.mtp_quant_bits == 4
+    assert contract.mtp_quant_group_size == 32
+    assert contract.mtp_quant_policy == "cyankiwi"
+    assert contract.mtp_prequantized is True
+
+
+def test_prequantized_mtp_tensor_geometry_corrects_group_size() -> None:
+    class FakeArray:
+        def __init__(self, shape: tuple[int, ...]):
+            self.shape = shape
+
+    contract = MTPContract(
+        mtp_quant_bits=4,
+        mtp_quant_group_size=64,
+        mtp_prequantized=True,
+    )
+    weights = {
+        "layers.0.mlp.switch_mlp.gate_proj.weight": FakeArray((256, 512, 256)),
+        "layers.0.mlp.switch_mlp.gate_proj.scales": FakeArray((256, 512, 64)),
+        "layers.0.mlp.switch_mlp.gate_proj.biases": FakeArray((256, 512, 64)),
+    }
+
+    corrected = _contract_with_prequantized_tensor_geometry(contract, weights)
+
+    assert corrected.mtp_quant_group_size == 32
+
+
+def test_prequantized_mtp_module_specs_read_mixed_quant_config() -> None:
+    class FakeArray:
+        def __init__(self, shape: tuple[int, ...]):
+            self.shape = shape
+
+    contract = MTPContract(
+        mtp_quant_bits=4,
+        mtp_quant_group_size=64,
+        mtp_prequantized=True,
+    )
+    weights = {
+        "layers.0.self_attn.q_proj.weight": FakeArray((8192, 320)),
+        "layers.0.self_attn.q_proj.scales": FakeArray((8192, 16)),
+        "layers.0.self_attn.q_proj.biases": FakeArray((8192, 16)),
+        "layers.0.mlp.switch_mlp.gate_proj.weight": FakeArray((256, 512, 256)),
+        "layers.0.mlp.switch_mlp.gate_proj.scales": FakeArray((256, 512, 32)),
+        "layers.0.mlp.switch_mlp.gate_proj.biases": FakeArray((256, 512, 32)),
+    }
+    config = {
+        "quantization": {
+            "bits": 4,
+            "group_size": 64,
+            "mode": "affine",
+            "language_model.mtp.layers.0.self_attn.q_proj": {
+                "bits": 5,
+                "group_size": 128,
+                "mode": "affine",
+            },
+            "language_model.mtp.layers.0.mlp.switch_mlp.gate_proj": {
+                "bits": 4,
+                "group_size": 64,
+                "mode": "affine",
+            },
+        }
+    }
+
+    updated = _contract_with_prequantized_module_specs(contract, weights, config)
+
+    assert updated.mtp_prequantized_modules == (
+        "layers.0.mlp.switch_mlp.gate_proj",
+        "layers.0.self_attn.q_proj",
+    )
+    assert updated.mtp_prequantized_module_specs["layers.0.self_attn.q_proj"] == {
+        "bits": 5,
+        "group_size": 128,
+        "mode": "affine",
+    }
+    assert updated.to_dict()["mtp_prequantized_module_specs"][
+        "layers.0.self_attn.q_proj"
+    ]["bits"] == 5
+
+
+def test_low_mtp_norm_weights_are_not_shifted_without_delta_contract() -> None:
+    mx = pytest.importorskip("mlx.core")
+    weights = {
+        "pre_fc_norm_hidden.weight": mx.array([0.25, 0.5], dtype=mx.float32),
+        "pre_fc_norm_embedding.weight": mx.array([0.125, 0.375], dtype=mx.float32),
+    }
+
+    finalized = _finalize_mtp_weights(weights, {}, prequantized=True)
+
+    assert float(finalized["pre_fc_norm_hidden.weight"][0].item()) == pytest.approx(0.25)
+    assert float(finalized["pre_fc_norm_embedding.weight"][0].item()) == pytest.approx(0.125)
+
+
+def test_delta_encoded_mtp_norm_weights_are_restored_by_contract() -> None:
+    mx = pytest.importorskip("mlx.core")
+    weights = {
+        "pre_fc_norm_hidden.weight": mx.array([0.25, 0.5], dtype=mx.float32),
+    }
+
+    finalized = _finalize_mtp_weights(
+        weights,
+        {"mtplx_mtp_norm_encoding": "delta_plus_one"},
+        prequantized=True,
+    )
+
+    assert float(finalized["pre_fc_norm_hidden.weight"][0].item()) == pytest.approx(1.25)
+
+
 def test_mtp_contract_rejects_unknown_quant_policy() -> None:
     with pytest.raises(ValueError, match="mtp_quant_policy"):
         MTPContract(mtp_quant_policy="mystery").validate()
+
+
+def test_mtp_contract_accepts_forge_calibrated_hidden_variants() -> None:
+    contract = MTPContract().with_metadata(
+        {
+            "base_hidden_variant": "post_norm",
+            "hidden_variant": "fc",
+            "concat_order": "hidden_embedding",
+        },
+        preserve_explicit=False,
+    )
+
+    assert contract.hidden_variant == "fc"
+    assert contract.concat_order == "hidden_embedding"
+    assert contract.to_dict()["base_hidden_variant"] == "post_norm"
+
+
+def test_mtp_contract_rejects_unknown_hidden_variant() -> None:
+    with pytest.raises(ValueError, match="hidden_variant"):
+        MTPContract(hidden_variant="mystery").validate()
+
+
+def test_stack_mtp_moe_experts_stacks_quantized_numbered_experts() -> None:
+    mx = pytest.importorskip("mlx.core")
+    num_experts = 4
+    weights = {"layers.0.input_layernorm.weight": mx.ones((8,))}
+    for expert_index in range(num_experts):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            prefix = f"layers.0.mlp.experts.{expert_index}.{proj}"
+            weights[f"{prefix}.weight"] = mx.full((2, 2), float(expert_index))
+            weights[f"{prefix}.scales"] = mx.full((2, 1), float(expert_index + 1))
+            weights[f"{prefix}.biases"] = mx.full((2, 1), float(-expert_index))
+
+    stacked = _stack_mtp_moe_experts(
+        weights,
+        {"text_config": {"n_routed_experts": num_experts, "mtp_num_hidden_layers": 1}},
+    )
+
+    assert not any(".experts." in key for key in stacked)
+    gate = stacked["layers.0.mlp.switch_mlp.gate_proj.weight"]
+    assert tuple(gate.shape) == (num_experts, 2, 2)
+    assert float(gate[3, 0, 0].item()) == 3.0
+    assert tuple(stacked["layers.0.mlp.switch_mlp.down_proj.scales"].shape) == (
+        num_experts,
+        2,
+        1,
+    )
+
+
+def test_prequantized_module_prefixes_uses_only_complete_quantized_triples() -> None:
+    mx = pytest.importorskip("mlx.core")
+    weights = {
+        "layers.0.mlp.switch_mlp.gate_proj.weight": mx.ones((2, 2, 2)),
+        "layers.0.mlp.switch_mlp.gate_proj.scales": mx.ones((2, 2, 1)),
+        "layers.0.mlp.switch_mlp.gate_proj.biases": mx.ones((2, 2, 1)),
+        "layers.0.self_attn.q_proj.weight": mx.ones((2, 2)),
+    }
+
+    assert _prequantized_module_prefixes(weights) == (
+        "layers.0.mlp.switch_mlp.gate_proj",
+    )
+
+
+def test_mtp_contract_detects_prequantized_switch_moe_sidecar() -> None:
+    contract = _mtp_contract_for_weight_keys(
+        MTPContract(),
+        EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS,
+        {
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "num_experts": 256,
+                "mtp_num_hidden_layers": 1,
+                "quantization": {"bits": 4, "group_size": 64, "mode": "affine"},
+            }
+        },
+    )
+
+    assert contract.mtp_prequantized is True
+    assert contract.mtp_quant_policy == "all"
+    assert contract.mtp_quant_bits == 4

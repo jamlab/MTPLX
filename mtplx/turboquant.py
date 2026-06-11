@@ -8,7 +8,10 @@ already-loaded Metal ops, so keep this dependency-free and deliberately narrow.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+import math
 import os
+from statistics import NormalDist
 
 
 KEY_QUANTS: dict[str, dict[str, int | bool | str]] = {
@@ -46,6 +49,9 @@ CENTROIDS_3BIT = (
     1.34391,
     2.15195,
 )
+
+_NORMAL = NormalDist()
+_INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
 
 
 @dataclass(frozen=True)
@@ -112,6 +118,75 @@ def validate_head_dim(head_dim: int) -> None:
         raise ValueError(
             f"TurboQuant FWHT supports head_dim in {sorted(FWHT_SUPPORTED_HEAD_DIMS)}, got {head_dim}"
         )
+
+
+def _normal_pdf(x: float) -> float:
+    if math.isinf(x):
+        return 0.0
+    return _INV_SQRT_2PI * math.exp(-0.5 * x * x)
+
+
+def _normal_cdf(x: float) -> float:
+    if x == math.inf:
+        return 1.0
+    if x == -math.inf:
+        return 0.0
+    return _NORMAL.cdf(x)
+
+
+def _truncated_normal_mean(lo: float, hi: float) -> float:
+    mass = _normal_cdf(hi) - _normal_cdf(lo)
+    if mass <= 0.0:
+        if math.isinf(lo) and math.isinf(hi):
+            return 0.0
+        if math.isinf(lo):
+            return hi
+        if math.isinf(hi):
+            return lo
+        return 0.5 * (lo + hi)
+    return (_normal_pdf(lo) - _normal_pdf(hi)) / mass
+
+
+@lru_cache(maxsize=None)
+def value_centroids(bits: int) -> tuple[float, ...]:
+    """Return standard-normal Lloyd-Max V centroids for a TurboQuant bit width.
+
+    vLLM-Metal's TurboQuant encode and attention kernels accept arbitrary
+    ``v_bits`` in ``[1, 8]`` via a centroid buffer.  q3 keeps the upstream
+    baked table for byte-for-byte continuity; other widths use the analytic
+    Lloyd-Max update for a unit-normal source instead of an expensive sampled
+    MLX pass at cache-allocation time.
+    """
+
+    bits = int(bits)
+    if bits == 3:
+        return CENTROIDS_3BIT
+    if bits < 1 or bits > 8:
+        raise ValueError(f"TurboQuant value bits must be in [1, 8], got {bits}")
+
+    n = 1 << bits
+    centroids: list[float] = []
+    for i in range(n):
+        lo = -math.inf if i == 0 else _NORMAL.inv_cdf(i / n)
+        hi = math.inf if i == n - 1 else _NORMAL.inv_cdf((i + 1) / n)
+        centroids.append(_truncated_normal_mean(lo, hi))
+
+    tolerance = 5e-7 if bits >= 6 else 1e-8
+    for _ in range(1000):
+        boundaries = [
+            0.5 * (centroids[i] + centroids[i + 1]) for i in range(n - 1)
+        ]
+        updated = []
+        for i in range(n):
+            lo = -math.inf if i == 0 else boundaries[i - 1]
+            hi = math.inf if i == n - 1 else boundaries[i]
+            updated.append(_truncated_normal_mean(lo, hi))
+        max_delta = max(abs(a - b) for a, b in zip(updated, centroids, strict=True))
+        centroids = updated
+        if max_delta < tolerance:
+            break
+
+    return tuple(float(c) for c in centroids)
 
 
 def compression_ratio(*, head_dim: int, key_bits: int, value_bits: int) -> float:

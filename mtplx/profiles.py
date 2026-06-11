@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Mapping, MutableMapping
+from typing import Any, Mapping, MutableMapping
 
 
 ProfileName = str
@@ -24,6 +24,9 @@ PROFILE_CHOICES = (
 )
 PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
     {
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD",
         "MTPLX_MTP_HISTORY_POLICY",
         "MTPLX_VLLM_METAL_PAGED_TURBOQUANT",
         "MTPLX_VLLM_METAL_PAGED_TURBOQUANT_K_QUANT",
@@ -35,23 +38,115 @@ DEFAULT_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
 DEFAULT_FP16_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16"
 QUALITY_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality"
 LEGACY_OPTIMIZED_HF_MODEL_ID = "Youssofal/Qwen3.6-27B-MTPLX-Optimized"
+QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID = (
+    "Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed"
+)
+QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID = (
+    "Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed-FP16"
+)
+QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID = (
+    "mtplx-qwen35-9b-optimized-speed"
+)
+QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID = (
+    "mtplx-qwen35-9b-optimized-speed-fp16"
+)
+QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID = (
+    "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed"
+)
+QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID = (
+    "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16"
+)
+QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID = (
+    "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance"
+)
+QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID = (
+    "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance-FP16"
+)
+QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID = (
+    "mtplx-qwen36-35b-a3b-optimized-speed"
+)
+QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID = (
+    "mtplx-qwen36-35b-a3b-optimized-speed-fp16"
+)
+QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID = (
+    "mtplx-qwen36-35b-a3b-optimized-balance"
+)
+QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID = (
+    "mtplx-qwen36-35b-a3b-optimized-balance-fp16"
+)
 QUALITY_MODEL_ID = QUALITY_HF_MODEL_ID
 DEFAULT_MODEL_ID = DEFAULT_HF_MODEL_ID
 DEFAULT_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized-speed"
 DEFAULT_FP16_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized-speed-fp16"
 QUALITY_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized-quality"
 LEGACY_OPTIMIZED_PUBLIC_MODEL_ID = "mtplx-qwen36-27b-optimized"
-NATIVE_MTP_60_MLX_FORK_COMMIT = "2377a99f"
+# The historical 60 tok/s fork landed at 2377a99f, but the launch runtime uses
+# the reconstructed colon-free source-build mirror imported by the app daemon.
+NATIVE_MTP_60_MLX_FORK_COMMIT = "68cf2fdd"
 NATIVE_MTP_60_MLX_FORK_FRAGMENT = "mlx-mtplx-0.31.2-qmm"
 
 
 NATIVE_MTP_60_FAST_PATH_ENV = {
     "MTPLX_LAZY_VERIFY_LOGITS": "1",
     "MTPLX_BATCH_TARGET_ARRAYS": "1",
+    "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "1",
     "MTPLX_LAZY_MTP_HISTORY_APPEND": "1",
     "MTPLX_DROP_EVENTS": "1",
     "MTPLX_SKIP_VERIFY_SNAPSHOT": "1",
 }
+
+MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
+    {
+        *NATIVE_MTP_60_FAST_PATH_ENV,
+        "MTPLX_MTP_HISTORY_POLICY",
+        "MTPLX_MTP_HISTORY_LAST_WINDOW",
+        "MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH",
+        "MTPLX_CLEAR_CACHE_EVERY",
+    }
+)
+
+
+def _runtime_env_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int | float):
+        return str(value)
+    text = str(value).strip()
+    if text == "":
+        raise ValueError("runtime_env_overrides values must not be empty")
+    return text
+
+
+def normalize_runtime_env_overrides(raw: Any) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("runtime_env_overrides must be an object")
+    normalized: dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key).strip()
+        if name not in MODEL_RUNTIME_ENV_OVERRIDE_KEYS:
+            raise ValueError(f"runtime_env_overrides has unsupported key: {name}")
+        normalized[name] = _runtime_env_value(value)
+    return normalized
+
+
+def runtime_env_overrides_from_contract(contract: Mapping[str, Any] | None) -> dict[str, str]:
+    if not isinstance(contract, Mapping):
+        return {}
+    return normalize_runtime_env_overrides(contract.get("runtime_env_overrides"))
+
+
+def runtime_env_with_contract_overrides(
+    runtime_env: Mapping[str, str],
+    contract: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    merged = dict(runtime_env)
+    merged.update(runtime_env_overrides_from_contract(contract))
+    return merged
 
 EXACT_PAGED_ATTENTION_ENV = {
     "MTPLX_VLLM_METAL_PAGED_ATTN": "1",
@@ -94,10 +189,14 @@ SUSTAINED_PREFILL_ENV = {
     "MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS": "0",
     "MTPLX_DEFER_VERIFY_HIDDEN_EVAL": "1",
     "MTPLX_VERIFY_HIDDEN_MODE": "logits_first_committed_slice",
-    "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY": "auto",
+    "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY": "off",
     "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD": "98304",
-    "MTPLX_LONG_CONTEXT_MTP_DEPTH": "2",
-    "MTPLX_MTP_HISTORY_POLICY": "auto",
+    "MTPLX_LONG_CONTEXT_MTP_DEPTH": "3",
+    # Real OpenCode/Pi app runs showed that the 16k auto flip to an 8k
+    # MTP-history window can crater acceptance and long-context decode speed.
+    # Keep the full committed history in the product path; "auto" remains an
+    # explicit diagnostic override.
+    "MTPLX_MTP_HISTORY_POLICY": "committed",
     "MTPLX_MTP_HISTORY_LAST_WINDOW": "8192",
     "MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD": "16384",
     "MTPLX_DYNAMIC_PAGED_KV": "1",
@@ -134,11 +233,11 @@ def resolve_long_context_mtp_depth(
     min_depth: int = 1,
     env: Mapping[str, str] | MutableMapping[str, str] | None = None,
 ) -> tuple[int, dict[str, object]]:
-    """Resolve Sustained's context-aware MTP depth cap.
+    """Resolve Sustained's optional context-aware MTP depth cap.
 
-    Depth 3 is still the default because it wins at short and mid context. On the
-    M5 Max 128k path, depth 2 recovered decode while preserving exact speculative
-    sampling. This helper keeps that product policy explicit and observable.
+    Product mode currently leaves the cap disabled so a D3 request remains D3 at
+    long context. The helper stays in place only as an explicit diagnostic
+    switch; it must never silently downgrade the native app/OpenCode path.
     """
 
     source = os.environ if env is None else env
@@ -398,13 +497,19 @@ def apply_profile_env(
     name: str | None,
     *,
     environ: MutableMapping[str, str] | None = None,
+    runtime_env_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, str | None]:
     target = os.environ if environ is None else environ
     profile = get_profile(name)
-    previous = {key: target.get(key) for key in profile.env_dict()}
+    overrides = normalize_runtime_env_overrides(runtime_env_overrides)
+    expected = profile.env_dict()
+    expected.update(overrides)
+    previous = {key: target.get(key) for key in expected}
     for key, value in profile.env:
         if key in PROFILE_ENV_USER_OVERRIDE_KEYS and str(target.get(key) or "").strip():
             continue
+        target[key] = value
+    for key, value in overrides.items():
         target[key] = value
     return previous
 
@@ -426,19 +531,22 @@ def profile_env_status(
     name: str | None,
     *,
     environ: Mapping[str, str] | None = None,
+    runtime_env_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, object]]:
     target = os.environ if environ is None else environ
     profile = get_profile(name)
+    expected_env = profile.env_dict()
+    expected_env.update(normalize_runtime_env_overrides(runtime_env_overrides))
     return {
         key: {
-            "expected": expected,
+            "expected": expected_value,
             "observed": target.get(key),
             "override_allowed": key in PROFILE_ENV_USER_OVERRIDE_KEYS,
-            "ok": target.get(key) == expected
+            "ok": target.get(key) == expected_value
             or (
                 key in PROFILE_ENV_USER_OVERRIDE_KEYS
                 and bool(str(target.get(key) or "").strip())
             ),
         }
-        for key, expected in profile.env
+        for key, expected_value in expected_env.items()
     }

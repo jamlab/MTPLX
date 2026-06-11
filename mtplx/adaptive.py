@@ -87,6 +87,8 @@ class ExpectedValueDepthPolicy:
     margin_scale: float = 2.0
     confidence_weight: float = 0.35
     min_extra_accept_probability: float = 0.18
+    warmup_full_depth_cycles: int = 4
+    exploration_interval: int = 32
 
     wants_draft_metrics: bool = True
 
@@ -107,12 +109,18 @@ class ExpectedValueDepthPolicy:
             raise ValueError("cost estimates must be non-negative")
         if self.baseline_tok_s <= 0.0:
             raise ValueError("baseline_tok_s must be > 0")
+        if self.warmup_full_depth_cycles < 0:
+            raise ValueError("warmup_full_depth_cycles must be >= 0")
+        if self.exploration_interval < 0:
+            raise ValueError("exploration_interval must be >= 0")
         self.current_depth = self.max_depth
         priors = list(self.accept_priors)
         if len(priors) < self.max_depth:
             priors.extend([priors[-1] if priors else 0.5] * (self.max_depth - len(priors)))
         self._accept_ewma = [_clamp(float(value), 0.0, 1.0) for value in priors[: self.max_depth]]
         self._last_continue_decision: dict[str, int | float | bool | str] | None = None
+        self._cycles_observed = 0
+        self._attempt_counts = [0 for _ in range(self.max_depth)]
 
     def should_continue_after_draft(
         self,
@@ -141,6 +149,20 @@ class ExpectedValueDepthPolicy:
                 "action": "stop",
                 "reason": "beyond_max_depth",
                 "drafted_depth": drafted_depth,
+            }
+            self._last_continue_decision = decision
+            return decision
+
+        exploration_reason = self._exploration_reason(next_depth)
+        if exploration_reason is not None:
+            decision = {
+                "continue": True,
+                "action": "continue",
+                "reason": exploration_reason,
+                "drafted_depth": drafted_depth,
+                "next_depth": next_depth,
+                "cycles_observed": self._cycles_observed,
+                "attempted_next_depth": self._attempt_counts[next_depth - 1],
             }
             self._last_continue_decision = decision
             return decision
@@ -182,7 +204,9 @@ class ExpectedValueDepthPolicy:
         """Update EWMAs from one cycle outcome and return a loggable decision."""
         attempted_depth = max(1, min(int(attempted_depth), self.max_depth))
         accepted_depths = max(0, min(int(accepted_depths), attempted_depth))
+        self._cycles_observed += 1
         for index in range(attempted_depth):
+            self._attempt_counts[index] += 1
             accepted = 1.0 if accepted_depths > index else 0.0
             self._accept_ewma[index] = (
                 (1.0 - self.ewma_alpha) * self._accept_ewma[index]
@@ -196,7 +220,23 @@ class ExpectedValueDepthPolicy:
             "action": "update_ewma",
             "accept_ewma": [float(v) for v in self._accept_ewma],
             "last_continue_decision": self._last_continue_decision,
+            "cycles_observed": self._cycles_observed,
+            "attempt_counts": list(self._attempt_counts),
         }
+
+    def _exploration_reason(self, next_depth: int) -> str | None:
+        """Avoid self-locking before the policy has measured deeper drafts."""
+        if self._cycles_observed < self.warmup_full_depth_cycles:
+            return "warmup_full_depth"
+        if self._attempt_counts[next_depth - 1] == 0:
+            return "unobserved_depth"
+        if (
+            self.exploration_interval > 0
+            and self._cycles_observed > 0
+            and self._cycles_observed % self.exploration_interval == 0
+        ):
+            return "exploration_interval"
+        return None
 
     def _confidence_factor(self, draft_metrics: dict) -> float:
         margin = draft_metrics.get("top2_margin")

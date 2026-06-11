@@ -21,7 +21,7 @@ Endpoints:
 Binding to a non-localhost host requires an API key:
 
 ```bash
-mtplx serve --host 0.0.0.0 --port 8000 --api-key "$MTPLX_AUTH"
+mtplx serve --host 0.0.0.0 --port 8000 --api-key "$MTPLX_API_KEY"
 ```
 
 For Open WebUI, set the OpenAI-compatible base URL to:
@@ -35,6 +35,9 @@ For Dockerized Open WebUI, the container must use the host gateway URL, not the 
 ```bash
 mtplx openwebui docker-command
 ```
+
+That helper disables Open WebUI's Ollama probe and background task generations
+so MTPLX only serves visible chat turns by default.
 
 For Anthropic Messages-compatible clients, point the client base URL at the
 same local server root:

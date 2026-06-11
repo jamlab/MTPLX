@@ -24,6 +24,12 @@ from mtplx.profiles import (
     DEFAULT_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
     QUALITY_PUBLIC_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
 )
 
 
@@ -251,6 +257,32 @@ def test_public_model_id_for_ref_maps_gdn8_metadata_to_legacy_optimized(tmp_path
     assert public_model_id_for_ref(model) == LEGACY_OPTIMIZED_PUBLIC_MODEL_ID
 
 
+def test_public_model_id_for_ref_does_not_map_small_speed_role_to_27b(tmp_path):
+    model = tmp_path / "Qwen3.5-4B-MTPLX-Optimized-Speed"
+    model.mkdir()
+    (model / "mtplx_runtime.json").write_text(
+        json.dumps(
+            {
+                "artifact_role": "small-q4-speed-test",
+                "verified_on": {"model": "Qwen3.5-4B-MTPLX-Optimized-Speed"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3ForCausalLM"],
+                "model_type": "qwen3_5",
+                "quantization": {"bits": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert public_model_id_for_ref(model) == "qwen3.5-4b-mtplx-optimized-speed"
+
+
 def test_public_model_id_for_ref_maps_mixed_q4_speed_metadata_to_speed(tmp_path):
     model = tmp_path / "Qwen3.6-27B-MTPLX-Optimized"
     model.mkdir()
@@ -287,6 +319,110 @@ def test_public_model_id_for_ref_maps_flat8_metadata_to_quality(tmp_path):
     )
 
     assert public_model_id_for_ref(model) == QUALITY_PUBLIC_MODEL_ID
+
+
+def test_public_model_id_for_ref_keeps_qwen36_35b_identity(tmp_path):
+    model = tmp_path / "Qwen3.6-35B-A3B-MTPLX-Official4-CyanKiwiMTP-CleanRecipe"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3NextForCausalLM"],
+                "model_type": "qwen3_next",
+                "quantization": {
+                    "bits": 4,
+                    "language_model.model.layers.0.mlp.down_proj": {"bits": 4},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert public_model_id_for_ref(model) == QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_id"),
+    [
+        (
+            "Qwen3.5-9B-MTPLX-Optimized-Speed",
+            QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        ),
+        (
+            "Qwen-Qwen3.5-9B-MTPLX-Speed-6bit-OfficialCLI",
+            QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        ),
+        (
+            "Qwen3.5-9B-MTPLX-Optimized-Speed-FP16",
+            QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+        ),
+        (
+            "Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16",
+            QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+        ),
+        (
+            "Qwen3.6-35B-A3B-MTPLX-Optimized-Balance",
+            QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID,
+        ),
+        (
+            "Qwen3.6-35B-A3B-MTPLX-Optimized-Balance-FP16",
+            QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID,
+        ),
+    ],
+)
+def test_public_model_id_for_ref_maps_release_catalog_names(name, expected_id, tmp_path):
+    model = tmp_path / name
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3NextForCausalLM"],
+                "model_type": "qwen3_next",
+                "quantization": {"bits": 6},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert public_model_id_for_ref(model) == expected_id
+
+
+def test_public_model_id_for_ref_does_not_map_custom_qwen_to_27b(tmp_path):
+    model = tmp_path / "Acme-Qwen3.6-Custom-MTP-Speed"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3NextForCausalLM"],
+                "model_type": "qwen3_next",
+                "quantization": {"bits": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert public_model_id_for_ref(model) == "acme-qwen3.6-custom-mtp-speed"
+
+
+def test_public_model_id_for_ref_does_not_map_step_quantization_to_qwen(tmp_path):
+    model = tmp_path / "Step-3.7-Flash-MTPLX-step3p5"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Step3p5ForCausalLM"],
+                "model_type": "step3p5",
+                "quantization": {
+                    "bits": 4,
+                    "language_model.model.layers.0.mlp.down_proj": {"bits": 8},
+                    "language_model.model.layers.0.linear_attn.in_proj_qkv": {"bits": 8},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert public_model_id_for_ref(model) == "step-3.7-flash-mtplx-step3p5"
 
 
 def test_public_model_id_for_ref_maps_unknown_local_name_to_sanitized_id():

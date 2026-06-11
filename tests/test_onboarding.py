@@ -69,8 +69,12 @@ def test_interface_label_covers_all_targets():
 
 
 def test_run_onboarding_screens_with_stubbed_input(monkeypatch, capsys):
-    """Walk all three screens with stubbed ``input`` answers."""
-    answers = iter(["1", "1", "1"])
+    """Walk all four screens with stubbed ``input`` answers.
+
+    Screens: model, mode, interface, dashboard-companion (only asked for
+    server-spawning targets; openwebui is one of them).
+    """
+    answers = iter(["1", "1", "1", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     expected_model = onboarding._verified_default_model()
 
@@ -79,11 +83,13 @@ def test_run_onboarding_screens_with_stubbed_input(monkeypatch, capsys):
     assert state["profile"] == "sustained"
     assert state["max"] is False
     assert state["target"] == "openwebui"
+    assert state["open_dashboard"] is False
 
 
 def test_run_onboarding_screens_uses_fp16_default_when_policy_selects_it(monkeypatch):
     monkeypatch.setenv("MTPLX_DEFAULT_MODEL_VARIANT", "fp16")
-    answers = iter(["1", "1", "1"])
+    # 4 answers: model + mode + interface (openwebui) + dashboard companion.
+    answers = iter(["1", "1", "1", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
 
     state = onboarding.run_onboarding_screens()
@@ -116,7 +122,8 @@ def test_run_onboarding_fan_mode_falls_back_to_sustained_when_thermal_unavailabl
 
 
 def test_run_onboarding_sustained_mode_is_explicit(monkeypatch):
-    answers = iter(["1", "1", "1"])
+    # openwebui target → dashboard companion prompt fires; answer "No" (2).
+    answers = iter(["1", "1", "1", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
 
     state = onboarding.run_onboarding_screens()
@@ -127,7 +134,7 @@ def test_run_onboarding_sustained_mode_is_explicit(monkeypatch):
 
 
 def test_run_onboarding_can_select_pi(monkeypatch):
-    answers = iter(["1", "1", "3"])
+    answers = iter(["1", "1", "3", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
 
     state = onboarding.run_onboarding_screens()
@@ -135,10 +142,11 @@ def test_run_onboarding_can_select_pi(monkeypatch):
     assert state["profile"] == "sustained"
     assert state["max"] is False
     assert state["target"] == "pi"
+    assert state["open_dashboard"] is False
 
 
 def test_run_onboarding_can_select_opencode(monkeypatch):
-    answers = iter(["1", "1", "4"])
+    answers = iter(["1", "1", "4", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
 
     state = onboarding.run_onboarding_screens()
@@ -146,6 +154,43 @@ def test_run_onboarding_can_select_opencode(monkeypatch):
     assert state["profile"] == "sustained"
     assert state["max"] is False
     assert state["target"] == "opencode"
+    assert state["open_dashboard"] is False
+
+
+def test_run_onboarding_opencode_can_open_dashboard_companion(monkeypatch):
+    """User picks OpenCode AND yes to the dashboard companion."""
+    answers = iter(["1", "1", "4", "1"])
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    state = onboarding.run_onboarding_screens()
+
+    assert state["target"] == "opencode"
+    assert state["open_dashboard"] is True
+
+
+def test_run_onboarding_terminal_skips_dashboard_companion(monkeypatch):
+    """Terminal/CLI target has no server, so no dashboard companion prompt."""
+    # Only 3 answers: model, mode, interface (terminal). No 4th input
+    # consumed since terminal target skips the companion question.
+    answers = iter(["1", "1", "2"])
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    state = onboarding.run_onboarding_screens()
+
+    assert state["target"] == "terminal"
+    assert state["open_dashboard"] is False
+
+
+def test_run_onboarding_dashboard_target_skips_companion(monkeypatch):
+    """Picking 'Live Dashboard' as the target skips the companion prompt."""
+    answers = iter(["1", "1", "6"])
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    state = onboarding.run_onboarding_screens()
+
+    assert state["target"] == "dashboard"
+    # The companion question is only for non-dashboard server targets.
+    assert state["open_dashboard"] is False
 
 
 def test_run_serve_onboarding_screens_defaults_to_api_server(monkeypatch):
@@ -160,11 +205,15 @@ def test_run_serve_onboarding_screens_defaults_to_api_server(monkeypatch):
 
 
 def test_run_serve_onboarding_screens_can_open_browser(monkeypatch):
-    answers = iter(["1", "1", "2"])
+    # 4 answers: model + mode + server-surface (open chat=2) + dashboard
+    # companion (No=2). When server-surface is "Open browser chat too",
+    # the dashboard companion is asked too.
+    answers = iter(["1", "1", "2", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     state = onboarding.run_serve_onboarding_screens(host="127.0.0.1", port=8765)
     assert state["target"] == "openwebui"
     assert state["open_browser"] is True
+    assert state["open_dashboard"] is False
 
 
 def test_run_serve_flow_does_not_reuse_quickstart_state(tmp_path, monkeypatch):
@@ -369,7 +418,8 @@ def test_run_quickstart_flow_legacy_stable_state_is_not_reused(tmp_path, monkeyp
             "target": "terminal",
         }
     )
-    answers = iter(["1", "1", "1"])
+    # 4 answers: model + mode + interface (openwebui) + dashboard companion (No).
+    answers = iter(["1", "1", "1", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     state = onboarding.run_quickstart_flow(fresh=False)
     assert state is not None
@@ -421,7 +471,8 @@ def test_run_quickstart_flow_returning_user_says_no(tmp_path, monkeypatch):
             "target": "terminal",
         }
     )
-    answers = iter(["n", "1", "1", "1"])  # 'n' → walk onboarding again
+    # 'n' → walk onboarding again, then 4 screens (model + mode + openwebui + dashboard).
+    answers = iter(["n", "1", "1", "1", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     state = onboarding.run_quickstart_flow(fresh=False)
     assert state is not None
@@ -553,8 +604,9 @@ def test_run_quickstart_flow_fresh_skips_returning_prompt(tmp_path, monkeypatch)
             "target": "terminal",
         }
     )
-    # With fresh=True we go straight to the onboarding screens; only 3 inputs.
-    answers = iter(["1", "1", "1"])
+    # With fresh=True we go straight to the onboarding screens; 4 inputs
+    # (model + mode + interface + dashboard-companion).
+    answers = iter(["1", "1", "1", "2"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
     state = onboarding.run_quickstart_flow(fresh=True)
     assert state is not None
@@ -613,8 +665,19 @@ def test_start_invokes_onboarding_when_no_explicit_flags(tmp_path, monkeypatch):
 
     invocations: list[dict] = []
 
-    def fake_flow(*, fresh: bool = False, configured_model: str | None = None):
-        invocations.append({"fresh": fresh, "configured_model": configured_model})
+    def fake_flow(
+        *,
+        fresh: bool = False,
+        configured_model: str | None = None,
+        open_dashboard_override: bool | None = None,
+    ):
+        invocations.append(
+            {
+                "fresh": fresh,
+                "configured_model": configured_model,
+                "open_dashboard_override": open_dashboard_override,
+            }
+        )
         return {
             "model": "mtplx/onboarded",
             "profile": "stable",
@@ -1030,3 +1093,162 @@ def test_quickstart_explicit_depth_never_uses_tuning(monkeypatch):
     )
 
     assert args.depth == 2
+
+
+# ---------- app-aware model step + attach offer ------------------------------
+def _write_installed_model(root: Path, name: str) -> Path:
+    target = root / name
+    target.mkdir(parents=True)
+    (target / "config.json").write_text("{}", encoding="utf-8")
+    (target / "model.safetensors").write_bytes(b"weights")
+    return target
+
+
+def test_screen_model_lists_installed_models_first(tmp_path, monkeypatch):
+    from mtplx.model_catalog import scan_installed_models
+
+    cache = tmp_path / "models"
+    speed = _write_installed_model(
+        cache, "Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed"
+    )
+    installed = scan_installed_models(cache)
+    assert installed
+
+    answers = iter(["1"])
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    chosen = onboarding.screen_model(configured=None, installed=installed)
+
+    assert chosen == str(speed)
+
+
+def test_screen_model_preselects_app_model_when_installed(tmp_path, monkeypatch, capsys):
+    from mtplx.model_catalog import scan_installed_models
+
+    cache = tmp_path / "models"
+    _write_installed_model(cache, "Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed")
+    quality = _write_installed_model(
+        cache, "Youssofal--Qwen3.6-27B-MTPLX-Optimized-Quality"
+    )
+    installed = scan_installed_models(cache)
+    assert len(installed) == 2
+
+    answers = iter([""])  # accept default
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    chosen = onboarding.screen_model(
+        configured=None,
+        installed=installed,
+        app_model="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality",
+    )
+
+    assert chosen == str(quality)
+    output = capsys.readouterr().out
+    assert "installed" in output
+
+
+def test_screen_model_keeps_legacy_numbering_without_installed(monkeypatch):
+    answers = iter(["2"])
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    chosen = onboarding.screen_model(configured=None, installed=[])
+
+    assert chosen == onboarding.optimized_quality_model_ref()
+
+
+def test_returning_user_can_pick_same_as_the_app(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_QUICKSTART_STATE", str(tmp_path / "app-option.json"))
+    app_settings = tmp_path / "app-settings.json"
+    app_settings.write_text(
+        json.dumps({"model": "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MTPLX_APP_SETTINGS_PATH", str(app_settings))
+    onboarding.save_state(
+        {
+            "model": "mtplx/foo",
+            "profile": "sustained",
+            "max": False,
+            "target": "pi",
+        }
+    )
+    answers = iter(["2"])  # pick "Same as the MTPLX app"
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    state = onboarding.run_quickstart_flow(fresh=False)
+
+    assert state is not None
+    assert state["model"] == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality"
+    assert state["target"] == "pi"
+    persisted = onboarding.load_state()
+    assert persisted is not None
+    assert persisted["model"] == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality"
+
+
+def test_returning_user_keeps_yes_no_prompt_without_app_settings(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MTPLX_QUICKSTART_STATE", str(tmp_path / "no-app.json"))
+    onboarding.save_state(
+        {
+            "model": "mtplx/foo",
+            "profile": "sustained",
+            "max": False,
+            "target": "pi",
+        }
+    )
+    answers = iter([""])  # default Y on the legacy confirm
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    state = onboarding.run_quickstart_flow(fresh=False)
+
+    assert state is not None
+    assert state["model"] == "mtplx/foo"
+
+
+def test_quickstart_flow_offers_attach_when_daemon_running(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_QUICKSTART_STATE", str(tmp_path / "attach.json"))
+    from types import SimpleNamespace
+
+    daemon = SimpleNamespace(
+        host="127.0.0.1",
+        port=8000,
+        model="mtplx-test-model",
+        owned_by_app=True,
+    )
+    monkeypatch.setattr(onboarding, "_detect_running_daemon", lambda: daemon)
+    answers = iter(["1"])  # take the attach offer
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    state = onboarding.run_quickstart_flow(fresh=False)
+
+    assert state == {
+        "attach": {
+            "host": "127.0.0.1",
+            "port": 8000,
+            "model": "mtplx-test-model",
+            "owned_by_app": True,
+        }
+    }
+
+
+def test_quickstart_flow_attach_declined_continues_to_setup(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_QUICKSTART_STATE", str(tmp_path / "attach-no.json"))
+    from types import SimpleNamespace
+
+    daemon = SimpleNamespace(
+        host="127.0.0.1",
+        port=8000,
+        model="mtplx-test-model",
+        owned_by_app=False,
+    )
+    monkeypatch.setattr(onboarding, "_detect_running_daemon", lambda: daemon)
+    # Decline attach (2), then walk model + mode + interface + companion.
+    answers = iter(["2", "1", "1", "1", "2"])
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    state = onboarding.run_quickstart_flow(fresh=False)
+
+    assert state is not None
+    assert "attach" not in state
+    assert state["model"] == onboarding._verified_default_model()

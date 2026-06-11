@@ -12,16 +12,44 @@ from pathlib import Path
 from typing import Any
 
 
-def _run(args: list[str], cwd: Path | None = None) -> str:
+def _run_checked(args: list[str], cwd: Path | None = None) -> tuple[int, str]:
     try:
-        return subprocess.check_output(
+        completed = subprocess.run(
             args,
             cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-        ).strip()
+            check=False,
+        )
+        return completed.returncode, completed.stdout.strip()
     except Exception as exc:  # pragma: no cover - depends on host tools
-        return f"ERROR: {exc}"
+        return 1, str(exc)
+
+
+def _run(args: list[str], cwd: Path | None = None) -> str:
+    code, output = _run_checked(args, cwd=cwd)
+    if code == 0:
+        return output
+    return f"ERROR: {output}"
+
+
+def _git_snapshot(root: Path) -> tuple[str, str]:
+    code, inside = _run_checked(["git", "rev-parse", "--is-inside-work-tree"], cwd=root)
+    if code != 0 or inside.strip().lower() != "true":
+        return "not a git worktree", "not a git worktree"
+
+    branch_code, branch = _run_checked(["git", "branch", "--show-current"], cwd=root)
+    if branch_code != 0:
+        branch = "unknown"
+    elif not branch:
+        head_code, head = _run_checked(["git", "rev-parse", "--short", "HEAD"], cwd=root)
+        branch = f"detached {head}" if head_code == 0 and head else "detached HEAD"
+
+    status_code, status = _run_checked(["git", "status", "--short", "--branch"], cwd=root)
+    if status_code != 0 or not status:
+        status = "git status unavailable"
+    return branch, status
 
 
 def _mlx_info() -> dict[str, Any]:
@@ -80,13 +108,14 @@ class EnvironmentSnapshot:
 
 def collect_environment(project_root: Path | str = ".") -> EnvironmentSnapshot:
     root = Path(project_root).resolve()
+    git_branch, git_status = _git_snapshot(root)
     return EnvironmentSnapshot(
         project_root=str(root),
         python_executable=sys.executable,
         python_version=sys.version,
         platform=platform.platform(),
-        git_branch=_run(["git", "branch", "--show-current"], cwd=root),
-        git_status=_run(["git", "status", "--short", "--branch"], cwd=root),
+        git_branch=git_branch,
+        git_status=git_status,
         hf_path=shutil.which("hf"),
         uv_path=shutil.which("uv"),
         mlx=_mlx_info(),

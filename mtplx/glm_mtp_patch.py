@@ -162,11 +162,12 @@ def _rewrite_glm_mtp_weights(
     rewrite_mla_kv_b: bool,
 ) -> dict[str, Any]:
     mapped: dict[str, Any] = {}
+    shared_lm_head: dict[str, Any] = {}
     for key, value in raw.items():
         if "rotary_emb.inv_freq" in key:
             continue
-        if key == "lm_head.weight":
-            mapped.setdefault("layers.0.shared_head_head.weight", value)
+        if key in {"lm_head.weight", "lm_head.scales", "lm_head.biases"}:
+            shared_lm_head[key.removeprefix("lm_head.")] = value
             continue
         if key.startswith("mtp."):
             mapped[key.removeprefix("mtp.")] = value
@@ -199,8 +200,35 @@ def _rewrite_glm_mtp_weights(
         if rewrite_mla_kv_b:
             _rewrite_kv_b_projection(mapped, block_prefix, args)
         _stack_moe_experts(mapped, block_prefix, args)
+        if f"layers.{local_idx}.shared_head_head.weight" not in mapped:
+            for leaf, value in shared_lm_head.items():
+                mapped[f"layers.{local_idx}.shared_head_head.{leaf}"] = value
+
+    if not _has_complete_glm_mtp_payload(mapped, num_mtp_layers=num_mtp_layers):
+        return {}
 
     return mapped
+
+
+def _has_complete_glm_mtp_payload(
+    weights: dict[str, Any],
+    *,
+    num_mtp_layers: int,
+) -> bool:
+    """Return true only when every declared GLM MTP layer has real layer weights."""
+
+    for local_idx in range(num_mtp_layers):
+        prefix = f"layers.{local_idx}."
+        required = (
+            f"{prefix}enorm.weight",
+            f"{prefix}hnorm.weight",
+            f"{prefix}eh_proj.weight",
+        )
+        if not all(key in weights for key in required):
+            return False
+        if not any(key.startswith(f"{prefix}mtp_block.") for key in weights):
+            return False
+    return True
 
 
 def _quantize_for_loaded_weights(mtp: Any, config: dict[str, Any], weights: dict[str, Any]) -> None:

@@ -61,23 +61,47 @@ class SpecDecodeGraphBank:
         self.stats = GraphBankStats()
         self._compiled: dict[tuple[str, int, tuple[int, ...]], Any] = {}
 
-    def forward_ar(self, input_ids, *, cache=None, return_hidden: bool = True):
+    def forward_ar(
+        self,
+        input_ids,
+        *,
+        cache=None,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+    ):
         return self._forward(
             "forward",
             input_ids,
             cache=cache,
             return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
         )
 
-    def forward_ar_capture(self, input_ids, *, cache=None, return_hidden: bool = True):
+    def forward_ar_capture(
+        self,
+        input_ids,
+        *,
+        cache=None,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+    ):
         return self._forward(
             "capture",
             input_ids,
             cache=cache,
             return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
         )
 
-    def _forward(self, kind: str, input_ids, *, cache=None, return_hidden: bool = True):
+    def _forward(
+        self,
+        kind: str,
+        input_ids,
+        *,
+        cache=None,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+    ):
         started = time.perf_counter()
         self.stats.calls += 1
         length = _decode_length(input_ids)
@@ -88,12 +112,13 @@ class SpecDecodeGraphBank:
                 input_ids,
                 cache=cache,
                 return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
                 reason=reason,
                 started=started,
             )
 
         try:
-            key = (kind, length, _cache_container_signature(cache))
+            key = (kind, length, str(hidden_variant or ""), _cache_container_signature(cache))
             fn = self._compiled.get(key)
             if fn is None:
                 if kind == "capture":
@@ -101,12 +126,14 @@ class SpecDecodeGraphBank:
                         length,
                         cache=cache,
                         return_hidden=return_hidden,
+                        hidden_variant=hidden_variant,
                     )
                 else:
                     fn = self._compile_length(
                         length,
                         cache=cache,
                         return_hidden=return_hidden,
+                        hidden_variant=hidden_variant,
                     )
                 self._compiled[key] = fn
             result = fn(input_ids)
@@ -121,6 +148,7 @@ class SpecDecodeGraphBank:
                 input_ids,
                 cache=cache,
                 return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
                 reason=f"compile_error:{key}",
                 started=started,
             )
@@ -148,10 +176,10 @@ class SpecDecodeGraphBank:
         data["allow_python_cache_capture"] = self.allow_python_cache_capture
         data["promote_tensor_offsets"] = self.promote_tensor_offsets
         data["capture_backend"] = self.capture_backend
-        data["compiled_lengths"] = sorted({length for _, length, _ in self._compiled})
+        data["compiled_lengths"] = sorted({length for _, length, _, _ in self._compiled})
         data["compiled_paths"] = [
             f"{kind}:{length}"
-            for kind, length in sorted({(kind, length) for kind, length, _ in self._compiled})
+            for kind, length in sorted({(kind, length) for kind, length, _, _ in self._compiled})
         ]
         data["compiled_entry_count"] = len(self._compiled)
         return data
@@ -187,6 +215,7 @@ class SpecDecodeGraphBank:
         *,
         cache,
         return_hidden: bool,
+        hidden_variant: str | None,
         reason: str,
         started: float,
     ):
@@ -197,21 +226,35 @@ class SpecDecodeGraphBank:
                 input_ids,
                 cache=cache,
                 return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
             )
         else:
             result = self.runtime.forward_ar(
                 input_ids,
                 cache=cache,
                 return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
             )
         self.stats.elapsed_s += time.perf_counter() - started
         return result
 
-    def _compile_length(self, length: int, *, cache: Any, return_hidden: bool):
+    def _compile_length(
+        self,
+        length: int,
+        *,
+        cache: Any,
+        return_hidden: bool,
+        hidden_variant: str | None,
+    ):
         def verify_fn(input_ids):
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
-            return self.runtime.forward_ar(input_ids, cache=cache, return_hidden=return_hidden)
+            return self.runtime.forward_ar(
+                input_ids,
+                cache=cache,
+                return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
+            )
 
         return mx.compile(
             verify_fn,
@@ -219,7 +262,14 @@ class SpecDecodeGraphBank:
             outputs=cache_array_tree(cache),
         )
 
-    def _compile_capture_length(self, length: int, *, cache: Any, return_hidden: bool):
+    def _compile_capture_length(
+        self,
+        length: int,
+        *,
+        cache: Any,
+        return_hidden: bool,
+        hidden_variant: str | None,
+    ):
         def verify_fn(input_ids):
             if _decode_length(input_ids) != length:
                 raise ValueError("compiled verify length mismatch")
@@ -227,6 +277,7 @@ class SpecDecodeGraphBank:
                 input_ids,
                 cache=cache,
                 return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
             )
 
         return mx.compile(
@@ -235,18 +286,27 @@ class SpecDecodeGraphBank:
             outputs=cache_array_tree(cache),
         )
 
-    def _runtime_forward_ar_capture(self, input_ids, *, cache=None, return_hidden: bool = True):
+    def _runtime_forward_ar_capture(
+        self,
+        input_ids,
+        *,
+        cache=None,
+        return_hidden: bool = True,
+        hidden_variant: str | None = None,
+    ):
         if self._capture_accepts_backend:
             return self.runtime.forward_ar_capture(
                 input_ids,
                 cache=cache,
                 return_hidden=return_hidden,
+                hidden_variant=hidden_variant,
                 capture_backend=self.capture_backend,
             )
         return self.runtime.forward_ar_capture(
             input_ids,
             cache=cache,
             return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
         )
 
 

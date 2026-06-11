@@ -203,6 +203,34 @@ def required_download_free_bytes(model_size_bytes: int = DEFAULT_SPEED_MODEL_SIZ
     return max(int(model_size_bytes * 2.5), int(model_size_bytes + 20 * GIB))
 
 
+def _startup_default_model_observed(
+    *,
+    model_cache: str | Path | None,
+    include_startup_default_model: bool,
+) -> dict[str, Any] | None:
+    if not include_startup_default_model:
+        return None
+    try:
+        from mtplx.default_models import optimized_speed_model_ref
+    except Exception:
+        return None
+    try:
+        model_ref = str(optimized_speed_model_ref())
+    except Exception:
+        return None
+    if not model_ref or model_ref == DEFAULT_HF_MODEL_ID:
+        return None
+    path = Path(model_ref).expanduser()
+    if not path.is_dir():
+        return None
+    validation = validate_mtplx_model_files(path)
+    return {
+        "path": str(path),
+        "validation": validation,
+        "ok": bool(validation.get("ok")),
+    }
+
+
 def _port_open(host: str, port: int) -> bool:
     try:
         with socket.create_connection((host, int(port)), timeout=0.25):
@@ -214,6 +242,7 @@ def _port_open(host: str, port: int) -> bool:
 def build_diagnostic_checks(
     *,
     model_cache: str | Path | None = None,
+    include_startup_default_model: bool = True,
     deep: bool = False,
     server_port: int = 8000,
     openwebui_port: int = 3000,
@@ -322,18 +351,38 @@ def build_diagnostic_checks(
     )
     default_cached = cached_model_path(DEFAULT_HF_MODEL_ID, cache_dir=cache_root)
     default_validation = validate_mtplx_model_files(default_cached) if default_cached.exists() else None
+    startup_default = _startup_default_model_observed(
+        model_cache=model_cache,
+        include_startup_default_model=include_startup_default_model,
+    )
+    cache_ok = bool(default_validation and default_validation.get("ok"))
+    startup_default_ok = bool(startup_default and startup_default.get("ok"))
+    if cache_ok:
+        model_cache_status = "pass"
+        model_cache_fix = "No action needed."
+    elif startup_default_ok:
+        model_cache_status = "pass"
+        model_cache_fix = (
+            "No first-run action needed; the normal startup path has a complete "
+            "local model. Run the pull command only if you want to repair the "
+            "partial Hugging Face cache copy."
+        )
+    else:
+        model_cache_status = "warn"
+        model_cache_fix = "Download the default model before first run."
     checks.append(
         DiagnosticCheck(
             "model.cache",
-            "pass" if default_validation and default_validation.get("ok") else "warn",
+            model_cache_status,
             "warning",
             {
-                "path": str(default_cached),
-                "exists": default_cached.exists(),
-                "validation": default_validation,
+                "hf_cache_path": str(default_cached),
+                "hf_cache_exists": default_cached.exists(),
+                "hf_cache_validation": default_validation,
+                "startup_default_model": startup_default,
             },
-            "default model cached with config/tokenizer/index/mtp/runtime contract",
-            "Download the default model before first run.",
+            "default model available in the HF cache or as the verified local startup model",
+            model_cache_fix,
             "https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
             f"mtplx pull {DEFAULT_HF_MODEL_ID}",
         )
@@ -543,6 +592,7 @@ def summarize_checks(checks: list[DiagnosticCheck]) -> str:
 def build_diagnostics_payload(
     *,
     model_cache: str | Path | None = None,
+    include_startup_default_model: bool = True,
     deep: bool = False,
     mlx_info: dict[str, Any] | None = None,
     thermal_control: dict[str, Any] | None = None,
@@ -550,6 +600,7 @@ def build_diagnostics_payload(
 ) -> dict[str, Any]:
     host, checks = build_diagnostic_checks(
         model_cache=model_cache,
+        include_startup_default_model=include_startup_default_model,
         deep=deep,
         mlx_info=mlx_info,
         thermal_control=thermal_control,

@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
 from mtplx.constants import DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P
 
 
@@ -86,19 +87,36 @@ def encode_prompt_case(
 ) -> list[int]:
     if chat_template:
         messages = case.messages or [{"role": "user", "content": case.prompt}]
+        if is_gemma4_tokenizer(tokenizer):
+            return encode_chat_messages(
+                tokenizer,
+                messages,
+                enable_thinking=enable_thinking,
+                add_generation_prompt=True,
+            )
         if not hasattr(tokenizer, "apply_chat_template"):
             raise TypeError("Tokenizer does not expose apply_chat_template")
         kwargs: dict[str, Any] = {}
         if enable_thinking is not None:
             kwargs["enable_thinking"] = enable_thinking
-        return list(
-            tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                **kwargs,
+        try:
+            return list(
+                tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    **kwargs,
+                )
             )
-        )
+        except ValueError as exc:
+            if "chat_template is not set" not in str(exc):
+                raise
+            return encode_chat_messages(
+                tokenizer,
+                messages,
+                enable_thinking=enable_thinking,
+                add_generation_prompt=True,
+            )
     return list(tokenizer.encode(case.prompt))
 
 

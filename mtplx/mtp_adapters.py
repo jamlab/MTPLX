@@ -313,6 +313,132 @@ def save_mtp_lora_adapter(
     return out
 
 
+def save_combined_mtp_lora_adapter(
+    path: Path | str,
+    adapter_paths: Iterable[Path | str],
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> Path:
+    """Combine non-overlapping MTP LoRA sidecars into one loadable artifact."""
+
+    paths = [Path(item) for item in adapter_paths]
+    if not paths:
+        raise ValueError("at least one adapter path is required")
+
+    combined_targets: list[dict[str, Any]] = []
+    combined_tensors: dict[str, np.ndarray] = {}
+    combined_from: list[dict[str, Any]] = []
+    seen_targets: set[str] = set()
+    model_hashes: set[str] = set()
+    model_paths: set[str] = set()
+    for adapter_path in paths:
+        state = load_mtp_lora_adapter(adapter_path)
+        source_targets = list(state.metadata.get("targets", []))
+        if not source_targets:
+            raise ValueError(f"adapter artifact contains no targets: {adapter_path}")
+        source_target_names: list[str] = []
+        for entry in source_targets:
+            target = str(entry["target"])
+            if target in seen_targets:
+                raise ValueError(f"duplicate MTP adapter target: {target}")
+            seen_targets.add(target)
+            source_target_names.append(target)
+            combined_targets.append(dict(entry))
+            for leaf in ("lora_a", "lora_b", "depth_scales"):
+                key = f"{target}.{leaf}"
+                if key in state.tensors:
+                    combined_tensors[key] = state.tensors[key]
+        if state.metadata.get("model_hash"):
+            model_hashes.add(str(state.metadata["model_hash"]))
+        if state.metadata.get("model_path"):
+            model_paths.add(str(state.metadata["model_path"]))
+        combined_from.append(
+            {
+                "path": str(adapter_path),
+                "run_id": state.metadata.get("run_id"),
+                "train_depths": state.metadata.get("train_depths"),
+                "targets": source_target_names,
+            }
+        )
+
+    combined_metadata: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": ADAPTER_KIND,
+        "targets": combined_targets,
+        "combined_from": combined_from,
+    }
+    if len(model_hashes) == 1:
+        combined_metadata["model_hash"] = next(iter(model_hashes))
+    elif model_hashes:
+        raise ValueError("cannot combine adapters from different model hashes")
+    if len(model_paths) == 1:
+        combined_metadata["model_path"] = next(iter(model_paths))
+    if metadata:
+        combined_metadata.update(metadata)
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        out,
+        metadata_json=np.array(json.dumps(combined_metadata, sort_keys=True)),
+        **combined_tensors,
+    )
+    return out
+
+
+def save_filtered_mtp_lora_adapter(
+    path: Path | str,
+    adapter_path: Path | str,
+    *,
+    targets: Iterable[str],
+    metadata: dict[str, Any] | None = None,
+) -> Path:
+    """Save a sidecar containing only selected targets from another sidecar."""
+
+    requested = [str(target) for target in targets]
+    if not requested:
+        raise ValueError("at least one target is required")
+    requested_set = set(requested)
+    state = load_mtp_lora_adapter(adapter_path)
+    source_targets = list(state.metadata.get("targets", []))
+    target_entries = [
+        dict(entry)
+        for entry in source_targets
+        if str(entry.get("target")) in requested_set
+    ]
+    found = {str(entry["target"]) for entry in target_entries}
+    missing = [target for target in requested if target not in found]
+    if missing:
+        raise ValueError(f"adapter targets not found: {', '.join(missing)}")
+
+    tensors: dict[str, np.ndarray] = {}
+    for entry in target_entries:
+        target = str(entry["target"])
+        for leaf in ("lora_a", "lora_b", "depth_scales"):
+            key = f"{target}.{leaf}"
+            if key in state.tensors:
+                tensors[key] = state.tensors[key]
+
+    filtered_metadata = dict(state.metadata)
+    filtered_metadata["targets"] = target_entries
+    filtered_metadata["filtered_from"] = {
+        "path": str(adapter_path),
+        "run_id": state.metadata.get("run_id"),
+        "targets": requested,
+    }
+    if metadata:
+        filtered_metadata.update(metadata)
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        out,
+        metadata_json=np.array(json.dumps(filtered_metadata, sort_keys=True)),
+        **tensors,
+    )
+    return out
+
+
 def load_mtp_lora_adapter(path: Path | str) -> AdapterState:
     with np.load(Path(path), allow_pickle=False) as data:
         metadata = json.loads(str(data["metadata_json"].item()))

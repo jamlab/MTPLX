@@ -7,6 +7,7 @@ import json
 import re
 from collections import Counter
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,15 @@ class ValidationResult:
     name: str
     passed: bool
     detail: str = ""
+
+
+TRUNCATION_SENSITIVE_VALIDATORS = frozenset(
+    {
+        "balanced_delimiters",
+        "json",
+        "python_syntax",
+    }
+)
 
 
 def validate_json_text(text: str) -> ValidationResult:
@@ -136,3 +146,42 @@ def validate_benchmark_output(
     ):
         results.append(validate_python_syntax(text))
     return results
+
+
+def summarize_benchmark_quality(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize benchmark quality without mistaking budget truncation for collapse."""
+
+    failures: list[dict[str, Any]] = []
+    inconclusive: list[dict[str, Any]] = []
+    validations_total = 0
+    validations_passed = 0
+
+    for row_index, row in enumerate(rows):
+        hit_token_budget = bool(row.get("hit_token_budget")) or row.get("finish_reason") == "length"
+        validations = row.get("validations") or []
+        if not isinstance(validations, list):
+            continue
+        for validation in validations:
+            if not isinstance(validation, Mapping):
+                continue
+            validations_total += 1
+            if bool(validation.get("passed")):
+                validations_passed += 1
+                continue
+            item = {
+                "row_index": row_index,
+                "name": str(validation.get("name") or ""),
+                "detail": str(validation.get("detail") or ""),
+            }
+            if hit_token_budget and item["name"] in TRUNCATION_SENSITIVE_VALIDATORS:
+                inconclusive.append(item)
+            else:
+                failures.append(item)
+
+    return {
+        "quality_passed": not failures if validations_total else (True if rows else None),
+        "validations_total": validations_total,
+        "validations_passed": validations_passed,
+        "quality_failure_validations": failures,
+        "quality_inconclusive_validations": inconclusive,
+    }

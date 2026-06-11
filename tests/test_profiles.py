@@ -3,13 +3,16 @@ from __future__ import annotations
 from mtplx.profiles import (
     DEFAULT_PROFILE_NAME,
     NATIVE_MTP_60_FAST_PATH_ENV,
+    NATIVE_MTP_60_MLX_FORK_COMMIT,
     SUSTAINED_PREFILL_ENV,
     apply_profile_env,
     get_profile,
     list_profiles,
+    normalize_runtime_env_overrides,
     profile_env_status,
     restore_profile_env,
     resolve_long_context_mtp_depth,
+    runtime_env_with_contract_overrides,
 )
 
 
@@ -26,7 +29,7 @@ def test_performance_cold_is_explicit_fast_path() -> None:
     profile = get_profile("performance-cold")
 
     assert profile.runtime_profile == "native_mtp_60_cold"
-    assert profile.required_mlx_fork_commit == "2377a99f"
+    assert profile.required_mlx_fork_commit == NATIVE_MTP_60_MLX_FORK_COMMIT
     assert profile.draft_lm_head is not None
     assert profile.env_dict() == NATIVE_MTP_60_FAST_PATH_ENV
     assert "MTPLX_SUSTAINED_PREFILL_LAYOUT" not in profile.env_dict()
@@ -48,6 +51,60 @@ def test_apply_and_restore_profile_env() -> None:
 
     restore_profile_env(previous, environ=environ)
     assert environ == {}
+
+
+def test_model_runtime_env_overrides_can_disable_fast_path_flags() -> None:
+    environ: dict[str, str] = {}
+    overrides = {
+        "MTPLX_LAZY_VERIFY_LOGITS": False,
+        "MTPLX_BATCH_TARGET_ARRAYS": "0",
+    }
+
+    previous = apply_profile_env(
+        "performance-cold",
+        environ=environ,
+        runtime_env_overrides=overrides,
+    )
+
+    assert previous == {key: None for key in NATIVE_MTP_60_FAST_PATH_ENV}
+    assert environ["MTPLX_LAZY_VERIFY_LOGITS"] == "0"
+    assert environ["MTPLX_BATCH_TARGET_ARRAYS"] == "0"
+    status = profile_env_status(
+        "performance-cold",
+        environ=environ,
+        runtime_env_overrides=overrides,
+    )
+    assert status["MTPLX_LAZY_VERIFY_LOGITS"]["ok"] is True
+    assert status["MTPLX_BATCH_TARGET_ARRAYS"]["ok"] is True
+    assert status["MTPLX_LAZY_TARGET_DISTRIBUTIONS"]["ok"] is True
+
+    restore_profile_env(previous, environ=environ)
+    assert environ == {}
+
+
+def test_contract_runtime_env_overrides_are_normalized_and_restricted() -> None:
+    contract = {
+        "runtime_env_overrides": {
+            "MTPLX_LAZY_VERIFY_LOGITS": False,
+            "MTPLX_MTP_HISTORY_POLICY": "committed",
+            "MTPLX_CLEAR_CACHE_EVERY": 512,
+        }
+    }
+
+    merged = runtime_env_with_contract_overrides(
+        NATIVE_MTP_60_FAST_PATH_ENV,
+        contract,
+    )
+
+    assert merged["MTPLX_LAZY_VERIFY_LOGITS"] == "0"
+    assert merged["MTPLX_MTP_HISTORY_POLICY"] == "committed"
+    assert merged["MTPLX_CLEAR_CACHE_EVERY"] == "512"
+    try:
+        normalize_runtime_env_overrides({"MTPLX_UNSAFE_NEW_FLAG": "1"})
+    except ValueError as exc:
+        assert "unsupported key" in str(exc)
+    else:
+        raise AssertionError("unknown runtime env override should fail")
 
 
 def test_apply_profile_env_preserves_mtp_history_policy_override() -> None:
@@ -81,6 +138,24 @@ def test_apply_profile_env_preserves_turboquant_overrides() -> None:
     assert status["MTPLX_VLLM_METAL_PAGED_TURBOQUANT"]["ok"] is True
 
 
+def test_apply_profile_env_preserves_long_context_depth_overrides() -> None:
+    environ = {
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY": "auto",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD": "65536",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH": "2",
+    }
+
+    apply_profile_env("sustained", environ=environ)
+
+    assert environ["MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY"] == "auto"
+    assert environ["MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"] == "65536"
+    assert environ["MTPLX_LONG_CONTEXT_MTP_DEPTH"] == "2"
+    status = profile_env_status("sustained", environ=environ)
+    assert status["MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY"]["ok"] is True
+    assert status["MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"]["ok"] is True
+    assert status["MTPLX_LONG_CONTEXT_MTP_DEPTH"]["ok"] is True
+
+
 def test_list_profiles_includes_all_public_modes() -> None:
     names = [profile["name"] for profile in list_profiles()]
 
@@ -107,11 +182,13 @@ def test_sustained_profile_is_native_mtp_long_context_path() -> None:
     assert profile.env_dict()["MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT"] == "256"
     assert profile.env_dict()["MTPLX_LAZY_VERIFY_LOGITS"] == "1"
     assert profile.env_dict()["MTPLX_BATCH_TARGET_ARRAYS"] == "1"
+    assert profile.env_dict()["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "1"
     assert profile.env_dict()["MTPLX_DEFER_VERIFY_HIDDEN_EVAL"] == "1"
     assert profile.env_dict()["MTPLX_VERIFY_HIDDEN_MODE"] == "logits_first_committed_slice"
-    assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY"] == "auto"
+    assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY"] == "off"
     assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"] == "98304"
-    assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH"] == "2"
+    assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH"] == "3"
+    assert profile.env_dict()["MTPLX_MTP_HISTORY_POLICY"] == "committed"
     assert profile.env_dict()["MTPLX_LAZY_MTP_HISTORY_APPEND"] == "1"
     assert profile.env_dict()["MTPLX_DROP_EVENTS"] == "1"
     assert profile.env_dict()["MTPLX_SKIP_VERIFY_SNAPSHOT"] == "1"
@@ -120,7 +197,7 @@ def test_sustained_profile_is_native_mtp_long_context_path() -> None:
     assert "MTPLX_EVAL_STATE_ROOTS_ON_COMMIT" not in profile.env_dict()
 
 
-def test_sustained_long_context_depth_policy_caps_only_128k_class() -> None:
+def test_sustained_long_context_depth_policy_keeps_d3_by_default() -> None:
     env = SUSTAINED_PREFILL_ENV
 
     depth, details = resolve_long_context_mtp_depth(
@@ -130,18 +207,18 @@ def test_sustained_long_context_depth_policy_caps_only_128k_class() -> None:
     )
     assert depth == 3
     assert details["active"] is False
-    assert details["reason"] == "below_threshold"
+    assert details["reason"] == "disabled"
 
     depth, details = resolve_long_context_mtp_depth(
         prompt_tokens=131072,
         requested_depth=3,
         env=env,
     )
-    assert depth == 2
-    assert details["active"] is True
-    assert details["reason"] == "long_context_depth_cap"
+    assert depth == 3
+    assert details["active"] is False
+    assert details["reason"] == "disabled"
     assert details["requested_depth"] == 3
-    assert details["effective_depth"] == 2
+    assert details["effective_depth"] == 3
 
     depth, details = resolve_long_context_mtp_depth(
         prompt_tokens=131072,
@@ -150,4 +227,25 @@ def test_sustained_long_context_depth_policy_caps_only_128k_class() -> None:
     )
     assert depth == 1
     assert details["active"] is False
-    assert details["reason"] == "already_within_cap"
+    assert details["reason"] == "disabled"
+
+
+def test_long_context_depth_cap_is_explicit_diagnostic_only() -> None:
+    env = {
+        **SUSTAINED_PREFILL_ENV,
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY": "auto",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD": "98304",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH": "2",
+    }
+
+    depth, details = resolve_long_context_mtp_depth(
+        prompt_tokens=131072,
+        requested_depth=3,
+        env=env,
+    )
+
+    assert depth == 2
+    assert details["active"] is True
+    assert details["reason"] == "long_context_depth_cap"
+    assert details["requested_depth"] == 3
+    assert details["effective_depth"] == 2

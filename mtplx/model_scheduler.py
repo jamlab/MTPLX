@@ -8,7 +8,7 @@ maintenance work such as SessionBank postcommit snapshots.
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from threading import Condition, Thread, get_ident
@@ -49,6 +49,18 @@ class ModelWorkScheduler:
         self._owner_thread_id: int | None = None
         self._started = 0
         self._completed = 0
+        self._cancelled_before_start = 0
+        self._request_cancelled = 0
+        self._completed_by_kind: Counter[str] = Counter()
+        self._started_by_batch_key: Counter[str] = Counter()
+        self._batch_histogram: Counter[int] = Counter()
+        self._queue_wait_samples_s: deque[float] = deque(maxlen=256)
+        self._run_duration_samples_s: deque[float] = deque(maxlen=256)
+        self._cancellation_latency_samples_s: deque[float] = deque(maxlen=256)
+        self._active_sequence: int | None = None
+        self._active_batch_key: str | None = None
+        self._active_started_at_s: float | None = None
+        self._active_queue_wait_s: float | None = None
         self._thread = Thread(
             target=self._run,
             name=f"{self.name}-owner",
@@ -76,15 +88,58 @@ class ModelWorkScheduler:
 
     def stats(self) -> dict[str, Any]:
         with self._condition:
+            active_run_s = (
+                max(0.0, time.monotonic() - self._active_started_at_s)
+                if self._active_started_at_s is not None
+                else None
+            )
             return {
                 "foreground_pending": len(self._foreground),
                 "idle_pending": len(self._idle),
                 "active_kind": self._active_kind,
+                "active_sequence": self._active_sequence,
+                "active_batch_key": self._active_batch_key,
+                "active_run_s": active_run_s,
+                "active_queue_wait_s": self._active_queue_wait_s,
                 "started": self._started,
                 "completed": self._completed,
+                "cancelled_before_start": self._cancelled_before_start,
+                "request_cancelled": self._request_cancelled,
+                "completed_by_kind": dict(self._completed_by_kind),
+                "started_by_batch_key": dict(self._started_by_batch_key),
+                "batch_histogram": {
+                    str(size): count
+                    for size, count in sorted(self._batch_histogram.items())
+                },
+                "queue_wait_s": _sample_summary(self._queue_wait_samples_s),
+                "run_duration_s": _sample_summary(self._run_duration_samples_s),
+                "cancellation_latency_s": _sample_summary(
+                    self._cancellation_latency_samples_s
+                ),
                 "owner_thread_id": self._owner_thread_id,
                 "shutdown": self._shutdown,
             }
+
+    def record_request_cancelled(self, *, latency_s: float | None = None) -> None:
+        """Record a user-facing cancellation signal.
+
+        The in-flight registry owns the actual cancel event; this method keeps
+        the scheduler telemetry envelope complete without coupling the two
+        subsystems together.
+        """
+
+        with self._condition:
+            self._request_cancelled += 1
+            if latency_s is not None:
+                self._cancellation_latency_samples_s.append(max(0.0, float(latency_s)))
+
+    def record_batch_step(self, *, size: int, batch_key: str | None = None) -> None:
+        """Record a model-owner microbatch executed inside a long-lived pump."""
+
+        with self._condition:
+            self._batch_histogram[max(1, int(size))] += 1
+            if batch_key:
+                self._started_by_batch_key[str(batch_key)] += 1
 
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
         """ThreadPoolExecutor-compatible foreground submit."""
@@ -181,20 +236,38 @@ class ModelWorkScheduler:
             if item is None:
                 return
             if not item.future.set_running_or_notify_cancel():
+                with self._condition:
+                    self._cancelled_before_start += 1
                 continue
+            now = time.monotonic()
+            queue_wait_s = max(0.0, now - item.queued_at_s)
             with self._condition:
                 self._active_kind = (
                     "foreground" if item.kind == "foreground" else "idle_postcommit"
                 )
+                self._active_sequence = item.sequence
+                self._active_batch_key = item.batch_key
+                self._active_started_at_s = now
+                self._active_queue_wait_s = queue_wait_s
+                self._queue_wait_samples_s.append(queue_wait_s)
                 self._started += 1
+                self._started_by_batch_key[item.batch_key or "none"] += 1
             try:
                 item.future.set_result(item.fn(*item.args, **item.kwargs))
             except BaseException as exc:
                 item.future.set_exception(exc)
             finally:
+                run_duration_s = max(0.0, time.monotonic() - now)
                 with self._condition:
                     self._completed += 1
+                    self._completed_by_kind[item.kind] += 1
+                    self._batch_histogram[1] += 1
+                    self._run_duration_samples_s.append(run_duration_s)
                     self._active_kind = None
+                    self._active_sequence = None
+                    self._active_batch_key = None
+                    self._active_started_at_s = None
+                    self._active_queue_wait_s = None
                     self._condition.notify_all()
 
     def _take_next(self) -> _WorkItem | None:
@@ -212,3 +285,39 @@ class ModelWorkScheduler:
                     self._condition.wait(timeout=delay)
                     continue
                 self._condition.wait()
+
+
+def _sample_summary(samples: deque[float]) -> dict[str, float | int | None]:
+    values = list(samples)
+    if not values:
+        return {
+            "count": 0,
+            "latest": None,
+            "min": None,
+            "max": None,
+            "mean": None,
+            "p50": None,
+            "p95": None,
+        }
+    return {
+        "count": len(values),
+        "latest": values[-1],
+        "min": min(values),
+        "max": max(values),
+        "mean": sum(values) / len(values),
+        "p50": _percentile(values, 50.0),
+        "p95": _percentile(values, 95.0),
+    }
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    ordered = sorted(values)
+    if pct <= 0:
+        return ordered[0]
+    if pct >= 100:
+        return ordered[-1]
+    rank = (pct / 100.0) * (len(ordered) - 1)
+    lo = int(rank)
+    hi = min(len(ordered) - 1, lo + 1)
+    frac = rank - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 from scripts.run_context_degradation_diagnostics import (
     _local_online_hidden_config,
     _local_online_hidden_server_args,
     _local_profile_env,
+    _server_python_env,
 )
 
 
@@ -38,6 +40,17 @@ def test_sustained_profile_sets_v015_memory_env_without_decode_state_flags():
     assert env["MTPLX_VLLM_METAL_PAGED_ATTN_IMPL"] == "mlx_vector_paged"
     assert "MTPLX_TRUNK_CACHE_MATERIALIZE_EVERY" not in env
     assert "MTPLX_EVAL_STATE_ROOTS_ON_COMMIT" not in env
+
+
+def test_server_python_env_prepends_repo_root_without_dropping_existing_path(tmp_path):
+    existing = os.pathsep.join(["/already/there", "/elsewhere"])
+
+    env = _server_python_env({"PYTHONPATH": existing}, tmp_path)
+
+    parts = env["PYTHONPATH"].split(os.pathsep)
+    assert parts[0] == str(tmp_path.resolve())
+    assert "/already/there" in parts
+    assert "/elsewhere" in parts
 
 
 def test_cache_limit_profile_sets_only_allocator_limit_probe():
@@ -347,6 +360,19 @@ def test_vllm_metal_paged_attention_profile_can_enable_turboquant():
     assert env["MTPLX_VLLM_METAL_PAGED_TURBOQUANT"] == "1"
     assert env["MTPLX_VLLM_METAL_PAGED_TURBOQUANT_K_QUANT"] == "q8_0"
     assert env["MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT"] == "q3_0"
+
+
+def test_vllm_metal_paged_attention_profile_can_enable_q8_q4_turboquant():
+    env, info = _local_profile_env(
+        "vllm_metal_paged_attn_partitioned_block_16_blocks_1024_partition_threshold_2048_impl_mlx_vector_paged_turboquant_k_q8_0_v_q4_0",
+        {},
+    )
+
+    assert info["vllm_metal_paged_turboquant"] is True
+    assert info["vllm_metal_paged_turboquant_k_quant"] == "q8_0"
+    assert info["vllm_metal_paged_turboquant_v_quant"] == "q4_0"
+    assert env["MTPLX_VLLM_METAL_PAGED_TURBOQUANT_K_QUANT"] == "q8_0"
+    assert env["MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT"] == "q4_0"
 
 
 def test_vllm_metal_paged_attention_profile_can_exact_gather_last_layers():

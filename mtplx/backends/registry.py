@@ -19,6 +19,8 @@ SUPPORTED_ARCH_IDS = {
     "glm4-moe-lite-mtp",
     "mimo-mtp",
     "nemotron-h-mtp",
+    "gemma4-assistant-mtp",
+    "step3p5-mtp",
 }
 
 TIER_VERIFIED = "verified"
@@ -31,6 +33,34 @@ EXIT_VERIFIED = 0
 EXIT_NO_MTP = 2
 EXIT_UNVERIFIED = 3
 EXIT_INCOMPATIBLE_ARCHITECTURE = 4
+BLOCKING_RUNTIME_STATUSES = {
+    "candidate",
+    "candidate_build_only_benchmark_pending",
+    "candidate_build_only",
+    "failed",
+    "fail",
+    "failing",
+    "pending",
+    "blocked",
+    "blocker",
+    "needs_repair",
+    "needs_reverify",
+    "unverified",
+}
+BLOCKING_RUNTIME_STATUS_PREFIXES = (
+    "candidate",
+    "fail",
+    "pending",
+    "blocked",
+    "blocker",
+    "needs",
+    "unverified",
+)
+BLOCKING_SPEED_VERDICTS = {
+    "mtp_acceptance_collapsed",
+    "no_mtp_depth_beat_ar",
+    "no_quality_passed_mtp_depth_beat_ar",
+}
 
 
 class ModelCompatibilityError(RuntimeError):
@@ -84,7 +114,7 @@ class ArchitectureSupport:
 ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
     "qwen3-next-mtp": ArchitectureSupport(
         arch_id="qwen3-next-mtp",
-        display_name="Qwen3-Next / Qwen3.5 MTP",
+        display_name="Qwen3.6 / Qwen3-Next / Qwen3.5 MTP",
         family="qwen",
         backend="qwen3_next",
         support_level="verified-native",
@@ -255,6 +285,28 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
         ),
         notes="Mainline Gemma configs are no-MTP unless an explicit MTP marker is present.",
     ),
+    "gemma4-assistant-mtp": ArchitectureSupport(
+        arch_id="gemma4-assistant-mtp",
+        display_name="Gemma 4 assistant-backed MTP",
+        family="gemma",
+        backend="gemma4_assistant",
+        support_level="runtime-runnable-qa-pending",
+        runtime_compatibility="assistant-pair-native",
+        can_run_verified=True,
+        aliases=("gemma4_assistant", "Gemma4AssistantPair", "gemma4-assistant-mtp"),
+        config_markers=("mtplx_pair.json", "assistant_pair_bundle"),
+        family_gate="target-assistant-bundle",
+        references=(
+            "https://blog.google/innovation-and-ai/technology/developers-tools/multi-token-prediction-gemma-4/",
+            "https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/speculative/drafters/gemma4_assistant",
+            "https://huggingface.co/google/gemma-4-31B-it-assistant",
+        ),
+        notes=(
+            "Gemma 4 uses an external assistant drafter sharing target KV. "
+            "The runnable artifact is the bundle root with mtplx_pair.json, "
+            "target/, and assistant/; target-only folders are not runnable."
+        ),
+    ),
     "ernie-mtp": ArchitectureSupport(
         arch_id="ernie-mtp",
         display_name="ERNIE MoE MTP",
@@ -327,13 +379,32 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
     ),
     "step3p5-mtp": ArchitectureSupport(
         arch_id="step3p5-mtp",
-        display_name="Step-3.5 MTP",
+        display_name="Step-3.5 / Step-3.7-Flash MTP",
         family="step",
         backend="step3p5_mtp",
-        support_level="recognized-backend-pending",
-        runtime_compatibility="recognized-backend-pending",
-        aliases=("step3p5_mtp", "step3p5"),
-        references=("REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/step3p5_mtp.py",),
+        support_level="experimental-native-contract-gated",
+        runtime_compatibility="native-contract-gated",
+        can_run_verified=True,
+        aliases=(
+            "step3p5_mtp",
+            "step3p5",
+            "step3p7",
+            "step3p7_mtp",
+            "step3p7forconditionalgeneration",
+            "step3p5forcausallm",
+        ),
+        family_gate="appended-layer-mtp-markers",
+        references=(
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/step3p5_mtp.py",
+            "REFERENCES:TOOLS/vllm-official-main/vllm/model_executor/models/step3p5.py",
+            "REFERENCES:TOOLS/mlx-lm/mlx_lm/models/step3p5.py",
+        ),
+        notes=(
+            "Step ships 3 distinct appended NextN layers with dense MLP, GQA, "
+            "zero-centered norms, and shared heads. MTPLX routes verified-contract "
+            "artifacts through the dedicated Step MTP injector, which feeds the "
+            "draft layers the trunk pre-final-norm hidden state."
+        ),
     ),
     "hy-v3-mtp": ArchitectureSupport(
         arch_id="hy-v3-mtp",
@@ -389,6 +460,8 @@ class RuntimeContract:
     verified_on: dict[str, Any]
     recommended_draft_lm_head: dict[str, Any] | None = None
     recommended_draft_sampler: dict[str, Any] | None = None
+    mtp_contract: dict[str, Any] | None = None
+    runtime_env_overrides: dict[str, str] | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -428,6 +501,21 @@ class RuntimeContract:
             recommended_draft_sampler = normalize_draft_sampler_spec(
                 data.get("recommended_draft_sampler")
             )
+        mtp_contract = None
+        if data.get("mtp_contract") is not None:
+            from mtplx.mtp_patch import MTPContract
+
+            mtp_contract = MTPContract().with_metadata(
+                data.get("mtp_contract"),
+                preserve_explicit=False,
+            ).to_dict()
+        runtime_env_overrides = None
+        if data.get("runtime_env_overrides") is not None:
+            from mtplx.profiles import normalize_runtime_env_overrides
+
+            runtime_env_overrides = normalize_runtime_env_overrides(
+                data.get("runtime_env_overrides")
+            )
         return cls(
             mtplx_version=str(data["mtplx_version"]),
             arch_id=str(data["arch_id"]),
@@ -437,6 +525,8 @@ class RuntimeContract:
             verified_on=dict(data["verified_on"]),
             recommended_draft_lm_head=recommended_draft_lm_head,
             recommended_draft_sampler=recommended_draft_sampler,
+            mtp_contract=mtp_contract,
+            runtime_env_overrides=runtime_env_overrides,
             raw=dict(data),
         )
 
@@ -453,6 +543,10 @@ class RuntimeContract:
             out["recommended_draft_lm_head"] = dict(self.recommended_draft_lm_head)
         if self.recommended_draft_sampler is not None:
             out["recommended_draft_sampler"] = dict(self.recommended_draft_sampler)
+        if self.mtp_contract is not None:
+            out["mtp_contract"] = dict(self.mtp_contract)
+        if self.runtime_env_overrides is not None:
+            out["runtime_env_overrides"] = dict(self.runtime_env_overrides)
         return out
 
 
@@ -580,8 +674,87 @@ def _passes_verified_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bo
     return _passes_family_runtime_gate(arch_id, inspection, tensor_gate)
 
 
+def _runtime_contract_blocker(contract: RuntimeContract) -> str | None:
+    exactness_blocker = _runtime_evidence_blocker(
+        contract.exactness_baseline,
+        section_name="exactness_baseline",
+    )
+    if exactness_blocker:
+        return exactness_blocker
+    raw = contract.raw if isinstance(contract.raw, dict) else {}
+    speed_evidence = raw.get("speed_evidence")
+    speed_blocker = _runtime_evidence_blocker(
+        speed_evidence,
+        section_name="speed_evidence",
+    )
+    if speed_blocker:
+        return speed_blocker
+    if isinstance(speed_evidence, dict):
+        verdict = _text(speed_evidence.get("verdict"))
+        if verdict in BLOCKING_SPEED_VERDICTS:
+            return f"speed_evidence verdict is {speed_evidence.get('verdict')}"
+    return None
+
+
+def _runtime_evidence_blocker(value: Any, *, section_name: str) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    if value.get("public_release_blocker") is True:
+        return f"{section_name} is marked public_release_blocker"
+    status = _text(value.get("status"))
+    if status and (
+        status in BLOCKING_RUNTIME_STATUSES
+        or status.startswith(tuple(f"{prefix}_" for prefix in BLOCKING_RUNTIME_STATUS_PREFIXES))
+    ):
+        return f"{section_name} status is {value.get('status')}"
+    return None
+
+
 def _weight_keys(inspection: Any) -> tuple[str, ...]:
     return tuple(str(key) for key in (getattr(inspection, "weight_keys", ()) or ()))
+
+
+def _is_sidecar_mtp_key(key: str) -> bool:
+    return key.startswith(("mtp.", "language_model.mtp."))
+
+
+def _has_numbered_qwen_moe_expert_key(key: str) -> bool:
+    marker = ".mlp.experts."
+    if marker not in key:
+        return False
+    suffix = key.split(marker, 1)[1]
+    expert_id = suffix.split(".", 1)[0]
+    return expert_id.isdigit()
+
+
+def _qwen_moe_body_layout_blocker(inspection: Any) -> str | None:
+    model_type = _text(getattr(inspection, "model_type", None))
+    architecture = _text(getattr(inspection, "architecture", None))
+    descriptor = f"{model_type} {architecture}"
+    if "qwen3_5_moe" not in descriptor and "qwen3_5moe" not in descriptor:
+        return None
+    body_keys = tuple(
+        key for key in _weight_keys(inspection) if not _is_sidecar_mtp_key(key)
+    )
+    if not body_keys:
+        return None
+    has_numbered_experts = any(
+        _has_numbered_qwen_moe_expert_key(key) for key in body_keys
+    )
+    has_switch_mlp = any(".mlp.switch_mlp." in key for key in body_keys)
+    if has_numbered_experts and not has_switch_mlp:
+        return (
+            "Qwen MoE body uses numbered mlp.experts.* tensors, but the current "
+            "native MLX backend expects the packed switch_mlp layout. Re-run "
+            "Forge repair/conversion before marking this artifact runnable."
+        )
+    return None
+
+
+def _runtime_body_layout_blocker(arch_id: str | None, inspection: Any) -> str | None:
+    if arch_id == "qwen3-next-mtp":
+        return _qwen_moe_body_layout_blocker(inspection)
+    return None
 
 
 _APPENDED_LAYER_MARKER_SUFFIXES = (
@@ -590,6 +763,7 @@ _APPENDED_LAYER_MARKER_SUFFIXES = (
     "eh_proj.weight",
     "shared_head.norm.weight",
     "shared_head.head.weight",
+    "shared_head.output.weight",
 )
 
 
@@ -741,12 +915,18 @@ def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool
         "glm-moe-dsa-mtp",
         "glm4-moe-mtp",
         "glm4-moe-lite-mtp",
+        "step3p5-mtp",
     }:
         return _passes_appended_layer_gate(inspection)
     if arch_id == "mimo-mtp":
         return _passes_mimo_layer_gate(inspection)
     if arch_id == "nemotron-h-mtp":
         return _passes_nemotron_h_gate(inspection)
+    if arch_id == "gemma4-assistant-mtp":
+        return (
+            _text(getattr(inspection, "model_type", None)) == "gemma4_pair"
+            and isinstance(getattr(inspection, "gemma4_pair", None), dict)
+        )
     return False
 
 
@@ -772,10 +952,65 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
     contract_path = getattr(inspection, "runtime_contract_path", None)
     if not contract_path:
         contract_path = str(_contract_path(model_dir)) if _contract_path(model_dir).exists() else None
+    body_blocker = _runtime_body_layout_blocker(detected_arch_id, inspection)
+    if body_blocker:
+        support = architecture_support_for(detected_arch_id)
+        return CompatibilityVerdict(
+            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+            arch_id=detected_arch_id,
+            supported=False,
+            recognized=support is not None,
+            can_run=False,
+            exit_code=EXIT_UNVERIFIED,
+            message=body_blocker,
+            recommended_backend=(support.backend if support else None),
+            recommended_profile=(
+                contract.recommended_profile if contract is not None else DEFAULT_PROFILE_NAME
+            ),
+            runtime_contract=contract,
+            runtime_contract_path=contract_path,
+            runtime_contract_error=contract_error,
+            unsafe_force_required=False,
+            unverified_model=True,
+            mtp_supported="partial" if has_mtp else "no",
+            runtime_compatibility="invalid-base-tensor-layout",
+            support_level="native-backend-invalid-base-tensors",
+            support_notes=(support.notes if support else None),
+        )
 
     if contract is not None:
         arch_id = contract.arch_id
         support = architecture_support_for(arch_id)
+        blocker = _runtime_contract_blocker(contract)
+        if blocker:
+            return CompatibilityVerdict(
+                tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+                arch_id=arch_id,
+                supported=False,
+                recognized=support is not None,
+                can_run=False,
+                exit_code=EXIT_UNVERIFIED,
+                message=(
+                    "Runtime contract is not launch-ready: "
+                    f"{blocker}. Repair or regenerate the artifact with Forge "
+                    "before using it as a verified MTPLX model."
+                ),
+                recommended_backend=(support.backend if support else None),
+                recommended_profile=contract.recommended_profile,
+                runtime_contract=contract,
+                runtime_contract_path=contract_path,
+                runtime_contract_error=contract_error,
+                unsafe_force_required=True,
+                unverified_model=True,
+                mtp_supported="partial" if has_mtp else "no",
+                runtime_compatibility="runtime-contract-blocked",
+                support_level=(
+                    "native-backend-needs-contract-repair"
+                    if support is not None
+                    else "unsupported"
+                ),
+                support_notes=(support.notes if support else None),
+            )
         if (
             arch_id in SUPPORTED_ARCH_IDS
             and has_mtp
@@ -1031,6 +1266,44 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             runtime_compatibility=support.runtime_compatibility,
             support_level=support.support_level,
             support_notes=support.notes,
+        )
+
+    architecture_text = _text(getattr(inspection, "architecture", None))
+    model_type_text = _text(getattr(inspection, "model_type", None))
+    compact_architecture = _compact(architecture_text)
+    is_gemma4_pair_subfolder = (
+        "gemma4forconditionalgeneration" in compact_architecture
+        or "gemma4assistantforcausallm" in compact_architecture
+        or model_type_text == "gemma4_assistant"
+    )
+    if not has_mtp and is_gemma4_pair_subfolder:
+        is_assistant = (
+            "assistant" in compact_architecture
+            or model_type_text == "gemma4_assistant"
+        )
+        folder_kind = "assistant" if is_assistant else "target"
+        return CompatibilityVerdict(
+            tier=TIER_NO_MTP,
+            arch_id="gemma4-assistant-mtp",
+            supported=False,
+            recognized=True,
+            can_run=False,
+            exit_code=EXIT_NO_MTP,
+            message=(
+                f"Gemma 4 {folder_kind} folder detected, but MTPLX Gemma "
+                "requires the assistant-pair bundle root containing "
+                "mtplx_pair.json, target/, and assistant/. Inspect or start "
+                "the bundle root instead of this subfolder."
+            ),
+            recommended_backend="gemma4_assistant",
+            recommended_profile=DEFAULT_PROFILE_NAME,
+            mtp_supported="no",
+            runtime_compatibility="incomplete-assistant-pair",
+            support_level="gemma4-pair-bundle-required",
+            support_notes=(
+                "Gemma 4 support is an external assistant-pair backend; "
+                "target-only and assistant-only MLX folders are not runnable."
+            ),
         )
 
     if not has_mtp:

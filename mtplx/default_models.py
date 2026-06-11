@@ -20,6 +20,18 @@ from mtplx.profiles import (
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
     QUALITY_HF_MODEL_ID,
     QUALITY_PUBLIC_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
+    QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
 )
 
 
@@ -29,6 +41,11 @@ QUALITY_MODEL_ENV = "MTPLX_OPTIMIZED_QUALITY_MODEL"
 DEFAULT_MODEL_VARIANTS = frozenset({"auto", "speed", "q4", "bf16", "fp16"})
 _LEGACY_APPLE_FP16_GENERATIONS = frozenset({"m1", "m2"})
 _NEWER_APPLE_SPEED_GENERATIONS = frozenset({"m3", "m4", "m5"})
+# Below this much unified memory the 27B default cannot load safely, so the
+# default routes to the 9B artifact instead. Mirrors the app's <32 GiB
+# recommendation tier (model_catalog.recommended_catalog_ids).
+SMALL_DEFAULT_MEMORY_FLOOR_GIB = 32.0
+QWEN35_9B_SPEED_DESCRIPTION = "Q6 small-Mac artifact"
 OPTIMIZED_SPEED_LABEL = "Qwen3.6 27B MTPLX Optimized Speed"
 OPTIMIZED_SPEED_DESCRIPTION = "Q4 target with Q4 MTP sidecar"
 OPTIMIZED_QUALITY_LABEL = "Qwen3.6 27B MTPLX Optimized Quality"
@@ -42,6 +59,11 @@ _OPTIMIZED_SPEED_LOCAL_CANDIDATES = (
 _OPTIMIZED_QUALITY_LOCAL_CANDIDATES = (
     "~/Documents/MTPLX/hf-staging/Qwen3.6-27B-MTPLX-Optimized-Quality",
     "~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Quality",
+)
+_OPTIMIZED_35B_SPEED_LOCAL_CANDIDATES = (
+    "~/Documents/MTPLX/models/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed",
+    "~/Documents/MTPLX/models/Qwen3.6-35B-A3B-MTPLX-Official4-CyanKiwiMTP-CleanRecipe",
+    "~/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed",
 )
 _VERIFIED_DEFAULT_LOCAL_NAMES = frozenset(
     {
@@ -64,9 +86,14 @@ class DefaultModelSelection:
     reason: str
     auto_selected: bool
     env_override: str | None = None
+    memory_gib: float | None = None
 
     @property
     def display_name(self) -> str:
+        if "9B" in self.hf_model:
+            if self.variant == "fp16":
+                return "Qwen3.5 9B Optimized Speed FP16"
+            return "Qwen3.5 9B Optimized Speed"
         if self.variant == "fp16":
             return "Qwen3.6 27B Optimized Speed FP16"
         return OPTIMIZED_SPEED_LABEL
@@ -86,6 +113,7 @@ class DefaultModelSelection:
             "reason": self.reason,
             "auto_selected": self.auto_selected,
             "env_override": self.env_override,
+            "memory_gib": self.memory_gib,
             "display_name": self.display_name,
             "label": self.label,
         }
@@ -107,7 +135,10 @@ def _is_complete_local_model(path: Path) -> bool:
     if not (path / "config.json").is_file():
         return False
     has_weights = any(path.glob("model-*.safetensors")) or (path / "model.safetensors").is_file()
-    has_mtp = (path / "mtp.safetensors").is_file()
+    has_mtp = any(
+        (path / rel).is_file()
+        for rel in ("mtp.safetensors", "mtp/weights.safetensors", "model-mtp.safetensors")
+    )
     return has_weights and has_mtp
 
 
@@ -187,12 +218,81 @@ def _artifact_role_model_id(role: str) -> str | None:
     return None
 
 
+def _confirmed_default_speed_model_id(path: Path, *values: object) -> str | None:
+    candidates = [str(path)]
+    for value in values:
+        if isinstance(value, str):
+            candidates.append(value)
+    for candidate in candidates:
+        inferred = _public_model_id_from_name(candidate)
+        if inferred == DEFAULT_PUBLIC_MODEL_ID:
+            return DEFAULT_PUBLIC_MODEL_ID
+    return None
+
+
+def _metadata_or_name_looks_qwen36_35b(path: Path, metadata: Mapping[str, Any] | None = None) -> bool:
+    values = [str(path), path.name]
+    if isinstance(metadata, Mapping):
+        for key in (
+            "model",
+            "model_id",
+            "base_model",
+            "source_model",
+            "repo_id",
+            "public_model_id",
+            "served_model_id",
+            "artifact_role",
+        ):
+            value = metadata.get(key)
+            if isinstance(value, str):
+                values.append(value)
+        verified_on = metadata.get("verified_on")
+        if isinstance(verified_on, Mapping):
+            value = verified_on.get("model")
+            if isinstance(value, str):
+                values.append(value)
+    text = " ".join(values).replace("\\", "/").lower()
+    return "qwen3.6-35b-a3b" in text or "qwen36-35b-a3b" in text
+
+
+def _metadata_looks_qwen(path: Path, config: Mapping[str, Any]) -> bool:
+    values: list[str] = [path.name]
+    model_type = config.get("model_type")
+    if isinstance(model_type, str):
+        values.append(model_type)
+    architectures = config.get("architectures")
+    if isinstance(architectures, list):
+        values.extend(str(item) for item in architectures if isinstance(item, str))
+    return "qwen" in " ".join(values).lower()
+
+
 def _public_model_id_from_metadata(path: Path) -> str | None:
     runtime = _read_json(path / "mtplx_runtime.json")
     for key in ("public_model_id", "served_model_id", "model_id"):
         value = runtime.get(key)
         if isinstance(value, str) and value.strip():
             return _sanitize_public_model_id(value)
+    runtime_values = [str(path)]
+    role = runtime.get("artifact_role")
+    if isinstance(role, str):
+        runtime_values.append(role)
+    verified_on = runtime.get("verified_on")
+    if isinstance(verified_on, dict):
+        verified_model = verified_on.get("model")
+        if isinstance(verified_model, str):
+            runtime_values.append(verified_model)
+    explicit_name = _public_model_id_from_name(" ".join(runtime_values))
+    if explicit_name in {
+        QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID,
+    }:
+        return explicit_name
+    if _metadata_or_name_looks_qwen36_35b(path, runtime):
+        return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
     precision = runtime.get("precision_variant")
     if isinstance(precision, str) and precision.strip().lower() in {"fp16", "float16"}:
         return DEFAULT_FP16_PUBLIC_MODEL_ID
@@ -200,16 +300,31 @@ def _public_model_id_from_metadata(path: Path) -> str | None:
     if isinstance(role, str):
         inferred = _artifact_role_model_id(role)
         if inferred:
-            return inferred
+            if inferred != DEFAULT_PUBLIC_MODEL_ID:
+                return inferred
+            confirmed = _confirmed_default_speed_model_id(path)
+            if confirmed:
+                return confirmed
     verified_on = runtime.get("verified_on")
     if isinstance(verified_on, dict):
         verified_model = verified_on.get("model")
         if isinstance(verified_model, str):
             inferred = _artifact_role_model_id(verified_model)
             if inferred:
-                return inferred
+                if inferred != DEFAULT_PUBLIC_MODEL_ID:
+                    return inferred
+                confirmed = _confirmed_default_speed_model_id(path, verified_model)
+                if confirmed:
+                    return confirmed
 
     config = _read_json(path / "config.json")
+    if not _metadata_looks_qwen(path, config):
+        return None
+    name_inferred = _public_model_id_from_name(str(path))
+    if name_inferred is None:
+        return None
+    if name_inferred == QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID:
+        return name_inferred
     quantization = config.get("quantization") or config.get("quantization_config")
     if isinstance(quantization, dict):
         bits = quantization.get("bits")
@@ -240,6 +355,58 @@ def _public_model_id_from_name(value: str) -> str | None:
     if not text:
         return None
     lowered = text.replace("\\", "/").lower()
+    if QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID in lowered:
+        return QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
+    if QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID in lowered:
+        return QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
+    if QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower() in lowered:
+        return QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
+    if QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID.lower() in lowered:
+        return QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
+    if "qwen3.5-9b-mtplx-optimized-speed-fp16" in lowered:
+        return QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
+    if (
+        "qwen3.5-9b" in lowered
+        and "mtplx" in lowered
+        and ("optimized-speed" in lowered or "speed-6bit" in lowered)
+    ):
+        return QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
+    if QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID in lowered:
+        return QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID
+    if QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID in lowered:
+        return QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID
+    if QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID.lower() in lowered:
+        return QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID
+    if QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID.lower() in lowered:
+        return QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID
+    if (
+        ("qwen3.6-35b-a3b" in lowered or "qwen36-35b-a3b" in lowered)
+        and "optimized-balance-fp16" in lowered
+    ):
+        return QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID
+    if QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID in lowered:
+        return QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
+    if QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID in lowered:
+        return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
+    if QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower() in lowered:
+        return QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
+    if QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID.lower() in lowered:
+        return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
+    if (
+        ("qwen3.6-35b-a3b" in lowered or "qwen36-35b-a3b" in lowered)
+        and "optimized-speed-fp16" in lowered
+    ):
+        return QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
+    if (
+        ("qwen3.6-35b-a3b" in lowered or "qwen36-35b-a3b" in lowered)
+        and "optimized-balance" in lowered
+    ):
+        return QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID
+    if (
+        ("qwen3.6-35b-a3b" in lowered or "qwen36-35b-a3b" in lowered)
+        and "mtplx" in lowered
+    ):
+        return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
     if "qwen3.6-27b-mtplx-optimized-quality" in lowered:
         return QUALITY_PUBLIC_MODEL_ID
     if "qwen3.6-27b-mtplx-optimized-speed-fp16" in lowered:
@@ -318,6 +485,13 @@ def _hardware_generation(hardware: Mapping[str, Any]) -> str:
     )
 
 
+def _hardware_memory_gib(hardware: Mapping[str, Any]) -> float | None:
+    value = hardware.get("memory_gib")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value > 0 else None
+
+
 def select_default_model(
     *,
     variant_override: str | None = None,
@@ -326,7 +500,11 @@ def select_default_model(
     """Select the verified default model for this machine.
 
     Auto policy is intentionally simple and visible:
-    M1/M2 -> FP16, M3/M4/M5/unknown -> quantized Optimized Speed.
+    M1/M2 -> FP16, M3/M4/M5/unknown -> quantized Optimized Speed, and
+    machines under 32 GiB of unified memory route to the 9B artifact in the
+    selected precision (the 27B default cannot load safely there). Memory is
+    only consulted when known: callers passing a hardware mapping without
+    ``memory_gib`` keep the pure generation-based policy.
     """
 
     env_value = variant_override if variant_override is not None else os.environ.get(DEFAULT_MODEL_VARIANT_ENV)
@@ -334,6 +512,7 @@ def select_default_model(
     hardware_info = dict(detect_apple_silicon() if hardware is None else hardware)
     generation = _hardware_generation(hardware_info)
     chip = str(hardware_info.get("chip") or "").strip()
+    memory_gib = _hardware_memory_gib(hardware_info)
 
     if requested_variant == "fp16":
         variant = "fp16"
@@ -363,7 +542,24 @@ def select_default_model(
     if invalid_override is not None and requested_variant == "auto":
         reason = f"{reason}; ignored invalid {DEFAULT_MODEL_VARIANT_ENV}={invalid_override}"
 
-    if variant == "fp16":
+    route_small = (
+        memory_gib is not None and memory_gib < SMALL_DEFAULT_MEMORY_FLOOR_GIB
+    )
+    if route_small:
+        # The variant override still controls precision; memory routing only
+        # changes the model size, mirroring the app's <32 GiB tier.
+        reason = (
+            f"{reason}; routed to 9B for {memory_gib:.0f} GiB unified memory"
+        )
+        if variant == "fp16":
+            model = QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID
+            hf_model = QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID
+            precision = "FP16"
+        else:
+            model = QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID
+            hf_model = QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID
+            precision = QWEN35_9B_SPEED_DESCRIPTION
+    elif variant == "fp16":
         model = DEFAULT_FP16_HF_MODEL_ID
         hf_model = DEFAULT_FP16_HF_MODEL_ID
         precision = "FP16"
@@ -381,6 +577,7 @@ def select_default_model(
         chip_generation=generation,
         chip=chip,
         reason=reason,
+        memory_gib=memory_gib,
         auto_selected=auto_selected,
         env_override=env_value if env_value else None,
     )

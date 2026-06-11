@@ -75,6 +75,28 @@ def test_foreground_fifo_order_is_preserved():
         scheduler.shutdown(wait=True, cancel_futures=True)
 
 
+def test_model_scheduler_exposes_queue_and_batch_telemetry():
+    scheduler = ModelWorkScheduler(name="test-model-scheduler", idle_grace_s=0.0)
+    try:
+        future = scheduler.submit_foreground(
+            lambda: "ok",
+            batch_key="chat.stream",
+        )
+        assert future.result(timeout=2) == "ok"
+        scheduler.record_batch_step(size=3, batch_key="ar_batch.decode")
+        stats = scheduler.stats()
+
+        assert stats["started"] == 1
+        assert stats["completed"] == 1
+        assert stats["started_by_batch_key"]["chat.stream"] == 1
+        assert stats["started_by_batch_key"]["ar_batch.decode"] == 1
+        assert stats["batch_histogram"] == {"1": 1, "3": 1}
+        assert stats["queue_wait_s"]["count"] == 1
+        assert stats["run_duration_s"]["count"] == 1
+    finally:
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
 def test_model_work_runs_on_one_owner_thread():
     scheduler = ModelWorkScheduler(name="test-model-scheduler", idle_grace_s=0.0)
     try:

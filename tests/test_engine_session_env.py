@@ -55,3 +55,61 @@ def test_bank_bytes_from_env_nonpositive_uses_default(monkeypatch, raw):
     monkeypatch.setenv("TEST_BANK_BYTES", raw)
     es = _reload_module()
     assert es._bank_bytes_from_env("TEST_BANK_BYTES", 8888) == 8888
+
+
+def test_short_no_history_api_request_is_foreground_by_default():
+    es = _reload_module()
+    messages = [
+        {"role": "system", "content": "Return only the final answer."},
+        {"role": "user", "content": "Compute 17 + 29 + 101."},
+    ]
+
+    assert (
+        es.is_background_request(
+            messages=messages,
+            max_tokens=32,
+            headers={},
+            metadata={},
+            main_system_hash=None,
+        )
+        is False
+    )
+
+
+def test_openwebui_task_header_still_marks_background():
+    es = _reload_module()
+    messages = [
+        {"role": "system", "content": "Return a short title."},
+        {"role": "user", "content": "Conversation text"},
+    ]
+
+    assert (
+        es.is_background_request(
+            messages=messages,
+            max_tokens=32,
+            headers={"x-openwebui-task": "title"},
+            metadata={},
+            main_system_hash=None,
+        )
+        is True
+    )
+
+
+def test_system_prompt_mismatch_still_marks_background():
+    es = _reload_module()
+    main_hash = es.hash_text("main chat system")
+    messages = [
+        {"role": "system", "content": "Return a short title."},
+        {"role": "user", "content": "Conversation text"},
+    ]
+
+    assert (
+        es.is_background_request(
+            messages=messages,
+            max_tokens=32,
+            headers={},
+            metadata={},
+            main_system_hash=main_hash,
+        )
+        is True
+    )

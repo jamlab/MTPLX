@@ -100,6 +100,7 @@ def test_manager_default_max_entries_when_unset(monkeypatch):
     monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_BYTES", raising=False)
     monkeypatch.delenv("MTPLX_SESSION_BANK_PER_SESSION_BYTES", raising=False)
     es = _reload_engine_session()
+    monkeypatch.setattr(es.sys, "platform", "linux")
     mgr = es.EngineSessionManager()
     # Mirrors SessionBank's public default.
     assert mgr.bank.max_entries == 8
@@ -113,6 +114,7 @@ def test_manager_invalid_max_entries_falls_back_to_default(
     monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_BYTES", raising=False)
     monkeypatch.delenv("MTPLX_SESSION_BANK_PER_SESSION_BYTES", raising=False)
     es = _reload_engine_session()
+    monkeypatch.setattr(es.sys, "platform", "linux")
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="mtplx.engine_session"):
         mgr = es.EngineSessionManager()
@@ -143,7 +145,68 @@ def test_manager_byte_caps_alone_still_work(monkeypatch):
     monkeypatch.setenv("MTPLX_SESSION_BANK_MAX_BYTES", "16G")
     monkeypatch.setenv("MTPLX_SESSION_BANK_PER_SESSION_BYTES", "8G")
     es = _reload_engine_session()
+    monkeypatch.setattr(es.sys, "platform", "linux")
     mgr = es.EngineSessionManager()
     assert mgr.bank.max_entries == 8
     assert mgr.bank.max_bytes == 16 * 1024**3
     assert mgr.bank.per_session_max_bytes == 8 * 1024**3
+
+
+def test_manager_uses_24g_per_session_default_on_high_memory_darwin(
+    monkeypatch,
+):
+    monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_ENTRIES", raising=False)
+    monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_SESSION_BANK_PER_SESSION_BYTES", raising=False)
+    es = _reload_engine_session()
+    monkeypatch.setattr(es.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        es.subprocess,
+        "check_output",
+        lambda *args, **kwargs: str(128 * 1024**3),
+    )
+
+    mgr = es.EngineSessionManager()
+
+    assert mgr.bank.max_entries == 16
+    assert mgr.bank.max_bytes == 24 * 1024**3
+    assert mgr.bank.per_session_max_bytes == 24 * 1024**3
+
+
+def test_manager_keeps_8g_per_session_default_below_high_memory_threshold(
+    monkeypatch,
+):
+    monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_ENTRIES", raising=False)
+    monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_BYTES", raising=False)
+    monkeypatch.delenv("MTPLX_SESSION_BANK_PER_SESSION_BYTES", raising=False)
+    es = _reload_engine_session()
+    monkeypatch.setattr(es.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        es.subprocess,
+        "check_output",
+        lambda *args, **kwargs: str(64 * 1024**3),
+    )
+
+    mgr = es.EngineSessionManager()
+
+    assert mgr.bank.max_entries == 8
+    assert mgr.bank.per_session_max_bytes == 8 * 1024**3
+
+
+def test_manager_per_session_env_override_wins_on_high_memory_darwin(
+    monkeypatch,
+):
+    monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_ENTRIES", raising=False)
+    monkeypatch.delenv("MTPLX_SESSION_BANK_MAX_BYTES", raising=False)
+    monkeypatch.setenv("MTPLX_SESSION_BANK_PER_SESSION_BYTES", "12G")
+    es = _reload_engine_session()
+    monkeypatch.setattr(es.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        es.subprocess,
+        "check_output",
+        lambda *args, **kwargs: str(128 * 1024**3),
+    )
+
+    mgr = es.EngineSessionManager()
+
+    assert mgr.bank.per_session_max_bytes == 12 * 1024**3

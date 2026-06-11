@@ -26,6 +26,16 @@ class CacheSnapshot:
     meta_states: tuple[Any, ...]
 
 
+@dataclass(frozen=True)
+class _PagedGQARouteDecision:
+    route: str
+    reason: str
+    requested_route: str
+    min_context: int
+    min_q: int
+    max_q: int
+
+
 def _normalize_detach_mode(mode: str) -> str:
     normalized = mode.strip().lower().replace("-", "_")
     if normalized not in SUPPORTED_DETACH_MODES:
@@ -449,6 +459,203 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _paged_gqa_sdpa_route_decision_from_env(
+    *,
+    q_len: int,
+    offset: int,
+    query_heads: int,
+    kv_heads: int,
+) -> _PagedGQARouteDecision:
+    raw = (
+        os.environ.get("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE")
+        or os.environ.get("MTPLX_PAGED_GQA_SDPA_ROUTE")
+        or ""
+    ).strip()
+    if not raw and _env_truthy("MTPLX_VLLM_METAL_PAGED_GQA_SDPA"):
+        raw = "auto"
+    route = raw.lower().replace("-", "_")
+    min_context = _env_int("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT", 65536)
+    min_q = _env_int("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_Q", 4)
+    max_q = _env_int("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MAX_Q", 5)
+    if route in {"", "0", "false", "no", "off", "disabled"}:
+        return _PagedGQARouteDecision("", "disabled", route, min_context, min_q, max_q)
+    if route in {"1", "true", "yes", "on"}:
+        route = "auto"
+    if route not in {"auto", "grouped", "per_head", "async_per_head"}:
+        return _PagedGQARouteDecision(
+            "", "unsupported_route", route, min_context, min_q, max_q
+        )
+    q_len = int(q_len)
+    offset = int(offset)
+    query_heads = int(query_heads)
+    kv_heads = int(kv_heads)
+    if kv_heads <= 0 or query_heads <= 0 or query_heads == kv_heads:
+        return _PagedGQARouteDecision("", "not_gqa", route, min_context, min_q, max_q)
+    if query_heads % kv_heads:
+        return _PagedGQARouteDecision(
+            "", "query_heads_not_multiple_of_kv_heads", route, min_context, min_q, max_q
+        )
+    if offset < min_context:
+        return _PagedGQARouteDecision(
+            "", "context_lt_min", route, min_context, min_q, max_q
+        )
+    if q_len < min_q:
+        return _PagedGQARouteDecision("", "q_len_lt_min", route, min_context, min_q, max_q)
+    if q_len > max_q:
+        return _PagedGQARouteDecision("", "q_len_gt_max", route, min_context, min_q, max_q)
+    if route == "auto":
+        route = "async_per_head"
+    return _PagedGQARouteDecision(route, "enabled", route, min_context, min_q, max_q)
+
+
+def _paged_gqa_sdpa_route_from_env(
+    *,
+    q_len: int,
+    offset: int,
+    query_heads: int,
+    kv_heads: int,
+) -> str:
+    return _paged_gqa_sdpa_route_decision_from_env(
+        q_len=q_len,
+        offset=offset,
+        query_heads=query_heads,
+        kv_heads=kv_heads,
+    ).route
+
+
+_PAGED_GQA_SDPA_STREAMS: dict[int, list[Any]] = {}
+_PAGED_GQA_SDPA_MASK_CACHE_MAX = 8
+_PAGED_GQA_SDPA_MASK_CACHE: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+
+
+def _paged_gqa_tail_causal_mask(q_len: int, kv_len: int) -> Any:
+    import mlx.core as mx
+
+    q_pos = mx.arange(kv_len - q_len, kv_len)[:, None]
+    k_pos = mx.arange(kv_len)[None, :]
+    return k_pos <= q_pos
+
+
+def _cached_paged_gqa_mask(key: tuple[Any, ...], source: Any, mask: Any) -> Any:
+    if len(_PAGED_GQA_SDPA_MASK_CACHE) >= _PAGED_GQA_SDPA_MASK_CACHE_MAX:
+        _PAGED_GQA_SDPA_MASK_CACHE.clear()
+    _PAGED_GQA_SDPA_MASK_CACHE[key] = (source, mask)
+    return mask
+
+
+def _repeat_paged_gqa_mask(mask: Any, *, q_len: int, kv_len: int, gqa: int) -> Any:
+    import mlx.core as mx
+
+    if mask is None or (isinstance(mask, str) and mask == "causal"):
+        key = ("causal", int(q_len), int(kv_len), int(gqa))
+        cached = _PAGED_GQA_SDPA_MASK_CACHE.get(key)
+        if cached is not None:
+            return cached[1]
+        mask = _paged_gqa_tail_causal_mask(q_len, kv_len)
+        reps = [1] * mask.ndim
+        reps[-2] = int(gqa)
+        return _cached_paged_gqa_mask(key, None, mx.tile(mask, tuple(reps)))
+    if not isinstance(mask, mx.array):
+        return mask
+    if int(mask.shape[-2]) != q_len:
+        return mask
+    key = (
+        "array",
+        id(mask),
+        tuple(int(dim) for dim in mask.shape),
+        str(mask.dtype),
+        int(gqa),
+    )
+    cached = _PAGED_GQA_SDPA_MASK_CACHE.get(key)
+    if cached is not None and cached[0] is mask:
+        return cached[1]
+    reps = [1] * mask.ndim
+    reps[-2] = int(gqa)
+    return _cached_paged_gqa_mask(key, mask, mx.tile(mask, tuple(reps)))
+
+
+def _paged_gqa_sdpa_streams_for(kv_heads: int) -> list[Any]:
+    import mlx.core as mx
+
+    if kv_heads not in _PAGED_GQA_SDPA_STREAMS:
+        _PAGED_GQA_SDPA_STREAMS[kv_heads] = [mx.new_stream(mx.gpu) for _ in range(kv_heads)]
+    return _PAGED_GQA_SDPA_STREAMS[kv_heads]
+
+
+def _paged_gqa_sdpa(
+    *,
+    queries: Any,
+    keys: Any,
+    values: Any,
+    scale: float,
+    mask: Any,
+    route: str,
+) -> Any | None:
+    import mlx.core as mx
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    batch_size, query_heads, q_len, head_dim = queries.shape
+    _, kv_heads, kv_len, _ = keys.shape
+    if int(batch_size) != 1 or kv_heads <= 0 or query_heads % kv_heads:
+        return None
+    gqa = int(query_heads) // int(kv_heads)
+    grouped_queries = queries.reshape(
+        batch_size,
+        kv_heads,
+        gqa,
+        q_len,
+        head_dim,
+    ).reshape(batch_size, kv_heads, gqa * q_len, head_dim)
+    grouped_mask = _repeat_paged_gqa_mask(mask, q_len=q_len, kv_len=kv_len, gqa=gqa)
+    if route == "grouped":
+        output = scaled_dot_product_attention(
+            grouped_queries,
+            keys,
+            values,
+            cache=None,
+            scale=scale,
+            mask=grouped_mask,
+        )
+    elif route == "per_head":
+        output = mx.concatenate(
+            [
+                scaled_dot_product_attention(
+                    grouped_queries[:, head : head + 1, :, :],
+                    keys[:, head : head + 1, :, :],
+                    values[:, head : head + 1, :, :],
+                    cache=None,
+                    scale=scale,
+                    mask=grouped_mask,
+                )
+                for head in range(kv_heads)
+            ],
+            axis=1,
+        )
+    elif route == "async_per_head":
+        outputs = []
+        for head, stream in enumerate(_paged_gqa_sdpa_streams_for(kv_heads)):
+            with mx.stream(stream):
+                output = scaled_dot_product_attention(
+                    grouped_queries[:, head : head + 1, :, :],
+                    keys[:, head : head + 1, :, :],
+                    values[:, head : head + 1, :, :],
+                    cache=None,
+                    scale=scale,
+                    mask=grouped_mask,
+                )
+                mx.async_eval(output)
+                outputs.append(output)
+        output = mx.concatenate(outputs, axis=1)
+    else:
+        return None
+    return output.reshape(batch_size, kv_heads, gqa, q_len, head_dim).reshape(
+        batch_size,
+        query_heads,
+        q_len,
+        head_dim,
+    )
+
+
 def _dynamic_paged_num_blocks(*, block_size: int, configured_blocks: int) -> int:
     if not _env_truthy("MTPLX_DYNAMIC_PAGED_KV"):
         return int(configured_blocks)
@@ -470,9 +677,15 @@ def _dynamic_paged_num_blocks(*, block_size: int, configured_blocks: int) -> int
     return max(min_blocks, required_blocks)
 
 
-def _paged_attention_requires_external_ops(*, turboquant_config: Any | None = None) -> bool:
+def _paged_attention_requires_external_ops(
+    *,
+    turboquant_config: Any | None = None,
+    kv_quant_config: Any | None = None,
+) -> bool:
     if turboquant_config is not None:
         return True
+    if kv_quant_config is not None:
+        return False
     impl = _paged_attention_impl_from_env()
     if impl in {"fast_sdpa_gather", "sdpa_gather", "exact_gather"}:
         return False
@@ -596,6 +809,7 @@ class VllmMetalPagedKVCache:
         values: Any | None = None,
         offset: int = 0,
         turboquant_config: Any | None = None,
+        kv_quant_config: Any | None = None,
     ) -> None:
         self.block_size = int(block_size)
         self.num_blocks = int(num_blocks)
@@ -607,13 +821,26 @@ class VllmMetalPagedKVCache:
         self.key_zero_cache = None
         self.turboquant_config = turboquant_config
         self.turboquant = turboquant_config is not None
+        self.kv_quant_config = kv_quant_config
+        self.kv_quant = kv_quant_config is not None
         self._shape: tuple[int, int, int] | None = None
         self._dtypes: tuple[Any, Any] | None = None
         self.update_calls = 0
         self.paged_attention_calls = 0
         self.partitioned_attention_calls = 0
         self.turboquant_attention_calls = 0
+        self.kv_quant_attention_calls = 0
+        self.gqa_sdpa_calls = 0
+        self.gqa_sdpa_calls_by_route: dict[str, int] = {}
+        self.gqa_sdpa_calls_by_phase: dict[str, int] = {}
+        self.gqa_sdpa_route_misses_by_phase_reason: dict[str, int] = {}
+        self.gqa_sdpa_route_misses_by_q_len: dict[str, int] = {}
+        self.gqa_sdpa_last_route_miss: dict[str, int | str] = {}
         self.active_array_calls = 0
+        self.active_array_time_s = 0.0
+        self.kv_quant_dequant_calls = 0
+        self.kv_quant_dequant_time_s = 0.0
+        self.kv_quant_dequant_tokens = 0
         self.dense_fallback_calls = 0
         self.dense_fallback_calls_by_phase: dict[str, int] = {}
         self.paged_attention_bailouts_by_phase_reason: dict[str, int] = {}
@@ -637,6 +864,7 @@ class VllmMetalPagedKVCache:
         block_size: int = 16,
         num_blocks: int = 1024,
         turboquant_config: Any | None = None,
+        kv_quant_config: Any | None = None,
     ) -> "VllmMetalPagedKVCache":
         return cls(
             block_size=block_size,
@@ -645,6 +873,7 @@ class VllmMetalPagedKVCache:
             values=getattr(entry, "values", None),
             offset=int(getattr(entry, "offset", 0)),
             turboquant_config=turboquant_config,
+            kv_quant_config=kv_quant_config,
         )
 
     @property
@@ -736,20 +965,15 @@ class VllmMetalPagedKVCache:
             self.turboquant_config = None
         if self.turboquant:
             from .turboquant import (
-                CENTROIDS_3BIT,
                 SCALE_GROUP_SIZE,
                 packed_dim,
+                value_centroids,
                 validate_head_dim,
             )
 
             validate_head_dim(k_head_dim)
             validate_head_dim(v_head_dim)
             cfg = self.turboquant_config
-            if int(cfg.value_bits) != 3:
-                raise ValueError(
-                    "MTPLX TurboQuant currently supports v_quant='q3_0' for "
-                    "the Metal paged diagnostic path"
-                )
             key_dtype = mx.int8 if cfg.key_dtype_name == "int8" else mx.uint8
             self.key_cache = mx.zeros(
                 (
@@ -778,7 +1002,9 @@ class VllmMetalPagedKVCache:
             self.key_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
             self.value_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
             self.key_zero_cache = mx.zeros(scale_shape, dtype=mx.float16)
-            self._turboquant_v_centroids = mx.array(CENTROIDS_3BIT, dtype=mx.float32)
+            self._turboquant_v_centroids = mx.array(
+                value_centroids(int(cfg.value_bits)), dtype=mx.float32
+            )
             mx.eval(
                 self.key_cache,
                 self.value_cache,
@@ -786,6 +1012,40 @@ class VllmMetalPagedKVCache:
                 self.value_scale_cache,
                 self.key_zero_cache,
                 self._turboquant_v_centroids,
+            )
+        elif self.kv_quant:
+            from .kv_quant import packed_dim
+
+            cfg = self.kv_quant_config
+            bits = int(cfg.bits)
+            cache_dtype = mx.int8 if bits == 8 else mx.uint8
+            self.key_cache = mx.zeros(
+                (
+                    self.num_blocks,
+                    self.block_size,
+                    n_kv_heads,
+                    packed_dim(k_head_dim, bits),
+                ),
+                dtype=cache_dtype,
+            )
+            self.value_cache = mx.zeros(
+                (
+                    self.num_blocks,
+                    self.block_size,
+                    n_kv_heads,
+                    packed_dim(v_head_dim, bits),
+                ),
+                dtype=cache_dtype,
+            )
+            scale_shape = (self.num_blocks, self.block_size, n_kv_heads, 1)
+            self.key_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
+            self.value_scale_cache = mx.zeros(scale_shape, dtype=mx.float16)
+            self.key_zero_cache = None
+            mx.eval(
+                self.key_cache,
+                self.value_cache,
+                self.key_scale_cache,
+                self.value_scale_cache,
             )
         else:
             self.key_cache = mx.zeros(
@@ -881,6 +1141,42 @@ class VllmMetalPagedKVCache:
                 int(cfg.key_bits),
                 bool(cfg.key_signed),
             )
+        elif self.kv_quant:
+            if self.key_scale_cache is None or self.value_scale_cache is None:
+                raise RuntimeError("paged KV quantization scale caches were not allocated")
+            from .kv_quant import quantize_symmetric
+
+            bits = int(self.kv_quant_config.bits)
+            qk, k_scale = quantize_symmetric(k_3d, bits=bits)
+            qv, v_scale = quantize_symmetric(v_3d, bits=bits)
+            flat_k = self.key_cache.reshape(
+                -1,
+                int(self.key_cache.shape[2]),
+                int(self.key_cache.shape[3]),
+            )
+            flat_v = self.value_cache.reshape(
+                -1,
+                int(self.value_cache.shape[2]),
+                int(self.value_cache.shape[3]),
+            )
+            flat_ks = self.key_scale_cache.reshape(
+                -1,
+                int(self.key_scale_cache.shape[2]),
+                int(self.key_scale_cache.shape[3]),
+            )
+            flat_vs = self.value_scale_cache.reshape(
+                -1,
+                int(self.value_scale_cache.shape[2]),
+                int(self.value_scale_cache.shape[3]),
+            )
+            flat_k[slot_mapping] = qk
+            flat_v[slot_mapping] = qv
+            flat_ks[slot_mapping] = k_scale
+            flat_vs[slot_mapping] = v_scale
+            self.key_cache = flat_k.reshape(self.key_cache.shape)
+            self.value_cache = flat_v.reshape(self.value_cache.shape)
+            self.key_scale_cache = flat_ks.reshape(self.key_scale_cache.shape)
+            self.value_scale_cache = flat_vs.reshape(self.value_scale_cache.shape)
         else:
             flat_k = self.key_cache.reshape(-1, int(keys.shape[1]), int(keys.shape[3]))
             flat_v = self.value_cache.reshape(-1, int(values.shape[1]), int(values.shape[3]))
@@ -985,6 +1281,50 @@ class VllmMetalPagedKVCache:
                 file=sys.stderr,
             )
 
+    def _record_gqa_route_miss(
+        self,
+        decision: _PagedGQARouteDecision,
+        *,
+        offset: int,
+        q_len: int,
+        query_heads: int,
+        kv_heads: int,
+    ) -> None:
+        if not decision.requested_route or decision.reason in {"disabled", "enabled"}:
+            return
+        phase = current_attention_phase()
+        reason = decision.reason.strip().lower() or "unknown"
+        key = f"{phase}:{reason}"
+        self.gqa_sdpa_route_misses_by_phase_reason[key] = (
+            int(self.gqa_sdpa_route_misses_by_phase_reason.get(key, 0)) + 1
+        )
+        q_key = f"{phase}:q{int(q_len)}:{reason}"
+        self.gqa_sdpa_route_misses_by_q_len[q_key] = (
+            int(self.gqa_sdpa_route_misses_by_q_len.get(q_key, 0)) + 1
+        )
+        self.gqa_sdpa_last_route_miss = {
+            "phase": phase,
+            "reason": reason,
+            "requested_route": str(decision.requested_route),
+            "offset": int(offset),
+            "q_len": int(q_len),
+            "query_heads": int(query_heads),
+            "kv_heads": int(kv_heads),
+            "min_context": int(decision.min_context),
+            "min_q": int(decision.min_q),
+            "max_q": int(decision.max_q),
+        }
+        if _env_truthy("MTPLX_PREFILL_ROUTE_TRACE"):
+            print(
+                "mtplx_prefill_route "
+                f"path=paged_gqa_sdpa_miss phase={phase} reason={reason} "
+                f"route={decision.requested_route} offset={int(offset)} "
+                f"q_len={int(q_len)} q_heads={int(query_heads)} kv_heads={int(kv_heads)} "
+                f"min_context={int(decision.min_context)} "
+                f"min_q={int(decision.min_q)} max_q={int(decision.max_q)}",
+                file=sys.stderr,
+            )
+
     def record_dense_fallback(self) -> None:
         self.dense_fallback_calls += 1
         phase = current_attention_phase()
@@ -1009,6 +1349,39 @@ class VllmMetalPagedKVCache:
             int(self.value_cache.shape[2]),
             int(self.value_cache.shape[3]),
         )[start:end]
+        if self.kv_quant:
+            if (
+                self.key_scale_cache is None
+                or self.value_scale_cache is None
+                or self._shape is None
+                or self._dtypes is None
+            ):
+                raise RuntimeError("paged KV quantization cache is incomplete")
+            from .kv_quant import dequantize_symmetric
+
+            bits = int(self.kv_quant_config.bits)
+            flat_ks = self.key_scale_cache.reshape(
+                -1,
+                int(self.key_scale_cache.shape[2]),
+                int(self.key_scale_cache.shape[3]),
+            )[start:end]
+            flat_vs = self.value_scale_cache.reshape(
+                -1,
+                int(self.value_scale_cache.shape[2]),
+                int(self.value_scale_cache.shape[3]),
+            )[start:end]
+            flat_k = dequantize_symmetric(
+                flat_k,
+                flat_ks,
+                bits=bits,
+                head_dim=int(self._shape[1]),
+            ).astype(self._dtypes[0])
+            flat_v = dequantize_symmetric(
+                flat_v,
+                flat_vs,
+                bits=bits,
+                head_dim=int(self._shape[2]),
+            ).astype(self._dtypes[1])
         return flat_k.transpose(1, 0, 2)[None, ...], flat_v.transpose(1, 0, 2)[None, ...]
 
     def _large_q_split_sdpa_fallback(
@@ -1173,31 +1546,42 @@ class VllmMetalPagedKVCache:
         return mx.concatenate(outputs, axis=2).astype(queries.dtype)
 
     def _active_arrays(self) -> tuple[Any | None, Any | None]:
+        started = time.perf_counter()
         self.active_array_calls += 1
-        if (
-            _env_truthy("MTPLX_ASSERT_NO_PAGED_ACTIVE_ARRAYS")
-            and self._long_context_dense_fallback_forbidden()
-        ):
-            raise RuntimeError(
-                "Paged KV cache attempted to materialize active K/V arrays in "
-                f"the long-context path phase={current_attention_phase()} "
-                f"offset={int(self.offset)} threshold={self._partition_threshold()}"
-            )
-        if self.key_cache is None or self.value_cache is None or self.offset <= 0:
-            return None, None
-        if self.turboquant:
-            return None, None
-        flat_k = self.key_cache.reshape(
-            -1,
-            int(self.key_cache.shape[2]),
-            int(self.key_cache.shape[3]),
-        )[: self.offset]
-        flat_v = self.value_cache.reshape(
-            -1,
-            int(self.value_cache.shape[2]),
-            int(self.value_cache.shape[3]),
-        )[: self.offset]
-        return flat_k.transpose(1, 0, 2)[None, ...], flat_v.transpose(1, 0, 2)[None, ...]
+        try:
+            if (
+                _env_truthy("MTPLX_ASSERT_NO_PAGED_ACTIVE_ARRAYS")
+                and self._long_context_dense_fallback_forbidden()
+            ):
+                raise RuntimeError(
+                    "Paged KV cache attempted to materialize active K/V arrays in "
+                    f"the long-context path phase={current_attention_phase()} "
+                    f"offset={int(self.offset)} threshold={self._partition_threshold()}"
+                )
+            if self.key_cache is None or self.value_cache is None or self.offset <= 0:
+                return None, None
+            if self.turboquant:
+                return None, None
+            if self.kv_quant:
+                dequant_started = time.perf_counter()
+                keys, values = self._paged_range(0, int(self.offset))
+                self.kv_quant_dequant_calls += 1
+                self.kv_quant_dequant_time_s += time.perf_counter() - dequant_started
+                self.kv_quant_dequant_tokens += int(self.offset)
+                return keys, values
+            flat_k = self.key_cache.reshape(
+                -1,
+                int(self.key_cache.shape[2]),
+                int(self.key_cache.shape[3]),
+            )[: self.offset]
+            flat_v = self.value_cache.reshape(
+                -1,
+                int(self.value_cache.shape[2]),
+                int(self.value_cache.shape[3]),
+            )[: self.offset]
+            return flat_k.transpose(1, 0, 2)[None, ...], flat_v.transpose(1, 0, 2)[None, ...]
+        finally:
+            self.active_array_time_s += time.perf_counter() - started
 
     @property
     def keys(self):
@@ -1356,6 +1740,19 @@ class VllmMetalPagedKVCache:
         def run_partitioned_paged(*, force_fp32_paged: bool = False):
             if self.turboquant:
                 return bailout("turboquant_unsupported")
+            if self.kv_quant:
+                split_out = self._large_q_split_sdpa_fallback(
+                    queries,
+                    scale=scale,
+                    sliding_window=int(sliding_window),
+                    mask=mask,
+                )
+                if split_out is not None:
+                    self.paged_attention_calls += 1
+                    self.kv_quant_attention_calls += 1
+                    self.attention_time_s += time.perf_counter() - started
+                    return split_out
+                return bailout("kv_quant_partitioned_unsupported")
             if self.key_cache is None or self.value_cache is None:
                 return bailout("empty_cache")
             kernel_queries = queries.astype(mx.float32) if force_fp32_paged else queries
@@ -1542,7 +1939,7 @@ class VllmMetalPagedKVCache:
             self.paged_attention_calls += 1
             self.attention_time_s += time.perf_counter() - started
             return out
-        if not self.turboquant and impl in {"sdpa_2pass_paged", "mlx_vector_paged"}:
+        if not self.turboquant and not self.kv_quant and impl in {"sdpa_2pass_paged", "mlx_vector_paged"}:
             from .kernels.sdpa_2pass_paged import sdpa_2pass_paged_tail
 
             two_pass_threshold = int(
@@ -1569,6 +1966,51 @@ class VllmMetalPagedKVCache:
                 self.paged_attention_calls += 1
                 self.attention_time_s += time.perf_counter() - started
                 return out
+            gqa_decision = _paged_gqa_sdpa_route_decision_from_env(
+                q_len=q_len,
+                offset=int(self.offset),
+                query_heads=int(queries.shape[1]),
+                kv_heads=int(self.key_cache.shape[2]),
+            )
+            gqa_route = gqa_decision.route
+            if gqa_route:
+                keys, values = self._active_attention_arrays(sliding_window)
+                if keys is not None and values is not None:
+                    out = _paged_gqa_sdpa(
+                        queries=queries,
+                        keys=keys,
+                        values=values,
+                        scale=float(scale),
+                        mask=mask,
+                        route=gqa_route,
+                    )
+                    if out is not None:
+                        self.paged_attention_calls += 1
+                        self.gqa_sdpa_calls += 1
+                        self.gqa_sdpa_calls_by_route[gqa_route] = (
+                            int(self.gqa_sdpa_calls_by_route.get(gqa_route, 0)) + 1
+                        )
+                        phase = current_attention_phase()
+                        self.gqa_sdpa_calls_by_phase[phase] = (
+                            int(self.gqa_sdpa_calls_by_phase.get(phase, 0)) + 1
+                        )
+                        self.attention_time_s += time.perf_counter() - started
+                        if _env_truthy("MTPLX_PREFILL_ROUTE_TRACE"):
+                            print(
+                                "mtplx_prefill_route "
+                                f"path=paged_gqa_sdpa route={gqa_route} phase={phase} "
+                                f"offset={int(self.offset)} q_len={q_len}",
+                                file=sys.stderr,
+                        )
+                        return out
+            else:
+                self._record_gqa_route_miss(
+                    gqa_decision,
+                    offset=int(self.offset),
+                    q_len=q_len,
+                    query_heads=int(queries.shape[1]),
+                    kv_heads=int(self.key_cache.shape[2]),
+                )
             safe_tail_q_len = self._safe_2pass_paged_q_len(
                 query_heads=int(queries.shape[1]),
                 kv_heads=int(self.key_cache.shape[2]),
@@ -1595,6 +2037,63 @@ class VllmMetalPagedKVCache:
                 self.attention_time_s += time.perf_counter() - started
                 return out
             return bailout("kernel_unavailable")
+        if self.kv_quant:
+            from mlx_lm.models.base import scaled_dot_product_attention
+
+            gqa_decision = _paged_gqa_sdpa_route_decision_from_env(
+                q_len=q_len,
+                offset=int(self.offset),
+                query_heads=int(queries.shape[1]),
+                kv_heads=int(self._shape[0]) if self._shape is not None else 0,
+            )
+            gqa_route = gqa_decision.route
+            keys, values = self._active_attention_arrays(sliding_window)
+            if keys is None or values is None:
+                return bailout("empty_cache")
+            if gqa_route:
+                out = _paged_gqa_sdpa(
+                    queries=queries,
+                    keys=keys,
+                    values=values,
+                    scale=float(scale),
+                    mask=mask,
+                    route=gqa_route,
+                )
+                if out is not None:
+                    self.paged_attention_calls += 1
+                    self.kv_quant_attention_calls += 1
+                    self.gqa_sdpa_calls += 1
+                    self.gqa_sdpa_calls_by_route[gqa_route] = (
+                        int(self.gqa_sdpa_calls_by_route.get(gqa_route, 0)) + 1
+                    )
+                    phase = current_attention_phase()
+                    self.gqa_sdpa_calls_by_phase[phase] = (
+                        int(self.gqa_sdpa_calls_by_phase.get(phase, 0)) + 1
+                    )
+                    self.attention_time_s += time.perf_counter() - started
+                    return out
+            else:
+                self._record_gqa_route_miss(
+                    gqa_decision,
+                    offset=int(self.offset),
+                    q_len=q_len,
+                    query_heads=int(queries.shape[1]),
+                    kv_heads=int(self._shape[0]) if self._shape is not None else 0,
+                )
+            if q_len > max_q_len and partitioned_enabled and int(self.offset) >= partition_threshold:
+                return run_partitioned_paged(force_fp32_paged=False)
+            out = scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                cache=None,
+                scale=scale,
+                mask=mask,
+            )
+            self.paged_attention_calls += 1
+            self.kv_quant_attention_calls += 1
+            self.attention_time_s += time.perf_counter() - started
+            return out
         force_fp32_paged = impl in {"fp32_paged", "paged_fp32"}
         kernel_queries = queries.astype(mx.float32) if force_fp32_paged else queries
         kernel_key_cache = (
@@ -1693,8 +2192,13 @@ class VllmMetalPagedKVCache:
         return out.astype(queries.dtype) if force_fp32_paged else out
 
     def paged_stats(self) -> dict[str, Any]:
+        mode = "vllm_metal_paged"
+        if self.turboquant:
+            mode = "vllm_metal_paged_turboquant"
+        elif self.kv_quant:
+            mode = f"vllm_metal_paged_kv_{self.kv_quant_config.normalized_mode}"
         return {
-            "mode": "vllm_metal_paged_turboquant" if self.turboquant else "vllm_metal_paged",
+            "mode": mode,
             "block_size": int(self.block_size),
             "num_blocks": int(self.num_blocks),
             "capacity": int(self.capacity),
@@ -1703,7 +2207,22 @@ class VllmMetalPagedKVCache:
             "paged_attention_calls": int(self.paged_attention_calls),
             "partitioned_attention_calls": int(self.partitioned_attention_calls),
             "turboquant_attention_calls": int(self.turboquant_attention_calls),
+            "kv_quant_attention_calls": int(self.kv_quant_attention_calls),
+            "gqa_sdpa_calls": int(self.gqa_sdpa_calls),
+            "gqa_sdpa_calls_by_route": dict(self.gqa_sdpa_calls_by_route),
+            "gqa_sdpa_calls_by_phase": dict(self.gqa_sdpa_calls_by_phase),
+            "gqa_sdpa_route_misses_by_phase_reason": dict(
+                self.gqa_sdpa_route_misses_by_phase_reason
+            ),
+            "gqa_sdpa_route_misses_by_q_len": dict(
+                self.gqa_sdpa_route_misses_by_q_len
+            ),
+            "gqa_sdpa_last_route_miss": dict(self.gqa_sdpa_last_route_miss),
             "active_array_calls": int(self.active_array_calls),
+            "active_array_time_s": float(self.active_array_time_s),
+            "kv_quant_dequant_calls": int(self.kv_quant_dequant_calls),
+            "kv_quant_dequant_time_s": float(self.kv_quant_dequant_time_s),
+            "kv_quant_dequant_tokens": int(self.kv_quant_dequant_tokens),
             "dense_fallback_calls": int(self.dense_fallback_calls),
             "prefill_dense_fallback_calls": int(
                 self.dense_fallback_calls_by_phase.get("prefill", 0)
@@ -1750,6 +2269,10 @@ class VllmMetalPagedKVCache:
             ),
             "turboquant_v_quant": (
                 str(self.turboquant_config.value_quant) if self.turboquant else ""
+            ),
+            "kv_quant": int(bool(self.kv_quant)),
+            "kv_quant_mode": (
+                str(self.kv_quant_config.normalized_mode) if self.kv_quant else ""
             ),
             "sliding_window": int(
                 os.environ.get("MTPLX_VLLM_METAL_PAGED_SLIDING_WINDOW") or "-1"
@@ -2439,25 +2962,38 @@ def install_vllm_metal_paged_attention_kv_cache(
     block_size: int = 16,
     num_blocks: int = 1024,
     turboquant_config: Any | None = None,
+    kv_quant_config: Any | None = None,
 ) -> dict[str, int | str]:
     """Replace stock full-attention KV caches with vLLM-Metal paged caches."""
+    fallback_kv_quant_config = kv_quant_config
+    if turboquant_config is not None:
+        kv_quant_config = None
+    mode = "vllm_metal_paged"
+    if turboquant_config is not None:
+        mode = "vllm_metal_paged_turboquant"
+    elif kv_quant_config is not None:
+        mode = f"vllm_metal_paged_kv_{kv_quant_config.normalized_mode}"
     stats: dict[str, int | str] = {
         "enabled": 1,
-        "mode": "vllm_metal_paged_turboquant" if turboquant_config else "vllm_metal_paged",
+        "mode": mode,
         "entries": 0,
         "skipped": 0,
         "block_size": int(block_size),
         "num_blocks": int(num_blocks),
         "turboquant": int(bool(turboquant_config)),
+        "kv_quant": int(bool(kv_quant_config)),
         "attention_impl": _paged_attention_impl_from_env() or "vllm_metal",
     }
     external_ops_required = _paged_attention_requires_external_ops(
         turboquant_config=turboquant_config,
+        kv_quant_config=kv_quant_config,
     )
     stats["external_ops_required"] = int(external_ops_required)
     if turboquant_config is not None:
         stats["turboquant_k_quant"] = str(turboquant_config.key_quant)
         stats["turboquant_v_quant"] = str(turboquant_config.value_quant)
+    if kv_quant_config is not None:
+        stats["kv_quant_mode"] = str(kv_quant_config.normalized_mode)
     # Validate the optional dependency once at install time only for paths that
     # actually dispatch into the external vLLM-Metal ops. The packaged
     # mlx_vector_paged and sdpa_2pass_paged paths are in-tree and must survive a
@@ -2478,16 +3014,25 @@ def install_vllm_metal_paged_attention_kv_cache(
                     exc, context="TurboQuant install"
                 )
                 turboquant_config = None
-                stats["mode"] = "vllm_metal_paged"
+                kv_quant_config = fallback_kv_quant_config
+                stats["mode"] = (
+                    f"vllm_metal_paged_kv_{kv_quant_config.normalized_mode}"
+                    if kv_quant_config is not None
+                    else "vllm_metal_paged"
+                )
                 stats["turboquant"] = 0
+                stats["kv_quant"] = int(bool(kv_quant_config))
                 stats["external_ops_required"] = int(
                     _paged_attention_requires_external_ops(
                         turboquant_config=None,
+                        kv_quant_config=kv_quant_config,
                     )
                 )
                 stats["turboquant_disabled_reason"] = "vllm_metal_ops_unavailable"
                 stats.pop("turboquant_k_quant", None)
                 stats.pop("turboquant_v_quant", None)
+                if kv_quant_config is not None:
+                    stats["kv_quant_mode"] = str(kv_quant_config.normalized_mode)
             else:
                 raise
     for idx, entry in enumerate(cache or []):
@@ -2499,6 +3044,8 @@ def install_vllm_metal_paged_attention_kv_cache(
             entry.num_blocks = int(num_blocks)
             entry.turboquant_config = turboquant_config
             entry.turboquant = turboquant_config is not None
+            entry.kv_quant_config = kv_quant_config
+            entry.kv_quant = kv_quant_config is not None
             stats["entries"] = int(stats["entries"]) + 1
             continue
         if isinstance(entry, TailOwnedKVCache):
@@ -2518,6 +3065,7 @@ def install_vllm_metal_paged_attention_kv_cache(
             block_size=block_size,
             num_blocks=num_blocks,
             turboquant_config=turboquant_config,
+            kv_quant_config=kv_quant_config,
         )
         stats["entries"] = int(stats["entries"]) + 1
     return stats
@@ -2526,7 +3074,8 @@ def install_vllm_metal_paged_attention_kv_cache(
 def configure_tail_owned_attention_kv_cache(cache: list[Any]) -> dict[str, int | str]:
     paged_raw = os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN") or ""
     if paged_raw.strip().lower() in {"1", "true", "yes", "on"}:
-        from .turboquant import config_from_env
+        from .kv_quant import config_from_env as kv_quant_config_from_env
+        from .turboquant import config_from_env as turboquant_config_from_env
 
         block_size = int(os.environ.get("MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE") or "16")
         configured_blocks = int(os.environ.get("MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS") or "1024")
@@ -2534,11 +3083,13 @@ def configure_tail_owned_attention_kv_cache(cache: list[Any]) -> dict[str, int |
             block_size=block_size,
             configured_blocks=configured_blocks,
         )
+        turboquant_config = turboquant_config_from_env()
         return install_vllm_metal_paged_attention_kv_cache(
             cache,
             block_size=block_size,
             num_blocks=num_blocks,
-            turboquant_config=config_from_env(),
+            turboquant_config=turboquant_config,
+            kv_quant_config=kv_quant_config_from_env(),
         )
     raw = os.environ.get("MTPLX_OWNED_ATTN_KV") or ""
     normalized = raw.strip().lower().replace("-", "_")
@@ -2638,9 +3189,27 @@ def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
             aggregate["turboquant_attention_calls"] = int(
                 aggregate.get("turboquant_attention_calls", 0)
             ) + int(stats.get("turboquant_attention_calls", 0))
+            aggregate["kv_quant_attention_calls"] = int(
+                aggregate.get("kv_quant_attention_calls", 0)
+            ) + int(stats.get("kv_quant_attention_calls", 0))
+            aggregate["gqa_sdpa_calls"] = int(
+                aggregate.get("gqa_sdpa_calls", 0)
+            ) + int(stats.get("gqa_sdpa_calls", 0))
             aggregate["active_array_calls"] = int(
                 aggregate.get("active_array_calls", 0)
             ) + int(stats.get("active_array_calls", 0))
+            aggregate["active_array_time_s"] = float(
+                aggregate.get("active_array_time_s", 0.0)
+            ) + float(stats.get("active_array_time_s", 0.0))
+            aggregate["kv_quant_dequant_calls"] = int(
+                aggregate.get("kv_quant_dequant_calls", 0)
+            ) + int(stats.get("kv_quant_dequant_calls", 0))
+            aggregate["kv_quant_dequant_time_s"] = float(
+                aggregate.get("kv_quant_dequant_time_s", 0.0)
+            ) + float(stats.get("kv_quant_dequant_time_s", 0.0))
+            aggregate["kv_quant_dequant_tokens"] = int(
+                aggregate.get("kv_quant_dequant_tokens", 0)
+            ) + int(stats.get("kv_quant_dequant_tokens", 0))
             aggregate["dense_fallback_calls"] = int(
                 aggregate.get("dense_fallback_calls", 0)
             ) + int(stats.get("dense_fallback_calls", 0))
@@ -2660,6 +3229,10 @@ def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
             for dict_key in (
                 "large_q_split_sdpa_fallback_calls_by_phase",
                 "partitioned_paged_calls_by_phase",
+                "gqa_sdpa_calls_by_phase",
+                "gqa_sdpa_calls_by_route",
+                "gqa_sdpa_route_misses_by_phase_reason",
+                "gqa_sdpa_route_misses_by_q_len",
             ):
                 phase_counts = stats.get(dict_key) or {}
                 if isinstance(phase_counts, dict):
@@ -2667,6 +3240,9 @@ def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
                     for phase, count in phase_counts.items():
                         merged[str(phase)] = int(merged.get(str(phase), 0)) + int(count)
                     aggregate[dict_key] = merged
+            last_gqa_miss = stats.get("gqa_sdpa_last_route_miss") or {}
+            if isinstance(last_gqa_miss, dict) and last_gqa_miss:
+                aggregate["gqa_sdpa_last_route_miss"] = dict(last_gqa_miss)
             bailouts = stats.get("paged_attention_bailouts_by_phase_reason") or {}
             if isinstance(bailouts, dict):
                 merged = dict(aggregate.get("paged_attention_bailouts_by_phase_reason") or {})
@@ -2682,10 +3258,15 @@ def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
             aggregate["turboquant"] = int(
                 aggregate.get("turboquant", 0)
             ) or int(stats.get("turboquant", 0))
+            aggregate["kv_quant"] = int(
+                aggregate.get("kv_quant", 0)
+            ) or int(stats.get("kv_quant", 0))
             if stats.get("turboquant_k_quant"):
                 aggregate["turboquant_k_quant"] = str(stats["turboquant_k_quant"])
             if stats.get("turboquant_v_quant"):
                 aggregate["turboquant_v_quant"] = str(stats["turboquant_v_quant"])
+            if stats.get("kv_quant_mode"):
+                aggregate["kv_quant_mode"] = str(stats["kv_quant_mode"])
             continue
         if not isinstance(entry, TailOwnedKVCache):
             continue
@@ -2744,11 +3325,16 @@ def snapshot_untrimmable_cache(cache: list[Any]) -> CacheSnapshot:
     return CacheSnapshot(states=tuple(states), meta_states=tuple(meta_states))
 
 
-def restore_cache(cache: list[Any], snapshot: CacheSnapshot) -> None:
+def restore_cache(
+    cache: list[Any],
+    snapshot: CacheSnapshot,
+    *,
+    restore_meta_state: bool = True,
+) -> None:
     for entry, state, meta_state in zip(cache, snapshot.states, snapshot.meta_states):
         if state is not None:
             _restore_state_preserving_container(entry, state)
-        if meta_state is not None:
+        if restore_meta_state and meta_state is not None:
             entry.meta_state = _clone_tree(meta_state)
 
 
@@ -2770,6 +3356,66 @@ def rollback_after_verify(cache: list[Any], snapshot: CacheSnapshot, verified_to
         if _is_trimmable(entry) and hasattr(entry, "trim"):
             entry.trim(verified_tokens)
     restore_cache(cache, snapshot)
+
+
+def trim_verified_window_to_prefix(
+    cache: list[Any],
+    snapshot: CacheSnapshot,
+    *,
+    verified_tokens: int,
+    keep_tokens: int,
+) -> bool:
+    """Keep a verified target prefix by trimming only uncommitted KV tail tokens.
+
+    This is deliberately stricter than ``rollback_after_verify``. It is only
+    valid when the pre-verify snapshot contains no recurrent/non-trimmable
+    state, because those caches cannot be advanced partially from an ordinary
+    batched verify pass.
+    """
+    verified_tokens = int(verified_tokens)
+    keep_tokens = int(keep_tokens)
+    if keep_tokens < 0 or verified_tokens < keep_tokens:
+        return False
+    trim_tokens = verified_tokens - keep_tokens
+    if any(state is not None for state in snapshot.states):
+        return False
+    if any(meta_state is not None for meta_state in snapshot.meta_states):
+        return False
+    if trim_tokens <= 0:
+        return True
+    if not cache:
+        return False
+
+    before_offsets: list[int] = []
+    for entry in cache:
+        trim = getattr(entry, "trim", None)
+        offset = _entry_offset(entry)
+        if not _is_trimmable(entry) or not callable(trim) or offset is None:
+            return False
+        if offset < trim_tokens:
+            return False
+        before_offsets.append(offset)
+
+    for entry, before_offset in zip(cache, before_offsets):
+        trimmed = entry.trim(trim_tokens)
+        if trimmed is not None and int(trimmed) != trim_tokens:
+            return False
+        after_offset = _entry_offset(entry)
+        if after_offset is None or before_offset - after_offset != trim_tokens:
+            return False
+    return True
+
+
+def _entry_offset(entry: Any) -> int | None:
+    offset = getattr(entry, "offset", None)
+    if offset is None:
+        return None
+    try:
+        if hasattr(offset, "item"):
+            return int(offset.item())
+        return int(offset)
+    except Exception:
+        return None
 
 
 def detach_array_leaf(value: Any, *, mode: str) -> Any:

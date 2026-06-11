@@ -73,6 +73,20 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _server_python_env(env: dict[str, str], repo_root: Path) -> dict[str, str]:
+    next_env = dict(env)
+    repo_path = str(repo_root.resolve())
+    existing = next_env.get("PYTHONPATH")
+    if existing:
+        parts = existing.split(os.pathsep)
+        next_env["PYTHONPATH"] = os.pathsep.join(
+            [repo_path, *[part for part in parts if part != repo_path]]
+        )
+    else:
+        next_env["PYTHONPATH"] = repo_path
+    return next_env
+
+
 def _append_jsonl(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -1806,6 +1820,8 @@ def run_local_ablation(args: argparse.Namespace) -> int:
     python_bin = args.python_bin or str(Path(".venv/bin/python"))
     base_url = f"http://{args.host}:{args.port}"
     rows: list[dict[str, Any]] = []
+    repo_root = Path.cwd().resolve()
+    server_script = repo_root / "scripts" / "serve_openai_mtplx.py"
     _write_json(
         output_dir / "ablation-config.json",
         {
@@ -1840,7 +1856,7 @@ def run_local_ablation(args: argparse.Namespace) -> int:
         server_log = profile_dir / "server.log"
         cmd = [
             python_bin,
-            "scripts/serve_openai_mtplx.py",
+            str(server_script),
             "--model",
             args.model,
             "--model-id",
@@ -1877,8 +1893,8 @@ def run_local_ablation(args: argparse.Namespace) -> int:
         log_handle = server_log.open("w", encoding="utf-8")
         proc = subprocess.Popen(
             cmd,
-            cwd=Path.cwd(),
-            env=env,
+            cwd=repo_root,
+            env=_server_python_env(env, repo_root),
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1898,6 +1914,17 @@ def run_local_ablation(args: argparse.Namespace) -> int:
         try:
             health = _wait_for_server(base_url, proc, timeout_s=args.startup_timeout_s)
             _write_json(profile_dir / "health-ready.json", health)
+            direct_headers = _json_loads(args.headers_json, default={})
+            if args.cache_mode != "default":
+                direct_headers = {
+                    **direct_headers,
+                    "x-mtplx-cache-mode": args.cache_mode,
+                }
+            direct_metadata = {
+                **_json_loads(args.metadata_json, default={}),
+                "ablation_profile": profile,
+                "ablation_run_id": run_id,
+            }
             direct_args = argparse.Namespace(
                 base_url=base_url,
                 label=f"{args.label}-{profile}",
@@ -1914,12 +1941,8 @@ def run_local_ablation(args: argparse.Namespace) -> int:
                 top_k=args.top_k,
                 seed=args.seed,
                 timeout=args.request_timeout_s,
-                headers_json=(
-                    None
-                    if args.cache_mode == "default"
-                    else json.dumps({"x-mtplx-cache-mode": args.cache_mode})
-                ),
-                metadata_json=json.dumps({"ablation_profile": profile, "ablation_run_id": run_id}),
+                headers_json=json.dumps(direct_headers) if direct_headers else None,
+                metadata_json=json.dumps(direct_metadata),
             )
             code = run_direct(direct_args)
             profile_summary["direct_returncode"] = code
@@ -2037,6 +2060,14 @@ def main() -> int:
             "'bypass' to isolate within-response decode from SessionBank "
             "postcommit snapshots."
         ),
+    )
+    local.add_argument(
+        "--headers-json",
+        help="Extra HTTP headers to forward to direct requests, as a JSON object.",
+    )
+    local.add_argument(
+        "--metadata-json",
+        help="Extra OpenAI request metadata to forward to direct requests, as a JSON object.",
     )
     local.add_argument(
         "--adaptive-policy",

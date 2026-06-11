@@ -162,9 +162,8 @@ def test_restore_still_rejects_truly_incompatible_policy():
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_mtp_history_policy_does_flip_at_default_threshold(monkeypatch):
-    """Sanity check that the threshold-driven flip is real. This is what causes
-    the lookup side to ask for ``last_window`` when the prompt crosses ~16K."""
+def test_resolve_mtp_history_policy_auto_flips_at_default_threshold(monkeypatch):
+    """Sanity check that the diagnostic auto policy still flips near 16K."""
     monkeypatch.setenv("MTPLX_MTP_HISTORY_POLICY", "auto")
     monkeypatch.delenv("MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD", raising=False)
 

@@ -36,6 +36,55 @@ EXPECTED_MTP_KEYS = (
     "mtp.pre_fc_norm_hidden.weight",
 )
 
+EXPECTED_QWEN_MOE_MTP_TENSOR_COUNT = 19
+EXPECTED_QWEN_MOE_MTP_KEYS = (
+    "mtp.fc.weight",
+    "mtp.layers.0.input_layernorm.weight",
+    "mtp.layers.0.mlp.experts.down_proj",
+    "mtp.layers.0.mlp.experts.gate_up_proj",
+    "mtp.layers.0.mlp.gate.weight",
+    "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+    "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+    "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+    "mtp.layers.0.mlp.shared_expert_gate.weight",
+    "mtp.layers.0.post_attention_layernorm.weight",
+    "mtp.layers.0.self_attn.k_norm.weight",
+    "mtp.layers.0.self_attn.k_proj.weight",
+    "mtp.layers.0.self_attn.o_proj.weight",
+    "mtp.layers.0.self_attn.q_norm.weight",
+    "mtp.layers.0.self_attn.q_proj.weight",
+    "mtp.layers.0.self_attn.v_proj.weight",
+    "mtp.norm.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+)
+
+EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS = (
+    "mtp.fc.weight",
+    "mtp.layers.0.input_layernorm.weight",
+    "mtp.layers.0.mlp.gate.weight",
+    "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+    "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+    "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+    "mtp.layers.0.mlp.shared_expert_gate.weight",
+    "mtp.layers.0.mlp.switch_mlp.down_proj.weight",
+    "mtp.layers.0.mlp.switch_mlp.gate_proj.weight",
+    "mtp.layers.0.mlp.switch_mlp.up_proj.weight",
+    "mtp.layers.0.post_attention_layernorm.weight",
+    "mtp.layers.0.self_attn.k_norm.weight",
+    "mtp.layers.0.self_attn.k_proj.weight",
+    "mtp.layers.0.self_attn.o_proj.weight",
+    "mtp.layers.0.self_attn.q_norm.weight",
+    "mtp.layers.0.self_attn.q_proj.weight",
+    "mtp.layers.0.self_attn.v_proj.weight",
+    "mtp.norm.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+)
+EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_TENSOR_COUNT = len(
+    EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS
+)
+
 MTP_QUANTIZED_LINEAR_WEIGHT_KEYS = (
     "mtp.layers.0.mlp.down_proj.weight",
     "mtp.layers.0.mlp.gate_proj.weight",
@@ -74,6 +123,66 @@ EXPECTED_ALL_PREQUANTIZED_MTP_KEYS = tuple(
     )
 )
 EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT = len(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS)
+
+QWEN_MOE_MTP_QUANTIZED_LINEAR_WEIGHT_KEYS = (
+    "mtp.layers.0.mlp.gate.weight",
+    "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+    "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+    "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+    "mtp.layers.0.mlp.shared_expert_gate.weight",
+    "mtp.layers.0.self_attn.k_proj.weight",
+    "mtp.layers.0.self_attn.o_proj.weight",
+    "mtp.layers.0.self_attn.q_proj.weight",
+    "mtp.layers.0.self_attn.v_proj.weight",
+)
+
+QWEN_MOE_SWITCH_MLP_MTP_QUANTIZED_LINEAR_WEIGHT_KEYS = (
+    "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+    "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+    "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+    "mtp.layers.0.mlp.shared_expert_gate.weight",
+    "mtp.layers.0.mlp.switch_mlp.down_proj.weight",
+    "mtp.layers.0.mlp.switch_mlp.gate_proj.weight",
+    "mtp.layers.0.mlp.switch_mlp.up_proj.weight",
+    "mtp.layers.0.self_attn.k_proj.weight",
+    "mtp.layers.0.self_attn.o_proj.weight",
+    "mtp.layers.0.self_attn.q_proj.weight",
+    "mtp.layers.0.self_attn.v_proj.weight",
+)
+
+EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS = tuple(
+    sorted(
+        EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS
+        + tuple(
+            key.rsplit(".", 1)[0] + ".scales"
+            for key in QWEN_MOE_SWITCH_MLP_MTP_QUANTIZED_LINEAR_WEIGHT_KEYS
+        )
+        + tuple(
+            key.rsplit(".", 1)[0] + ".biases"
+            for key in QWEN_MOE_SWITCH_MLP_MTP_QUANTIZED_LINEAR_WEIGHT_KEYS
+        )
+    )
+)
+EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_TENSOR_COUNT = len(
+    EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS
+)
+
+EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS = tuple(
+    sorted(
+        EXPECTED_QWEN_MOE_MTP_KEYS
+        + tuple(
+            key.rsplit(".", 1)[0] + ".scales"
+            for key in QWEN_MOE_MTP_QUANTIZED_LINEAR_WEIGHT_KEYS
+        )
+        + tuple(
+            key.rsplit(".", 1)[0] + ".biases"
+            for key in QWEN_MOE_MTP_QUANTIZED_LINEAR_WEIGHT_KEYS
+        )
+    )
+)
+EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_TENSOR_COUNT = len(
+    EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS
+)
 
 MULTIMODAL_SIDECARS = (
     "preprocessor_config.json",

@@ -77,8 +77,11 @@ def sparse_distribution_from_mlx_logits(
     top_idx = top_idx[order]
     top_vals = top_vals[order]
 
-    log_total = mx.logsumexp(flat, axis=-1)
-    top_probs_full = mx.exp(top_vals - log_total)
+    if config.top_p >= 1.0:
+        top_probs_full = mx.softmax(top_vals, axis=-1)
+    else:
+        log_total = mx.logsumexp(flat, axis=-1)
+        top_probs_full = mx.exp(top_vals - log_total)
     mx.eval(top_idx, top_probs_full)
 
     token_ids = np.asarray(top_idx, dtype=np.int64).reshape(-1)
@@ -128,8 +131,11 @@ def sparse_distributions_from_mlx_logits(
     top_idx = mx.take_along_axis(top_idx, order, axis=-1)
     top_vals = mx.take_along_axis(top_vals, order, axis=-1)
 
-    log_total = mx.logsumexp(rows, axis=-1)
-    top_probs_full = mx.exp(top_vals - log_total[:, None])
+    if config.top_p >= 1.0:
+        top_probs_full = mx.softmax(top_vals, axis=-1)
+    else:
+        log_total = mx.logsumexp(rows, axis=-1)
+        top_probs_full = mx.exp(top_vals - log_total[:, None])
     mx.eval(top_idx, top_probs_full)
 
     token_rows = np.asarray(top_idx, dtype=np.int64)
@@ -184,8 +190,11 @@ def batched_sparse_distributions_from_mlx_logits(
     top_idx = mx.take_along_axis(top_idx, order, axis=-1)
     top_vals = mx.take_along_axis(top_vals, order, axis=-1)
 
-    log_total = mx.logsumexp(rows, axis=-1)
-    top_probs_full = mx.exp(top_vals - log_total[:, None])
+    if config.top_p >= 1.0:
+        top_probs_full = mx.softmax(top_vals, axis=-1)
+    else:
+        log_total = mx.logsumexp(rows, axis=-1)
+        top_probs_full = mx.exp(top_vals - log_total[:, None])
     mx.eval(top_idx, top_probs_full)
 
     token_rows = np.asarray(top_idx, dtype=np.int64)
@@ -211,3 +220,46 @@ def batched_sparse_distributions_from_mlx_logits(
         prob_rows[bad, 0] = 1.0
 
     return BatchedSparseDistributions(token_rows, prob_rows, vocab_size=vocab_size)
+
+
+def sample_token_ids_from_mlx_logits(
+    logits: mx.array,
+    config: SamplerConfig,
+) -> mx.array | None:
+    """Sample token ids on-device with the same top-k/top-p semantics.
+
+    This is for exact target-prefix verification paths that need sampled target
+    ids, not p/q residual distributions. It keeps the small-support sampling on
+    MLX and returns one token id per input row.
+    """
+
+    if config.temperature <= 0:
+        return mx.argmax(logits, axis=-1)
+
+    rows = logits.astype(mx.float32) / float(config.temperature)
+    vocab_size = int(rows.shape[-1])
+    if config.top_k <= 0:
+        if 0 < config.top_p < 1.0:
+            return None
+        return mx.random.categorical(rows)
+
+    k = min(int(config.top_k), vocab_size)
+    if k <= 0:
+        return None
+
+    top_idx = mx.argpartition(-rows, kth=k - 1, axis=-1)[..., :k]
+    top_vals = mx.take_along_axis(rows, top_idx, axis=-1)
+    order = mx.argsort(-top_vals, axis=-1)
+    top_idx = mx.take_along_axis(top_idx, order, axis=-1)
+    top_vals = mx.take_along_axis(top_vals, order, axis=-1)
+
+    if 0 < config.top_p < 1.0:
+        log_total = mx.logsumexp(rows, axis=-1, keepdims=True)
+        top_probs = mx.exp(top_vals - log_total)
+        higher_mass = mx.cumsum(top_probs, axis=-1) - top_probs
+        first = mx.arange(k) == 0
+        keep = (higher_mass < float(config.top_p)) | first
+        top_vals = mx.where(keep, top_vals, -float("inf"))
+
+    sampled_offsets = mx.random.categorical(top_vals)
+    return mx.take_along_axis(top_idx, sampled_offsets[..., None], axis=-1)[..., 0]

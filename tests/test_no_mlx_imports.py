@@ -36,6 +36,7 @@ def _run_no_mlx(
     tmp_path: Path,
     args: list[str],
     *,
+    cwd: Path | None = None,
     env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     blocker = tmp_path / "blocker"
@@ -49,7 +50,7 @@ def _run_no_mlx(
         env.update(env_extra)
     return subprocess.run(
         [sys.executable, *args],
-        cwd=ROOT,
+        cwd=cwd or ROOT,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -103,6 +104,23 @@ def test_doctor_json_reports_missing_mlx_without_traceback(tmp_path: Path) -> No
     assert "resource.memory" in check_ids
     assert "resource.model_cache_disk" in check_ids
     assert "model.default_repo" in check_ids
+
+
+def test_doctor_json_reports_non_git_cwd_without_raw_git_error(tmp_path: Path) -> None:
+    proc = _run_no_mlx(
+        tmp_path,
+        ["-m", "mtplx.cli", "doctor", "--deep", "--json"],
+        cwd=tmp_path,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    env = payload["environment"]
+    assert env["project_root"] == str(tmp_path.resolve())
+    assert env["git_branch"] == "not a git worktree"
+    assert env["git_status"] == "not a git worktree"
+    assert "ERROR:" not in env["git_branch"]
+    assert "ERROR:" not in env["git_status"]
 
 
 def test_inspect_local_non_mtp_model_without_mlx(tmp_path: Path) -> None:

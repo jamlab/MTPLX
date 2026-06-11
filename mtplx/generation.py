@@ -7,6 +7,7 @@ optimized runtime can tighten the same contracts after the MTP-1 gates pass.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import os
 import sys
@@ -30,10 +31,12 @@ from .cache_state import (
     snapshot_cache,
     snapshot_untrimmable_cache,
     tail_owned_attention_kv_stats,
+    trim_verified_window_to_prefix,
 )
 from .fast_sampling import (
     BatchedSparseDistributions,
     batched_sparse_distributions_from_mlx_logits,
+    sample_token_ids_from_mlx_logits,
     sparse_distribution_from_mlx_logits,
     sparse_distributions_from_mlx_logits,
 )
@@ -59,7 +62,42 @@ VerifyStrategy = Literal[
     "capture_commit",
     "graphbank",
     "graphbank_capture_commit",
+    "target_prefix",
+    "trim_commit",
 ]
+
+_PREFILL_CHUNK_SIZE_OVERRIDE: ContextVar[int | None] = ContextVar(
+    "mtplx_prefill_chunk_size_override",
+    default=None,
+)
+
+
+def _resolve_runtime_mtp_hidden_variant(
+    rt: MTPLXRuntime,
+    requested: str | None,
+) -> str:
+    if requested in {None, "auto", "contract"}:
+        return str(getattr(rt.contract, "hidden_variant", "post_norm") or "post_norm")
+    return str(requested)
+
+
+def _resolve_runtime_base_hidden_variant(
+    rt: MTPLXRuntime,
+    requested: str | None,
+) -> str:
+    if requested in {None, "auto", "contract"}:
+        return str(getattr(rt.contract, "base_hidden_variant", "post_norm") or "post_norm")
+    return str(requested)
+
+
+def _resolve_runtime_mtp_position_mode(rt: MTPLXRuntime) -> str:
+    raw = os.environ.get("MTPLX_MTP_POSITION_MODE")
+    if raw is None:
+        raw = getattr(rt.contract, "mtp_position_mode", "cache")
+    normalized = str(raw or "cache").strip().lower().replace("-", "_")
+    if normalized in {"", "0", "off", "false", "default", "cache", "local"}:
+        return "cache"
+    return normalized
 
 
 def _eval_value_summary(value: Any) -> dict[str, Any]:
@@ -142,10 +180,14 @@ def _generation_rate_fields(
     generated_tokens: int,
     elapsed_s: float,
     prompt_eval_time_s: float,
+    cache_restore_time_s: float = 0.0,
 ) -> dict[str, float]:
     end_to_end_tok_s = generated_tokens / elapsed_s if elapsed_s > 0.0 else 0.0
-    prompt_elapsed_s = min(max(0.0, prompt_eval_time_s), max(0.0, elapsed_s))
-    decode_elapsed_s = max(0.0, elapsed_s - prompt_elapsed_s)
+    non_decode_elapsed_s = min(
+        max(0.0, prompt_eval_time_s) + max(0.0, cache_restore_time_s),
+        max(0.0, elapsed_s),
+    )
+    decode_elapsed_s = max(0.0, elapsed_s - non_decode_elapsed_s)
     decode_tok_s = (
         generated_tokens / decode_elapsed_s if decode_elapsed_s > 0.0 else 0.0
     )
@@ -187,11 +229,8 @@ def _resolve_mtp_history_policy(requested_policy: str, prompt_tokens: int) -> st
     requested = _normalize_mtp_history_policy(requested_policy)
     env_policy = os.environ.get("MTPLX_MTP_HISTORY_POLICY")
     # Honor the env-var override whenever the caller requested either the
-    # default "committed" or the auto-resolution path. Previously this only
-    # fired when ``requested == "committed"``, which silently dropped the
-    # override in every server hot path that resolves to "auto" via the
-    # sustained profile (profiles.py:93). Sustained users could not opt
-    # out of the last_window flip without editing the profile.
+    # product default "committed" or the auto-resolution path. This keeps
+    # diagnostic history-policy overrides reachable from the server hot path.
     if env_policy and requested in ("committed", "auto"):
         requested = _normalize_mtp_history_policy(env_policy)
     if requested != "auto":
@@ -275,6 +314,50 @@ def _attach_runtime_diagnostics(
     stats.paged_kv_capacity_tokens = int(owned_attn.get("capacity") or 0)
     stats.paged_kv_num_blocks = int(owned_attn.get("num_blocks") or 0)
     stats.paged_active_array_calls = int(owned_attn.get("active_array_calls") or 0)
+    stats.paged_active_array_time_s = float(
+        owned_attn.get("active_array_time_s") or 0.0
+    )
+    stats.paged_turboquant = bool(owned_attn.get("turboquant") or False)
+    stats.paged_turboquant_k_quant = str(owned_attn.get("turboquant_k_quant") or "")
+    stats.paged_turboquant_v_quant = str(owned_attn.get("turboquant_v_quant") or "")
+    stats.paged_turboquant_attention_calls = int(
+        owned_attn.get("turboquant_attention_calls") or 0
+    )
+    stats.paged_kv_quant = bool(owned_attn.get("kv_quant") or False)
+    stats.paged_kv_quant_mode = str(owned_attn.get("kv_quant_mode") or "")
+    stats.paged_kv_quant_attention_calls = int(
+        owned_attn.get("kv_quant_attention_calls") or 0
+    )
+    stats.paged_kv_quant_dequant_calls = int(
+        owned_attn.get("kv_quant_dequant_calls") or 0
+    )
+    stats.paged_kv_quant_dequant_time_s = float(
+        owned_attn.get("kv_quant_dequant_time_s") or 0.0
+    )
+    stats.paged_kv_quant_dequant_tokens = int(
+        owned_attn.get("kv_quant_dequant_tokens") or 0
+    )
+    stats.paged_gqa_sdpa_calls = int(owned_attn.get("gqa_sdpa_calls") or 0)
+    gqa_by_route = owned_attn.get("gqa_sdpa_calls_by_route") or {}
+    stats.paged_gqa_sdpa_calls_by_route = (
+        dict(gqa_by_route) if isinstance(gqa_by_route, dict) else {}
+    )
+    gqa_by_phase = owned_attn.get("gqa_sdpa_calls_by_phase") or {}
+    stats.paged_gqa_sdpa_calls_by_phase = (
+        dict(gqa_by_phase) if isinstance(gqa_by_phase, dict) else {}
+    )
+    gqa_misses = owned_attn.get("gqa_sdpa_route_misses_by_phase_reason") or {}
+    stats.paged_gqa_sdpa_route_misses_by_phase_reason = (
+        dict(gqa_misses) if isinstance(gqa_misses, dict) else {}
+    )
+    gqa_misses_by_q = owned_attn.get("gqa_sdpa_route_misses_by_q_len") or {}
+    stats.paged_gqa_sdpa_route_misses_by_q_len = (
+        dict(gqa_misses_by_q) if isinstance(gqa_misses_by_q, dict) else {}
+    )
+    gqa_last_miss = owned_attn.get("gqa_sdpa_last_route_miss") or {}
+    stats.paged_gqa_sdpa_last_route_miss = (
+        dict(gqa_last_miss) if isinstance(gqa_last_miss, dict) else {}
+    )
     stats.attention_dense_fallback_calls = int(
         owned_attn.get("dense_fallback_calls") or 0
     )
@@ -458,6 +541,9 @@ def _prefill_cache_only_forward(rt: MTPLXRuntime, token_ids: Any, cache: Any) ->
 
 
 def _prefill_chunk_size() -> int:
+    override = _PREFILL_CHUNK_SIZE_OVERRIDE.get()
+    if override is not None:
+        return max(1, int(override))
     raw = (os.environ.get("MTPLX_PREFILL_CHUNK_SIZE") or "2048").strip().lower()
     if raw == "auto":
         layout = _sustained_prefill_layout()
@@ -468,6 +554,24 @@ def _prefill_chunk_size() -> int:
         return max(1, int(raw))
     except ValueError:
         return 2048
+
+
+@contextmanager
+def prefill_chunk_size_override(chunk_size: int | None):
+    """Apply a request-local prefill chunk override.
+
+    The legacy env knob remains supported for profiles and CLI diagnostics, but
+    the native app needs a live next-request setting. A ContextVar keeps that
+    override off process-global environment state.
+    """
+
+    token = _PREFILL_CHUNK_SIZE_OVERRIDE.set(
+        None if chunk_size is None else max(1, int(chunk_size))
+    )
+    try:
+        yield
+    finally:
+        _PREFILL_CHUNK_SIZE_OVERRIDE.reset(token)
 
 
 def _iter_prefill_chunks(token_ids: list[int]) -> list[list[int]]:
@@ -503,6 +607,13 @@ def _sustained_prefill_layout() -> str:
     )
     if layout != "auto":
         return layout
+    kv_quant = (
+        os.environ.get("MTPLX_VLLM_METAL_PAGED_KV_QUANT")
+        or os.environ.get("MTPLX_PAGED_KV_QUANT")
+        or ""
+    ).strip().lower().replace("-", "_")
+    if kv_quant in {"q8", "q8_0", "int8", "q4", "q4_0", "int4"}:
+        return "contiguous_then_repage"
     context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
     dense_max = _env_int("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", 131072)
     if context_tokens > 0 and context_tokens <= dense_max:
@@ -605,6 +716,21 @@ def _maybe_repage_target_prefill_cache(cache: Any) -> float:
     return time.perf_counter() - started
 
 
+def _session_restore_cache_factory(rt: MTPLXRuntime) -> Callable[[], Any] | None:
+    if not _contiguous_prefill_cache_layout_enabled():
+        return None
+    return lambda: _make_target_prefill_cache(rt)
+
+
+def _session_live_frontier_reference_restore_enabled() -> bool:
+    name = "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE"
+    if name not in os.environ:
+        name = "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER"
+    if name not in os.environ:
+        return False
+    return _env_truthy(name)
+
+
 def _eval_cache_roots(cache: Any) -> None:
     arrays = _tree_mx_arrays(cache)
     if not arrays:
@@ -630,12 +756,12 @@ def _eval_verify_outputs(
         "verify_hidden_eval_time_s": 0.0,
         "verify_joint_eval_time_s": 0.0,
     }
-    if os.environ.get("MTPLX_LAZY_VERIFY_LOGITS"):
+    if _env_truthy("MTPLX_LAZY_VERIFY_LOGITS"):
         started = time.perf_counter()
         _eval(verify_hidden, _caller_depth=2)
         timings["verify_hidden_eval_time_s"] += time.perf_counter() - started
         return timings
-    if os.environ.get("MTPLX_SPLIT_VERIFY_EVAL"):
+    if _env_truthy("MTPLX_SPLIT_VERIFY_EVAL"):
         started = time.perf_counter()
         _eval(verify_logits, _caller_depth=2)
         timings["verify_logits_eval_time_s"] += time.perf_counter() - started
@@ -777,6 +903,10 @@ class _DecodeTrace:
             "verify_hidden_eval_time_s": 0.0,
             "verify_joint_eval_time_s": 0.0,
             "verify_target_distribution_time_s": 0.0,
+            "target_distribution_materialized_rows": 0,
+            "target_distribution_materialized_windows": 0,
+            "lazy_bonus_verify_calls": 0,
+            "lazy_bonus_commit_time_s": 0.0,
             "verify_eval_unattributed_time_s": 0.0,
             "draft_time_s": 0.0,
             "accept_time_s": 0.0,
@@ -877,6 +1007,18 @@ class _DecodeTrace:
         )
         verify_target_distribution_time_delta = float(
             self._delta(totals, "verify_target_distribution_time_s")
+        )
+        target_distribution_rows_delta = int(
+            self._delta(totals, "target_distribution_materialized_rows")
+        )
+        target_distribution_windows_delta = int(
+            self._delta(totals, "target_distribution_materialized_windows")
+        )
+        lazy_bonus_verify_calls_delta = int(
+            self._delta(totals, "lazy_bonus_verify_calls")
+        )
+        lazy_bonus_commit_time_delta = float(
+            self._delta(totals, "lazy_bonus_commit_time_s")
         )
         verify_eval_unattributed_time_delta = float(
             self._delta(totals, "verify_eval_unattributed_time_s")
@@ -984,6 +1126,27 @@ class _DecodeTrace:
             "verify_hidden_eval_time_s_delta": verify_hidden_eval_time_delta,
             "verify_joint_eval_time_s_delta": verify_joint_eval_time_delta,
             "verify_target_distribution_time_s_delta": verify_target_distribution_time_delta,
+            "target_distribution_materialized_rows_delta": target_distribution_rows_delta,
+            "target_distribution_materialized_windows_delta": target_distribution_windows_delta,
+            "target_distribution_rows_per_window_delta": (
+                target_distribution_rows_delta / target_distribution_windows_delta
+                if target_distribution_windows_delta
+                else None
+            ),
+            "verify_target_distribution_ms_per_row_delta": (
+                1000.0
+                * verify_target_distribution_time_delta
+                / target_distribution_rows_delta
+                if target_distribution_rows_delta
+                else None
+            ),
+            "lazy_bonus_verify_calls_delta": lazy_bonus_verify_calls_delta,
+            "lazy_bonus_commit_time_s_delta": lazy_bonus_commit_time_delta,
+            "lazy_bonus_commit_ms_per_call_delta": (
+                1000.0 * lazy_bonus_commit_time_delta / lazy_bonus_verify_calls_delta
+                if lazy_bonus_verify_calls_delta
+                else None
+            ),
             "verify_eval_unattributed_time_s_delta": verify_eval_unattributed_time_delta,
             "draft_time_s_delta": draft_time_delta,
             "accept_time_s_delta": float(self._delta(totals, "accept_time_s")),
@@ -1047,16 +1210,14 @@ class _DecodeTrace:
             "cache_state_nbytes": _tree_nbytes(cache),
             "mtp_cache_state_nbytes": _tree_nbytes(mtp_cache),
             "mlx_memory": _mlx_memory_stats(),
-            "lazy_verify_logits": bool(os.environ.get("MTPLX_LAZY_VERIFY_LOGITS")),
+            "lazy_verify_logits": _env_truthy("MTPLX_LAZY_VERIFY_LOGITS"),
             "defer_verify_hidden_eval": _defer_verify_hidden_eval_enabled(),
             "verify_hidden_mode": _verify_hidden_mode(),
-            "split_verify_eval": bool(os.environ.get("MTPLX_SPLIT_VERIFY_EVAL")),
-            "lazy_mtp_history_append": bool(
-                os.environ.get("MTPLX_LAZY_MTP_HISTORY_APPEND")
-            ),
-            "batch_target_arrays": bool(os.environ.get("MTPLX_BATCH_TARGET_ARRAYS")),
-            "drop_events": bool(os.environ.get("MTPLX_DROP_EVENTS")),
-            "skip_verify_snapshot": bool(os.environ.get("MTPLX_SKIP_VERIFY_SNAPSHOT")),
+            "split_verify_eval": _env_truthy("MTPLX_SPLIT_VERIFY_EVAL"),
+            "lazy_mtp_history_append": _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND"),
+            "batch_target_arrays": _batch_target_arrays_enabled(),
+            "drop_events": _env_truthy("MTPLX_DROP_EVENTS"),
+            "skip_verify_snapshot": _env_truthy("MTPLX_SKIP_VERIFY_SNAPSHOT"),
             "mtp_history_materialize_every": int(mtp_history_materialize_every),
             "mtp_history_materialize_events": int(mtp_history_materialize_events),
             "clear_cache_every": int(_clear_cache_every()),
@@ -1171,6 +1332,28 @@ def _batch_target_arrays_enabled() -> bool:
     }
 
 
+def _lazy_target_distributions_enabled() -> bool:
+    return _env_truthy("MTPLX_LAZY_TARGET_DISTRIBUTIONS")
+
+
+def _lazy_bonus_verify_enabled() -> bool:
+    return _env_truthy("MTPLX_LAZY_BONUS_VERIFY")
+
+
+def _lazy_bonus_verify_min_depth() -> int:
+    raw = os.environ.get("MTPLX_LAZY_BONUS_VERIFY_MIN_DEPTH")
+    if raw is None or raw.strip() == "":
+        return 2
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 2
+
+
+def _omit_speculative_bonus_enabled() -> bool:
+    return _env_truthy("MTPLX_OMIT_SPECULATIVE_BONUS")
+
+
 @dataclass
 class GenerationStats:
     mode: Mode
@@ -1208,6 +1391,25 @@ class GenerationStats:
     paged_kv_capacity_tokens: int = 0
     paged_kv_num_blocks: int = 0
     paged_active_array_calls: int = 0
+    paged_active_array_time_s: float = 0.0
+    paged_turboquant: bool = False
+    paged_turboquant_k_quant: str = ""
+    paged_turboquant_v_quant: str = ""
+    paged_turboquant_attention_calls: int = 0
+    paged_kv_quant: bool = False
+    paged_kv_quant_mode: str = ""
+    paged_kv_quant_attention_calls: int = 0
+    paged_kv_quant_dequant_calls: int = 0
+    paged_kv_quant_dequant_time_s: float = 0.0
+    paged_kv_quant_dequant_tokens: int = 0
+    paged_gqa_sdpa_calls: int = 0
+    paged_gqa_sdpa_calls_by_route: dict[str, int] = field(default_factory=dict)
+    paged_gqa_sdpa_calls_by_phase: dict[str, int] = field(default_factory=dict)
+    paged_gqa_sdpa_route_misses_by_phase_reason: dict[str, int] = field(
+        default_factory=dict
+    )
+    paged_gqa_sdpa_route_misses_by_q_len: dict[str, int] = field(default_factory=dict)
+    paged_gqa_sdpa_last_route_miss: dict[str, object] = field(default_factory=dict)
     attention_dense_fallback_calls: int = 0
     prefill_dense_fallback_calls: int = 0
     decode_dense_fallback_calls: int = 0
@@ -1241,6 +1443,11 @@ class GenerationStats:
     verify_hidden_eval_time_s: float = 0.0
     verify_joint_eval_time_s: float = 0.0
     verify_target_distribution_time_s: float = 0.0
+    target_distribution_materialized_rows: int = 0
+    target_distribution_materialized_windows: int = 0
+    target_distribution_share: float = 0.0
+    lazy_bonus_verify_calls: int = 0
+    lazy_bonus_commit_time_s: float = 0.0
     verify_eval_unattributed_time_s: float = 0.0
     verify_hidden_mode: str = "default"
     draft_time_s: float = 0.0
@@ -1251,12 +1458,18 @@ class GenerationStats:
     prompt_mtp_history_time_s: float = 0.0
     prompt_target_prefill_tok_s: float = 0.0
     prompt_mtp_history_tok_s: float = 0.0
+    cache_restore_time_s: float = 0.0
     mtp_history_policy: str = "cycle"
     mtp_history_window_tokens: int = 0
     mtp_history_position_base: int = 0
     cached_tokens: int = 0
     new_prefill_tokens: int = 0
     session_cache_hit: bool = False
+    cache_source: str = "none"
+    ssd_cache_hit: bool = False
+    ssd_cached_tokens: int = 0
+    ssd_restore_s: float = 0.0
+    ssd_suffix_tokens: int = 0
     cache_miss_reason: str | None = None
     session_restore_mode: str = "cold"
     snapshot_time_s: float = 0.0
@@ -1331,6 +1544,12 @@ class GenerationStats:
     draft_core: dict[str, object] = field(default_factory=dict)
     owned_recurrent_state: dict[str, object] = field(default_factory=dict)
     owned_attn_kv: dict[str, object] = field(default_factory=dict)
+    repetition_stop_triggered: bool = False
+    repetition_stop_reason: str | None = None
+    repetition_stop_block_tokens: int = 0
+    repetition_stop_repeats: int = 0
+    repetition_stop_trimmed_tokens: int = 0
+    repetition_stop_raw_tokens: int = 0
     events: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -1343,13 +1562,57 @@ class GenerationOutput:
     text: str
     stats: GenerationStats
     final_state: GenerationFinalState | None = None
+    finish_reason: str | None = None
 
     def to_dict(self) -> dict:
         return {
             "tokens": self.tokens,
             "text": self.text,
             "stats": self.stats.to_dict(),
+            "finish_reason": self.finish_reason,
         }
+
+
+@dataclass(frozen=True)
+class RepetitionStopConfig:
+    enabled: bool = False
+    min_tokens: int = 768
+    min_repeated_tokens: int = 192
+    min_repeats: int = 4
+    min_block_tokens: int = 1
+    max_block_tokens: int = 96
+
+
+@dataclass(frozen=True)
+class RepetitionStopResult:
+    trim_start: int
+    block_tokens: int
+    repeats: int
+    repeated_tokens: int
+
+
+def _repetition_stop_config(enabled: bool) -> RepetitionStopConfig:
+    if not enabled:
+        return RepetitionStopConfig(enabled=False)
+    min_tokens = max(1, _env_int("MTPLX_REPETITION_STOP_MIN_TOKENS", 768))
+    min_repeated_tokens = max(
+        1,
+        _env_int("MTPLX_REPETITION_STOP_MIN_REPEATED_TOKENS", 192),
+    )
+    min_repeats = max(2, _env_int("MTPLX_REPETITION_STOP_MIN_REPEATS", 4))
+    min_block_tokens = max(1, _env_int("MTPLX_REPETITION_STOP_MIN_BLOCK_TOKENS", 1))
+    max_block_tokens = max(
+        min_block_tokens,
+        _env_int("MTPLX_REPETITION_STOP_MAX_BLOCK_TOKENS", 96),
+    )
+    return RepetitionStopConfig(
+        enabled=True,
+        min_tokens=min_tokens,
+        min_repeated_tokens=min_repeated_tokens,
+        min_repeats=min_repeats,
+        min_block_tokens=min_block_tokens,
+        max_block_tokens=max_block_tokens,
+    )
 
 
 @dataclass
@@ -1361,12 +1624,17 @@ class PromptState:
     token_prefix: tuple[int, ...]
     prompt_eval_time_s: float
     prompt_mtp_history_time_s: float = 0.0
+    cache_restore_time_s: float = 0.0
     mtp_history_policy: str = "cycle"
     mtp_history_window_tokens: int = 0
     mtp_history_position_base: int = 0
     cached_tokens: int = 0
     suffix_tokens: int = 0
     cache_hit: bool = False
+    cache_source: str = "none"
+    ssd_cache_hit: bool = False
+    ssd_cached_tokens: int = 0
+    ssd_restore_s: float = 0.0
     cache_miss_reason: str | None = None
     restore_mode: str = "cold"
 
@@ -1392,6 +1660,72 @@ class GenerationFinalState:
     mtp_history_policy: str = "cycle"
     mtp_history_window_tokens: int = 0
     mtp_history_position_base: int = 0
+    extra_state: dict[str, Any] | None = None
+
+
+def _finish_reason_from_tokens(
+    tokens: list[int],
+    *,
+    stop_token_ids: set[int],
+    max_tokens: int,
+) -> str:
+    if any(_is_stop(token, stop_token_ids) for token in tokens):
+        return "stop"
+    return "length" if len(tokens) >= max_tokens else "stop"
+
+
+def _detect_repeated_token_suffix(
+    tokens: list[int],
+    config: RepetitionStopConfig,
+) -> RepetitionStopResult | None:
+    if not config.enabled:
+        return None
+    token_count = len(tokens)
+    if token_count < max(1, int(config.min_tokens)):
+        return None
+    max_block = min(
+        max(1, int(config.max_block_tokens)),
+        token_count // max(1, int(config.min_repeats)),
+    )
+    min_block = max(1, int(config.min_block_tokens))
+    if max_block < min_block:
+        return None
+    best: RepetitionStopResult | None = None
+    for block_tokens in range(min_block, max_block + 1):
+        block = tokens[token_count - block_tokens : token_count]
+        repeats = 1
+        cursor = token_count - block_tokens
+        while (
+            cursor >= block_tokens
+            and tokens[cursor - block_tokens : cursor] == block
+        ):
+            repeats += 1
+            cursor -= block_tokens
+        repeated_tokens = repeats * block_tokens
+        if repeats < int(config.min_repeats):
+            continue
+        if repeated_tokens < int(config.min_repeated_tokens):
+            continue
+        candidate = RepetitionStopResult(
+            trim_start=token_count - repeated_tokens,
+            block_tokens=block_tokens,
+            repeats=repeats,
+            repeated_tokens=repeated_tokens,
+        )
+        if best is None or candidate.repeated_tokens > best.repeated_tokens:
+            best = candidate
+    return best
+
+
+def _trim_repeated_suffix(
+    tokens: list[int],
+    config: RepetitionStopConfig,
+) -> RepetitionStopResult | None:
+    result = _detect_repeated_token_suffix(tokens, config)
+    if result is None:
+        return None
+    del tokens[result.trim_start :]
+    return result
 
 
 def _prefill_restored_prompt_suffix(
@@ -1399,9 +1733,14 @@ def _prefill_restored_prompt_suffix(
     restored: Any,
     suffix: list[int],
     *,
+    base_hidden_variant: str,
     mtp_hidden_variant: str,
     mtp_history_policy: str,
     abort_check: Callable[[], bool] | None = None,
+    chunk_callback: Callable[[dict[str, Any]], None] | None = None,
+    tokens_total: int | None = None,
+    cached_tokens: int = 0,
+    chunk_started_s: float | None = None,
 ) -> tuple[Any, Any, float, float]:
     """Extend a restored SessionBank prefix without one giant suffix forward.
 
@@ -1419,10 +1758,54 @@ def _prefill_restored_prompt_suffix(
     target_forward_time = 0.0
     mtp_history_time = 0.0
     final_logits_only = _final_logits_prefill_enabled()
+    tokens_total = int(tokens_total if tokens_total is not None else len(suffix))
+    cached_tokens = max(0, int(cached_tokens))
+    suffix_total = int(len(suffix))
+    suffix_done = 0
     use_committed_mtp = (
         _mtp_history_uses_committed_cache(mtp_history_policy)
         and restored.mtp_history_cache is not None
     )
+
+    def emit_chunk(chunk_len: int, chunk_elapsed: float, started: float) -> None:
+        if chunk_callback is None:
+            return
+        try:
+            phase_start = chunk_started_s if chunk_started_s is not None else started
+            elapsed = max(0.0, time.perf_counter() - phase_start)
+            new_done = max(0, min(suffix_total, suffix_done))
+            tokens_done = max(0, min(tokens_total, cached_tokens + new_done))
+            chunk_tok_s = (
+                float(chunk_len) / chunk_elapsed
+                if chunk_elapsed > 0.0 and chunk_len > 0
+                else None
+            )
+            cumulative_tok_s = (
+                float(new_done) / elapsed
+                if elapsed > 0.0 and new_done > 0
+                else None
+            )
+            chunk_callback(
+                {
+                    "phase": "chunk",
+                    "tokens_done": tokens_done,
+                    "tokens_total": tokens_total,
+                    "cached_tokens": cached_tokens,
+                    "new_prefill_tokens": suffix_total,
+                    "elapsed_s": elapsed,
+                    "prefill_tok_s": cumulative_tok_s,
+                    "cumulative_prefill_tok_s": cumulative_tok_s,
+                    "prefill_wall_tok_s": cumulative_tok_s,
+                    "live_prefill_tok_s": (
+                        chunk_tok_s if chunk_tok_s is not None else cumulative_tok_s
+                    ),
+                    "chunk_size": int(chunk_len),
+                    "chunk_elapsed_s": chunk_elapsed,
+                    "chunk_prefill_tok_s": chunk_tok_s,
+                }
+            )
+        except Exception:
+            pass
 
     def append_history(hidden_states: Any, token_ids: list[int]) -> None:
         nonlocal mtp_history_time
@@ -1454,7 +1837,7 @@ def _prefill_restored_prompt_suffix(
                         chunk_array,
                         cache=restored.cache,
                         return_hidden=True,
-                        hidden_variant=mtp_hidden_variant,
+                        hidden_variant=base_hidden_variant,
                         emit_logits=False,
                     )
                 else:
@@ -1473,9 +1856,12 @@ def _prefill_restored_prompt_suffix(
                 _eval(hidden_chunk)
             else:
                 _eval(logits_chunk, hidden_chunk)
-            target_forward_time += time.perf_counter() - started
+            chunk_elapsed = time.perf_counter() - started
+            target_forward_time += chunk_elapsed
             _runtime_count(rt, "restored_suffix_prefill_chunks")
             _runtime_count(rt, "prefill_chunks")
+            suffix_done = min(suffix_total, end)
+            emit_chunk(end - start, chunk_elapsed, started)
             _check_postcommit_abort(abort_check)
 
             if hidden_chunk is not None:
@@ -1495,12 +1881,16 @@ def _prefill_restored_prompt_suffix(
             mx.array([[suffix[-1]]]),
             cache=restored.cache,
             return_hidden=True,
-            hidden_variant=mtp_hidden_variant,
+            hidden_variant=base_hidden_variant,
             emit_logits=True,
             logits_keep=1 if final_logits_only else None,
         )
     _eval(suffix_logits, suffix_hidden)
-    target_forward_time += time.perf_counter() - started
+    chunk_elapsed = time.perf_counter() - started
+    target_forward_time += chunk_elapsed
+    target_forward_time += _maybe_repage_target_prefill_cache(restored.cache)
+    suffix_done = suffix_total
+    emit_chunk(1, chunk_elapsed, started)
     _check_postcommit_abort(abort_check)
     return (
         suffix_logits[:, -1, :],
@@ -1508,6 +1898,56 @@ def _prefill_restored_prompt_suffix(
         target_forward_time,
         mtp_history_time,
     )
+
+
+def _emit_prefill_restore_progress(
+    callback: Callable[[dict[str, Any]], None] | None,
+    *,
+    tokens_total: int,
+    cached_tokens: int,
+    new_prefill_tokens: int,
+    started_s: float,
+    cache_source: str | None = None,
+    ssd_cache_hit: bool = False,
+    ssd_cached_tokens: int = 0,
+    ssd_restore_s: float = 0.0,
+    ssd_suffix_tokens: int | None = None,
+) -> None:
+    """Publish useful prefill state immediately after a prefix restore."""
+
+    if callback is None:
+        return
+    cached_tokens = max(0, int(cached_tokens))
+    tokens_total = max(0, int(tokens_total))
+    new_prefill_tokens = max(0, int(new_prefill_tokens))
+    try:
+        payload: dict[str, Any] = {
+            "phase": "chunk",
+            "tokens_done": min(tokens_total, cached_tokens),
+            "tokens_total": tokens_total,
+            "cached_tokens": cached_tokens,
+            "new_prefill_tokens": new_prefill_tokens,
+            "elapsed_s": max(0.0, time.perf_counter() - float(started_s)),
+            "cache_hit": cached_tokens > 0,
+        }
+        if cache_source:
+            payload["cache_source"] = str(cache_source)
+        if ssd_cache_hit:
+            payload.update(
+                {
+                    "ssd_cache_hit": True,
+                    "ssd_cached_tokens": int(ssd_cached_tokens),
+                    "ssd_restore_s": float(ssd_restore_s),
+                    "ssd_suffix_tokens": (
+                        int(ssd_suffix_tokens)
+                        if ssd_suffix_tokens is not None
+                        else new_prefill_tokens
+                    ),
+                }
+            )
+        callback(payload)
+    except Exception:
+        pass
 
 
 def _cache_offset(cache: Any) -> int:
@@ -1588,17 +2028,32 @@ def _near_prefix_restore_enabled() -> bool:
     return not _env_falsey("MTPLX_SESSION_NEAR_PREFIX_RESTORE")
 
 
+def _opencode_compact_tool_history_policy(policy_fingerprint: str | None) -> bool:
+    fingerprint = str(policy_fingerprint or "")
+    return (
+        "tool_prompt_mode=compact" in fingerprint
+        and "tool_contract=compact_tool_contract:schema_free:v1" in fingerprint
+        and "opencode_prompt_contract=opencode_agent" in fingerprint
+    )
+
+
 def _restore_near_prefix_prompt_state(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
+    base_hidden_variant: str,
     mtp_hidden_variant: str,
     mtp_history_policy: str,
     session_bank: Any,
     template_hash: str | None,
     draft_head_identity: str | None,
     policy_fingerprint: str | None,
+    min_restore_tokens: int = 0,
+    allow_block_prefix: bool | None = None,
     abort_check: Callable[[], bool] | None = None,
+    chunk_callback: Callable[[dict[str, Any]], None] | None = None,
+    chunk_started_s: float | None = None,
+    cache_factory: Callable[[], Any] | None = None,
 ) -> PromptState | None:
     if not _near_prefix_restore_enabled() or len(prompt_ids) < 2:
         return None
@@ -1607,41 +2062,118 @@ def _restore_near_prefix_prompt_state(
         return None
     max_gap = max(0, _env_int("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP", 8))
     min_match = max(1, _env_int("MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS", 64))
+    block_prefix_raw = os.environ.get("MTPLX_SESSION_BLOCK_PREFIX_RESTORE")
+    block_prefix_enabled = (
+        (
+            True
+            if block_prefix_raw is None
+            else not _env_falsey("MTPLX_SESSION_BLOCK_PREFIX_RESTORE")
+        )
+        if allow_block_prefix is None
+        else bool(allow_block_prefix)
+    )
+    block_size = max(1, _env_int("MTPLX_SESSION_PREFIX_BLOCK_SIZE", 256))
+    block_min_match = max(
+        block_size,
+        _env_int("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", 512),
+    )
     for entry, matched in candidates(
         prompt_ids,
         max_token_gap=max_gap,
         min_matched_tokens=min_match,
+        block_size=block_size,
+        block_min_matched_tokens=block_min_match,
+        allow_block_prefix=block_prefix_enabled,
+        model_path=str(rt.model_path),
+        mtp_enabled=bool(rt.mtp_enabled),
+        hidden_variant=base_hidden_variant,
+        template_hash=template_hash,
+        mtp_history_policy=mtp_history_policy,
+        draft_head_identity=draft_head_identity,
+        policy_fingerprint=policy_fingerprint,
     ):
         _check_postcommit_abort(abort_check)
         matched = int(matched)
+        if matched <= int(min_restore_tokens):
+            continue
         if matched < 2 or matched >= int(getattr(entry, "prefix_len", 0) or 0):
             continue
         if not _entry_matches_restore_lookup(
             entry,
             rt,
-            hidden_variant=mtp_hidden_variant,
+            hidden_variant=base_hidden_variant,
             template_hash=template_hash,
             mtp_history_policy=mtp_history_policy,
             draft_head_identity=draft_head_identity,
             policy_fingerprint=policy_fingerprint,
         ):
             continue
-        if entry.mtp_history_snapshot is None and _mtp_history_uses_committed_cache(
+        committed_history_required = _mtp_history_uses_committed_cache(
             mtp_history_policy
-        ):
+        )
+        has_committed_history = (
+            entry.mtp_history_snapshot is not None
+            or getattr(entry, "mtp_history_cache_ref", None) is not None
+        )
+        if committed_history_required and not has_committed_history:
             continue
 
-        cache = rt.make_cache()
-        restore_cache(cache, entry.cache_snapshot)
-        if not _trim_cache_to_offset(cache, matched - 1):
+        prefix_restore = None
+        cache_restore_time_s = 0.0
+        restore_entry_prefix_cache = getattr(
+            session_bank, "restore_entry_prefix_cache", None
+        )
+        if callable(restore_entry_prefix_cache):
+            restore_modes = (
+                ["reference"]
+                if getattr(entry, "live_ref_only", False)
+                else ["clone", "reference"]
+                if getattr(entry, "cache_ref", None) is not None
+                else ["clone"]
+            )
+            for restore_mode in restore_modes:
+                restore_started = time.perf_counter()
+                prefix_restore = restore_entry_prefix_cache(
+                    rt,
+                    entry,
+                    matched,
+                    mode=restore_mode,
+                    cache_factory=cache_factory,
+                )
+                cache_restore_time_s += time.perf_counter() - restore_started
+                if prefix_restore is not None:
+                    break
+        else:
+            restore_started = time.perf_counter()
+            cache = cache_factory() if cache_factory is not None else rt.make_cache()
+            restore_cache(
+                cache,
+                entry.cache_snapshot,
+                restore_meta_state=cache_factory is None,
+            )
+            if _trim_cache_to_offset(cache, matched - 1):
+                mtp_history_cache = None
+                if entry.mtp_history_snapshot is not None:
+                    mtp_history_cache = rt.make_mtp_cache()
+                    restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
+                    if not _trim_cache_to_offset(mtp_history_cache, matched - 1):
+                        mtp_history_cache = None
+                        cache = None
+                if cache is not None:
+                    prefix_restore = (cache, mtp_history_cache, "clone")
+            cache_restore_time_s = time.perf_counter() - restore_started
+        if prefix_restore is None:
             continue
-
-        mtp_history_cache = None
-        if entry.mtp_history_snapshot is not None:
-            mtp_history_cache = rt.make_mtp_cache()
-            restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
-            if not _trim_cache_to_offset(mtp_history_cache, matched - 1):
-                continue
+        cache, mtp_history_cache, storage_restore_mode = prefix_restore
+        if committed_history_required and mtp_history_cache is None:
+            continue
+        cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
+        ssd_cache_hit = bool(getattr(entry, "ssd_cache_hit", False)) or cache_source == "ssd"
+        ssd_restore_s = float(getattr(entry, "ssd_restore_s", 0.0) or 0.0)
+        ssd_cached_tokens = matched if ssd_cache_hit else 0
+        total_cache_restore_time_s = (
+            cache_restore_time_s + ssd_restore_s if ssd_cache_hit else cache_restore_time_s
+        )
 
         started = time.perf_counter()
         _check_postcommit_abort(abort_check)
@@ -1650,46 +2182,90 @@ def _restore_near_prefix_prompt_state(
                 mx.array([[int(prompt_ids[matched - 1])]]),
                 cache=cache,
                 return_hidden=True,
-                hidden_variant=mtp_hidden_variant,
+                hidden_variant=base_hidden_variant,
                 emit_logits=True,
                 logits_keep=1 if _final_logits_prefill_enabled() else None,
             )
         _eval(logits, hidden)
         repair_time = time.perf_counter() - started
         _check_postcommit_abort(abort_check)
+        restore_kind_base = (
+            "block_prefix" if int(entry.prefix_len) - matched > max_gap else "near_prefix"
+        )
+        restore_kind_suffix = (
+            "reference_lease"
+            if str(storage_restore_mode) == "reference_lease"
+            else "clone"
+        )
+        restore_kind = f"{restore_kind_base}_{restore_kind_suffix}"
+        if ssd_cache_hit:
+            restore_kind = f"ssd_{restore_kind}"
+        try:
+            diagnostic = getattr(session_bank, "last_prefix_diagnostic", None)
+            if isinstance(diagnostic, dict):
+                diagnostic["restore_kind"] = restore_kind
+                diagnostic["cache_source"] = cache_source
+                diagnostic["ssd_cache_hit"] = bool(ssd_cache_hit)
+                diagnostic["ssd_cached_tokens"] = int(ssd_cached_tokens)
+                diagnostic["ssd_restore_s"] = float(ssd_restore_s)
+        except Exception:
+            pass
         restored = SimpleNamespace(
             entry=SimpleNamespace(prefix_len=matched),
             cache=cache,
             logits=logits[:, -1, :],
             hidden=hidden[:, -1:, :],
             mtp_history_cache=mtp_history_cache,
-            restore_mode="near_prefix_clone",
+            restore_mode=restore_kind,
         )
         suffix = list(prompt_ids[matched:])
+        _emit_prefill_restore_progress(
+            chunk_callback,
+            tokens_total=len(prompt_ids),
+            cached_tokens=matched,
+            new_prefill_tokens=len(suffix),
+            started_s=chunk_started_s if chunk_started_s is not None else started,
+            cache_source=cache_source,
+            ssd_cache_hit=ssd_cache_hit,
+            ssd_cached_tokens=ssd_cached_tokens,
+            ssd_restore_s=ssd_restore_s,
+            ssd_suffix_tokens=len(suffix),
+        )
         if not suffix:
             entry.hits += 1
             entry.last_access_s = time.time()
+            repage_time = _maybe_repage_target_prefill_cache(cache)
             return PromptState(
                 trunk_cache=cache,
                 logits=logits[:, -1, :],
                 hidden=hidden[:, -1:, :],
                 committed_mtp_cache=mtp_history_cache,
                 token_prefix=tuple(int(token) for token in prompt_ids),
-                prompt_eval_time_s=repair_time,
+                prompt_eval_time_s=repair_time + repage_time,
+                cache_restore_time_s=total_cache_restore_time_s,
                 mtp_history_policy=mtp_history_policy,
                 cached_tokens=matched,
                 suffix_tokens=0,
                 cache_hit=True,
-                restore_mode="near_prefix_clone",
+                cache_source=cache_source,
+                ssd_cache_hit=ssd_cache_hit,
+                ssd_cached_tokens=ssd_cached_tokens,
+                ssd_restore_s=ssd_restore_s,
+                restore_mode=restore_kind,
             )
         suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
             _prefill_restored_prompt_suffix(
                 rt,
                 restored,
                 suffix,
+                base_hidden_variant=base_hidden_variant,
                 mtp_hidden_variant=mtp_hidden_variant,
                 mtp_history_policy=mtp_history_policy,
                 abort_check=abort_check,
+                chunk_callback=chunk_callback,
+                tokens_total=len(prompt_ids),
+                cached_tokens=matched,
+                chunk_started_s=chunk_started_s,
             )
         )
         entry.hits += 1
@@ -1702,11 +2278,16 @@ def _restore_near_prefix_prompt_state(
             token_prefix=tuple(int(token) for token in prompt_ids),
             prompt_eval_time_s=repair_time + suffix_time + mtp_history_time,
             prompt_mtp_history_time_s=mtp_history_time,
+            cache_restore_time_s=total_cache_restore_time_s,
             mtp_history_policy=mtp_history_policy,
             cached_tokens=matched,
             suffix_tokens=len(suffix),
             cache_hit=True,
-            restore_mode="near_prefix_clone",
+            cache_source=cache_source,
+            ssd_cache_hit=ssd_cache_hit,
+            ssd_cached_tokens=ssd_cached_tokens,
+            ssd_restore_s=ssd_restore_s,
+            restore_mode=restore_kind,
         )
     return None
 
@@ -1715,14 +2296,17 @@ def restore_or_prefill_prompt_state(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
-    mtp_hidden_variant: str = "post_norm",
+    base_hidden_variant: str | None = None,
+    mtp_hidden_variant: str | None = None,
     mtp_history_policy: str = "cycle",
     session_bank: Any | None = None,
     restore_mode: str = "clone",
+    session_id: str | None = None,
     template_hash: str | None = None,
     draft_head_identity: str | None = None,
     policy_fingerprint: str | None = None,
     abort_check: Callable[[], bool] | None = None,
+    prefill_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> PromptState:
     """Build the initial prompt state used by MTP-k decode.
 
@@ -1730,6 +2314,9 @@ def restore_or_prefill_prompt_state(
     today's cold path behavior intact while giving EngineSession a concrete
     target for future warm SessionBank restores.
     """
+    base_hidden_variant = _resolve_runtime_base_hidden_variant(rt, base_hidden_variant)
+    mtp_hidden_variant = _resolve_runtime_mtp_hidden_variant(rt, mtp_hidden_variant)
+    mtp_position_mode = _resolve_runtime_mtp_position_mode(rt)
     os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
     mtp_history_policy = _resolve_mtp_history_policy(
         mtp_history_policy,
@@ -1738,18 +2325,155 @@ def restore_or_prefill_prompt_state(
     mtp_history_window_tokens = (
         _mtp_history_last_window_tokens() if mtp_history_policy == "last_window" else 0
     )
+    # Dashboard prefill instrumentation. We fire `phase: "started"` before
+    # any restore/prefill work runs (so the UI can flip into prefill mode
+    # immediately), `phase: "chunk"` from inside the chunked path after
+    # each chunk completes, and `phase: "completed"` just before this
+    # function returns. The callback must be cheap and exception-safe —
+    # it runs on the generation hot path.
+    prefill_started_s = time.perf_counter()
+    if prefill_callback is not None:
+        try:
+            prefill_callback(
+                {
+                    "phase": "started",
+                    "tokens_done": 0,
+                    "tokens_total": int(len(prompt_ids)),
+                    "cached_tokens": 0,
+                    "new_prefill_tokens": int(len(prompt_ids)),
+                    "elapsed_s": 0.0,
+                    "started_s": prefill_started_s,
+                }
+            )
+        except Exception:
+            pass
+
+    def _emit_prefill_complete(state: PromptState) -> PromptState:
+        if prefill_callback is None:
+            return state
+        try:
+            elapsed = max(0.0, time.perf_counter() - prefill_started_s)
+            new_tokens = int(state.suffix_tokens)
+            wall_tok_s = (
+                (new_tokens / elapsed) if elapsed > 0 and new_tokens > 0 else None
+            )
+            compute_elapsed = max(0.0, float(state.prompt_eval_time_s or 0.0))
+            compute_tok_s = (
+                (new_tokens / compute_elapsed)
+                if compute_elapsed > 0 and new_tokens > 0
+                else None
+            )
+            prefill_callback(
+                {
+                    "phase": "completed",
+                    "tokens_total": int(len(prompt_ids)),
+                    "cached_tokens": int(state.cached_tokens),
+                    "new_prefill_tokens": new_tokens,
+                    "elapsed_s": elapsed,
+                    "prompt_eval_time_s": compute_elapsed,
+                    "prefill_tok_s": compute_tok_s if compute_tok_s is not None else wall_tok_s,
+                    "prefill_compute_tok_s": compute_tok_s,
+                    "prefill_wall_tok_s": wall_tok_s,
+                    "cache_hit": bool(state.cache_hit),
+                }
+            )
+        except Exception:
+            pass
+        return state
+
     _check_postcommit_abort(abort_check)
     if session_bank is not None:
+        restore_cache_factory = _session_restore_cache_factory(rt)
+        normalized_restore_mode = str(restore_mode).replace("-", "_")
+        allow_live_frontier_reference = (
+            normalized_restore_mode in {"reference", "reference_lease"}
+            and _session_live_frontier_reference_restore_enabled()
+        )
+        effective_restore_mode = (
+            "clone"
+            if restore_cache_factory is not None
+            and normalized_restore_mode in {"reference", "reference_lease"}
+            and not allow_live_frontier_reference
+            else restore_mode
+        )
+        exact_prefix_len = 0
+        try:
+            longest_prefix = getattr(session_bank, "longest_prefix", None)
+            if callable(longest_prefix):
+                exact_entry = longest_prefix(prompt_ids)
+                if exact_entry is not None:
+                    exact_prefix_len = int(
+                        getattr(exact_entry, "prefix_len", 0) or 0
+                    )
+        except Exception:
+            exact_prefix_len = 0
+
+        tried_larger_near_prefix = False
+        if (
+            0 < exact_prefix_len < len(prompt_ids)
+            and _opencode_compact_tool_history_policy(policy_fingerprint)
+        ):
+            tried_larger_near_prefix = True
+            near_prompt_state = _restore_near_prefix_prompt_state(
+                rt,
+                prompt_ids,
+                base_hidden_variant=base_hidden_variant,
+                mtp_hidden_variant=mtp_hidden_variant,
+                mtp_history_policy=mtp_history_policy,
+                session_bank=session_bank,
+                template_hash=template_hash,
+                draft_head_identity=draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+                min_restore_tokens=exact_prefix_len,
+                allow_block_prefix=True,
+                abort_check=abort_check,
+                chunk_callback=prefill_callback,
+                chunk_started_s=prefill_started_s,
+                cache_factory=restore_cache_factory,
+            )
+            if near_prompt_state is not None:
+                return _emit_prefill_complete(near_prompt_state)
+        elif 0 < exact_prefix_len < len(prompt_ids):
+            # Tokenizer-boundary drift can leave a newer near-exact snapshot
+            # slightly longer than the older exact prefix. Prefer that small
+            # safe overlap, but do not override an exact prefix with a large
+            # block-prefix restore: Desktop QA showed that broad block reuse can
+            # preserve speed while degrading the visible answer.
+            tried_larger_near_prefix = True
+            near_prompt_state = _restore_near_prefix_prompt_state(
+                rt,
+                prompt_ids,
+                base_hidden_variant=base_hidden_variant,
+                mtp_hidden_variant=mtp_hidden_variant,
+                mtp_history_policy=mtp_history_policy,
+                session_bank=session_bank,
+                template_hash=template_hash,
+                draft_head_identity=draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+                min_restore_tokens=exact_prefix_len,
+                allow_block_prefix=False,
+                abort_check=abort_check,
+                chunk_callback=prefill_callback,
+                chunk_started_s=prefill_started_s,
+                cache_factory=restore_cache_factory,
+            )
+            if near_prompt_state is not None:
+                return _emit_prefill_complete(near_prompt_state)
+
+        restore_started = time.perf_counter()
         restored = session_bank.restore(
             rt,
             prompt_ids,
-            mode=restore_mode,
-            hidden_variant=mtp_hidden_variant,
+            mode=effective_restore_mode,
+            session_id=session_id,
+            hidden_variant=base_hidden_variant,
             template_hash=template_hash,
             mtp_history_policy=mtp_history_policy,
             draft_head_identity=draft_head_identity,
             policy_fingerprint=policy_fingerprint,
+            cache_factory=restore_cache_factory,
         )
+        restore_elapsed_s = time.perf_counter() - restore_started
         if restored is not None and (
             not _mtp_history_uses_committed_cache(mtp_history_policy)
             or restored.mtp_history_cache is not None
@@ -1757,33 +2481,58 @@ def restore_or_prefill_prompt_state(
             _check_postcommit_abort(abort_check)
             suffix = list(prompt_ids[restored.entry.prefix_len :])
             if not suffix:
-                return PromptState(
+                repage_time = _maybe_repage_target_prefill_cache(restored.cache)
+                return _emit_prefill_complete(PromptState(
                     trunk_cache=restored.cache,
                     logits=restored.logits,
                     hidden=restored.hidden,
                     committed_mtp_cache=restored.mtp_history_cache,
                     token_prefix=tuple(int(token) for token in prompt_ids),
-                    prompt_eval_time_s=0.0,
+                    prompt_eval_time_s=repage_time,
+                    cache_restore_time_s=restore_elapsed_s,
                     mtp_history_policy=mtp_history_policy,
                     mtp_history_window_tokens=mtp_history_window_tokens,
                     cached_tokens=restored.entry.prefix_len,
                     suffix_tokens=0,
                     cache_hit=True,
+                    cache_source=getattr(restored, "cache_source", "ram"),
+                    ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
+                    ssd_cached_tokens=int(getattr(restored, "ssd_cached_tokens", 0) or 0),
+                    ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
                     restore_mode=restored.restore_mode,
-                )
+                ))
 
             _check_postcommit_abort(abort_check)
+            _emit_prefill_restore_progress(
+                prefill_callback,
+                tokens_total=len(prompt_ids),
+                cached_tokens=restored.entry.prefix_len,
+                new_prefill_tokens=len(suffix),
+                started_s=prefill_started_s,
+                cache_source=getattr(restored, "cache_source", "ram"),
+                ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
+                ssd_cached_tokens=int(
+                    getattr(restored, "ssd_cached_tokens", 0) or 0
+                ),
+                ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
+                ssd_suffix_tokens=len(suffix),
+            )
             suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
                 _prefill_restored_prompt_suffix(
                     rt,
                     restored,
                     suffix,
+                    base_hidden_variant=base_hidden_variant,
                     mtp_hidden_variant=mtp_hidden_variant,
                     mtp_history_policy=mtp_history_policy,
                     abort_check=abort_check,
+                    chunk_callback=prefill_callback,
+                    tokens_total=len(prompt_ids),
+                    cached_tokens=restored.entry.prefix_len,
+                    chunk_started_s=prefill_started_s,
                 )
             )
-            return PromptState(
+            return _emit_prefill_complete(PromptState(
                 trunk_cache=restored.cache,
                 logits=suffix_logits,
                 hidden=suffix_hidden,
@@ -1791,31 +2540,41 @@ def restore_or_prefill_prompt_state(
                 token_prefix=tuple(int(token) for token in prompt_ids),
                 prompt_eval_time_s=suffix_time + mtp_history_time,
                 prompt_mtp_history_time_s=mtp_history_time,
+                cache_restore_time_s=restore_elapsed_s,
                 mtp_history_policy=mtp_history_policy,
                 mtp_history_window_tokens=mtp_history_window_tokens,
                 cached_tokens=restored.entry.prefix_len,
                 suffix_tokens=len(suffix),
                 cache_hit=True,
+                cache_source=getattr(restored, "cache_source", "ram"),
+                ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
+                ssd_cached_tokens=int(getattr(restored, "ssd_cached_tokens", 0) or 0),
+                ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
                 restore_mode=restored.restore_mode,
-            )
+            ))
 
         near_prompt_state = _restore_near_prefix_prompt_state(
             rt,
             prompt_ids,
+            base_hidden_variant=base_hidden_variant,
             mtp_hidden_variant=mtp_hidden_variant,
             mtp_history_policy=mtp_history_policy,
             session_bank=session_bank,
             template_hash=template_hash,
             draft_head_identity=draft_head_identity,
             policy_fingerprint=policy_fingerprint,
+            min_restore_tokens=0 if tried_larger_near_prefix else exact_prefix_len,
             abort_check=abort_check,
+            chunk_callback=prefill_callback,
+            chunk_started_s=prefill_started_s,
+            cache_factory=restore_cache_factory,
         )
         if near_prompt_state is not None:
-            return near_prompt_state
+            return _emit_prefill_complete(near_prompt_state)
 
     mtp_history_cache = None
     prompt_history_time = 0.0
-    mtp_history_position_base = 0
+    mtp_history_position_base = 1 if mtp_position_mode == "absolute" else 0
     if _mtp_history_uses_committed_cache(mtp_history_policy):
         if _sustained_prefill_enabled():
             (
@@ -1829,13 +2588,18 @@ def restore_or_prefill_prompt_state(
             ) = _prefill_committed_mtp_history_streaming(
                 rt,
                 prompt_ids,
+                base_hidden_variant=base_hidden_variant,
                 mtp_hidden_variant=mtp_hidden_variant,
+                mtp_position_mode=mtp_position_mode,
                 history_window_tokens=(
                     mtp_history_window_tokens
                     if mtp_history_policy == "last_window"
                     else None
                 ),
                 abort_check=abort_check,
+                chunk_callback=prefill_callback,
+                cached_tokens=0,
+                chunk_started_s=prefill_started_s,
             )
             prompt_eval_time = target_time + prompt_history_time
         else:
@@ -1845,6 +2609,7 @@ def restore_or_prefill_prompt_state(
                 _prefill_with_hidden_sequence(
                     rt,
                     prompt_ids,
+                    hidden_variant=base_hidden_variant,
                 )
             )
             _check_postcommit_abort(abort_check)
@@ -1856,7 +2621,9 @@ def restore_or_prefill_prompt_state(
                 if mtp_history_policy == "last_window":
                     keep = min(len(history_token_ids), mtp_history_window_tokens)
                     dropped = len(history_token_ids) - keep
-                    mtp_history_position_base = max(0, dropped)
+                    mtp_history_position_base = (
+                        dropped + 1 if mtp_position_mode == "absolute" else max(0, dropped)
+                    )
                     history_token_ids = history_token_ids[-keep:]
                     history_hidden = history_hidden[:, -keep:, :]
                 prompt_history_time = _append_mtp_history(
@@ -1867,7 +2634,7 @@ def restore_or_prefill_prompt_state(
                     mtp_hidden_variant=mtp_hidden_variant,
                     position_offset=(
                         mtp_history_position_base
-                        if mtp_history_policy == "last_window"
+                        if mtp_position_mode == "absolute" or mtp_history_policy == "last_window"
                         else None
                     ),
                 )
@@ -1877,10 +2644,11 @@ def restore_or_prefill_prompt_state(
             rt,
             prompt_ids,
             return_hidden=True,
+            hidden_variant=base_hidden_variant,
             abort_check=abort_check,
         )
         prompt_eval_time = target_time
-    return PromptState(
+    return _emit_prefill_complete(PromptState(
         trunk_cache=cache,
         logits=logits,
         hidden=hidden,
@@ -1895,7 +2663,7 @@ def restore_or_prefill_prompt_state(
         cache_miss_reason=getattr(session_bank, "last_miss_reason", None)
         if session_bank is not None
         else None,
-    )
+    ))
 
 
 def _decode(tokenizer, tokens: list[int]) -> str:
@@ -2230,6 +2998,7 @@ def _prefill(
     prompt_ids: list[int],
     *,
     return_hidden: bool,
+    hidden_variant: str | None = None,
     abort_check: Callable[[], bool] | None = None,
 ):
     if not prompt_ids:
@@ -2265,6 +3034,7 @@ def _prefill(
             mx.array([[prompt_ids[-1]]]),
             cache=cache,
             return_hidden=return_hidden,
+            hidden_variant=hidden_variant if return_hidden else None,
             emit_logits=True,
             logits_keep=1 if final_logits_only else None,
         )
@@ -2286,9 +3056,14 @@ def _prefill_committed_mtp_history_streaming(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
-    mtp_hidden_variant: str,
+    base_hidden_variant: str = "post_norm",
+    mtp_hidden_variant: str = "post_norm",
+    mtp_position_mode: str = "cache",
     history_window_tokens: int | None = None,
     abort_check: Callable[[], bool] | None = None,
+    chunk_callback: Callable[[dict[str, Any]], None] | None = None,
+    cached_tokens: int = 0,
+    chunk_started_s: float | None = None,
 ):
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
@@ -2301,11 +3076,14 @@ def _prefill_committed_mtp_history_streaming(
     final_logits_only = _final_logits_prefill_enabled()
     body = prompt_ids[:-1]
     history_start_token_index = 1
-    mtp_history_position_base = 0
+    use_absolute_positions = mtp_position_mode == "absolute"
+    mtp_history_position_base = 1 if use_absolute_positions else 0
     if history_window_tokens is not None:
         window = max(1, int(history_window_tokens))
         history_start_token_index = max(1, len(prompt_ids) - window)
-        mtp_history_position_base = max(0, history_start_token_index - 1)
+        mtp_history_position_base = (
+            history_start_token_index if use_absolute_positions else max(0, history_start_token_index - 1)
+        )
 
     cursor = 0
     body_array = mx.array([body]) if body else None
@@ -2325,7 +3103,7 @@ def _prefill_committed_mtp_history_streaming(
                     chunk_array,
                     cache=cache,
                     return_hidden=True,
-                    hidden_variant=mtp_hidden_variant,
+                    hidden_variant=base_hidden_variant,
                     emit_logits=not final_logits_only,
                 )
             else:
@@ -2342,6 +3120,43 @@ def _prefill_committed_mtp_history_streaming(
             _eval(logits_chunk, hidden_chunk)
         target_forward_time += time.perf_counter() - started
         _runtime_count(rt, "prefill_chunks")
+        if chunk_callback is not None:
+            try:
+                now = time.perf_counter()
+                phase_start = chunk_started_s if chunk_started_s is not None else started
+                chunk_elapsed = max(0.0, now - started)
+                elapsed = max(0.0, now - phase_start)
+                tokens_done = int(cursor + chunk_len)
+                chunk_tok_s = (
+                    float(chunk_len) / chunk_elapsed
+                    if chunk_elapsed > 0.0
+                    else None
+                )
+                cumulative_tok_s = (
+                    float(tokens_done) / elapsed
+                    if elapsed > 0.0 and tokens_done > 0
+                    else None
+                )
+                chunk_callback(
+                    {
+                        "phase": "chunk",
+                        "tokens_done": tokens_done,
+                        "tokens_total": int(len(prompt_ids)),
+                        "cached_tokens": int(cached_tokens),
+                        "elapsed_s": elapsed,
+                        "prefill_tok_s": cumulative_tok_s,
+                        "cumulative_prefill_tok_s": cumulative_tok_s,
+                        "prefill_wall_tok_s": cumulative_tok_s,
+                        "live_prefill_tok_s": (
+                            chunk_tok_s if chunk_tok_s is not None else cumulative_tok_s
+                        ),
+                        "chunk_size": int(chunk_len),
+                        "chunk_elapsed_s": chunk_elapsed,
+                        "chunk_prefill_tok_s": chunk_tok_s,
+                    }
+                )
+            except Exception:
+                pass
         _check_postcommit_abort(abort_check)
 
         if hidden_chunk is not None:
@@ -2361,7 +3176,9 @@ def _prefill_committed_mtp_history_streaming(
                     sliced_token_ids,
                     mtp_hidden_variant=mtp_hidden_variant,
                     position_offset=(
-                        token_start_index + slice_start - 1
+                        token_start_index + slice_start
+                        if use_absolute_positions
+                        else token_start_index + slice_start - 1
                         if history_window_tokens is not None
                         else None
                     ),
@@ -2381,7 +3198,7 @@ def _prefill_committed_mtp_history_streaming(
             mx.array([[prompt_ids[-1]]]),
             cache=cache,
             return_hidden=True,
-            hidden_variant=mtp_hidden_variant,
+            hidden_variant=base_hidden_variant,
             emit_logits=True,
             logits_keep=1 if final_logits_only else None,
         )
@@ -2400,7 +3217,12 @@ def _prefill_committed_mtp_history_streaming(
     )
 
 
-def _prefill_with_hidden_sequence(rt: MTPLXRuntime, prompt_ids: list[int]):
+def _prefill_with_hidden_sequence(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    *,
+    hidden_variant: str,
+):
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
 
@@ -2411,6 +3233,7 @@ def _prefill_with_hidden_sequence(rt: MTPLXRuntime, prompt_ids: list[int]):
             mx.array([prompt_ids]),
             cache=cache,
             return_hidden=True,
+            hidden_variant=hidden_variant,
             emit_logits=True,
             logits_keep=1 if _final_logits_prefill_enabled() else None,
         )
@@ -2446,7 +3269,7 @@ def _mtp_position_offset(
     if normalized in {"", "0", "off", "false", "default", "cache"}:
         return None
     if normalized == "absolute":
-        return offset
+        return max(0, int(base)) + offset
     if normalized in {"cap", "capped", "clamp", "clamped"}:
         if cap <= 0:
             return None
@@ -2524,9 +3347,10 @@ def _append_mtp_history(
         hidden_states,
         mx.array([token_ids]),
         mtp_cache=mtp_cache,
+        mtp_hidden_variant=mtp_hidden_variant,
         position_offset=position_offset,
     )
-    if os.environ.get("MTPLX_LAZY_MTP_HISTORY_APPEND") and not force_eval:
+    if _env_truthy("MTPLX_LAZY_MTP_HISTORY_APPEND") and not force_eval:
         return time.perf_counter() - started
     _eval(hidden)
     return time.perf_counter() - started
@@ -2543,7 +3367,25 @@ def generate_ar(
     token_callback: Callable[[list[int]], None] | None = None,
     trace_label: str | None = None,
     trace_metadata: dict[str, Any] | None = None,
+    prefill_callback: Callable[[dict[str, Any]], None] | None = None,
+    repetition_stop: bool = False,
 ) -> GenerationOutput:
+    if getattr(rt, "backend_id", None) == "gemma4_assistant":
+        from .backends.gemma4_assistant import generate_gemma4_ar
+
+        return generate_gemma4_ar(
+            rt,
+            prompt_ids,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            seed=seed,
+            stop_token_ids=stop_token_ids,
+            token_callback=token_callback,
+            trace_label=trace_label,
+            trace_metadata=trace_metadata,
+            prefill_callback=prefill_callback,
+            repetition_stop=repetition_stop,
+        )
     counter_start = _runtime_counter_snapshot(rt)
     rng = np.random.default_rng(seed)
     stop_token_ids = (
@@ -2557,13 +3399,57 @@ def generate_ar(
             or _env_truthy("MTPLX_DIAGNOSTIC_AR_RETURN_HIDDEN")
         )
     )
+    # Dashboard prefill instrumentation for AR. `_prefill` is unchunked,
+    # so we only fire started/completed (no chunk progress).
+    prefill_started_s = time.perf_counter()
+    if prefill_callback is not None:
+        try:
+            prefill_callback(
+                {
+                    "phase": "started",
+                    "tokens_done": 0,
+                    "tokens_total": int(len(prompt_ids)),
+                    "cached_tokens": 0,
+                    "new_prefill_tokens": int(len(prompt_ids)),
+                    "elapsed_s": 0.0,
+                    "started_s": prefill_started_s,
+                }
+            )
+        except Exception:
+            pass
     cache, logits, hidden, prompt_eval_time = _prefill(
         rt,
         prompt_ids,
         return_hidden=ar_return_hidden,
     )
+    if prefill_callback is not None:
+        try:
+            elapsed = max(0.0, time.perf_counter() - prefill_started_s)
+            tok_s = (
+                (len(prompt_ids) / elapsed)
+                if elapsed > 0 and prompt_ids
+                else None
+            )
+            prefill_callback(
+                {
+                    "phase": "completed",
+                    "tokens_total": int(len(prompt_ids)),
+                    "new_prefill_tokens": int(len(prompt_ids)),
+                    "cached_tokens": 0,
+                    "elapsed_s": elapsed,
+                    "prompt_eval_time_s": elapsed,
+                    "prefill_tok_s": tok_s,
+                    "prefill_compute_tok_s": tok_s,
+                    "prefill_wall_tok_s": tok_s,
+                    "cache_hit": False,
+                }
+            )
+        except Exception:
+            pass
     tokens: list[int] = []
     events: list[dict] = []
+    repetition_config = _repetition_stop_config(bool(repetition_stop))
+    repetition_result: RepetitionStopResult | None = None
     target_decode_time = 0.0
     target_forward_graph_time = 0.0
     target_eval_time = 0.0
@@ -2652,6 +3538,20 @@ def generate_ar(
         tokens.append(token)
         emit_token(token)
         events.append({"step": step, "token": token})
+        repetition_result = _trim_repeated_suffix(tokens, repetition_config)
+        if repetition_result is not None:
+            events.append(
+                {
+                    "step": step,
+                    "repetition_stop": {
+                        "reason": "exact_repeated_token_suffix",
+                        "block_tokens": repetition_result.block_tokens,
+                        "repeats": repetition_result.repeats,
+                        "trimmed_tokens": repetition_result.repeated_tokens,
+                    },
+                }
+            )
+            break
         if step + 1 >= max_tokens or _is_stop(token, stop_token_ids):
             break
 
@@ -2707,6 +3607,24 @@ def generate_ar(
         verify_joint_eval_time_s=target_eval_time,
         verify_calls=verify_calls,
         peak_memory_bytes=mx.get_peak_memory(),
+        repetition_stop_triggered=repetition_result is not None,
+        repetition_stop_reason=(
+            "exact_repeated_token_suffix" if repetition_result is not None else None
+        ),
+        repetition_stop_block_tokens=(
+            0 if repetition_result is None else repetition_result.block_tokens
+        ),
+        repetition_stop_repeats=(
+            0 if repetition_result is None else repetition_result.repeats
+        ),
+        repetition_stop_trimmed_tokens=(
+            0 if repetition_result is None else repetition_result.repeated_tokens
+        ),
+        repetition_stop_raw_tokens=(
+            0
+            if repetition_result is None
+            else len(tokens) + repetition_result.repeated_tokens
+        ),
         decode_trace_path=str(trace.path) if trace.path is not None else None,
         decode_trace_run_id=trace.run_id if trace.enabled else None,
         events=events,
@@ -2717,10 +3635,16 @@ def generate_ar(
         counter_start,
         ar_return_hidden=ar_return_hidden,
     )
+    finish_reason = _finish_reason_from_tokens(
+        tokens,
+        stop_token_ids=stop_token_ids,
+        max_tokens=max_tokens,
+    )
     return GenerationOutput(
         tokens=tokens,
         text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
         stats=stats,
+        finish_reason=finish_reason,
     )
 
 
@@ -2736,6 +3660,7 @@ def generate_mtp1(
     verify_strategy: VerifyStrategy = "batched",
     verify_core: str = "stock",
     draft_margin_threshold: float | None = None,
+    repetition_stop: bool = False,
 ) -> GenerationOutput:
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtp1 requires an MTP-enabled runtime")
@@ -2769,6 +3694,8 @@ def generate_mtp1(
     )
     tokens: list[int] = []
     events: list[dict] = []
+    repetition_config = _repetition_stop_config(bool(repetition_stop))
+    repetition_result: RepetitionStopResult | None = None
     accepted = rejected = drafted = 0
     skipped = 0
     draft_time = verify_time = 0.0
@@ -2784,6 +3711,20 @@ def generate_mtp1(
 
     step = 0
     while len(tokens) < max_tokens:
+        repetition_result = _trim_repeated_suffix(tokens, repetition_config)
+        if repetition_result is not None:
+            events.append(
+                {
+                    "step": step,
+                    "repetition_stop": {
+                        "reason": "exact_repeated_token_suffix",
+                        "block_tokens": repetition_result.block_tokens,
+                        "repeats": repetition_result.repeats,
+                        "trimmed_tokens": repetition_result.repeated_tokens,
+                    },
+                }
+            )
+            break
         primary_already_emitted = pending_primary is not None
         if pending_primary is None:
             primary, _ = _sample_from_logits(logits[0], sampler, rng)
@@ -3340,13 +4281,41 @@ def generate_mtp1(
         reject_path_counts=reject_path_counts,
         repair_time_by_reject_depth_s=repair_time_by_reject_depth,
         deferred_correction_repairs=deferred_correction_repairs,
+        repetition_stop_triggered=repetition_result is not None,
+        repetition_stop_reason=(
+            "exact_repeated_token_suffix" if repetition_result is not None else None
+        ),
+        repetition_stop_block_tokens=(
+            0 if repetition_result is None else repetition_result.block_tokens
+        ),
+        repetition_stop_repeats=(
+            0 if repetition_result is None else repetition_result.repeats
+        ),
+        repetition_stop_trimmed_tokens=(
+            0 if repetition_result is None else repetition_result.repeated_tokens
+        ),
+        repetition_stop_raw_tokens=(
+            0
+            if repetition_result is None
+            else len(tokens) + repetition_result.repeated_tokens
+        ),
         events=events,
     )
     _attach_runtime_diagnostics(stats, rt, counter_start)
+    finish_reason = (
+        "stop"
+        if repetition_result is not None
+        else _finish_reason_from_tokens(
+            tokens,
+            stop_token_ids=stop_token_ids,
+            max_tokens=max_tokens,
+        )
+    )
     return GenerationOutput(
         tokens=tokens,
         text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
         stats=stats,
+        finish_reason=finish_reason,
     )
 
 
@@ -3359,7 +4328,8 @@ def generate_mtpk(
     speculative_depth: int,
     seed: int = 0,
     stop_token_ids: set[int] | None = None,
-    mtp_hidden_variant: str = "post_norm",
+    base_hidden_variant: str | None = None,
+    mtp_hidden_variant: str | None = None,
     mtp_cache_policy: str = "persistent",
     mtp_history_policy: str = "cycle",
     draft_sampler: SamplerConfig | None = None,
@@ -3396,6 +4366,8 @@ def generate_mtpk(
     commit_prompt_state_keep_live_ref: bool = False,
     trace_label: str | None = None,
     trace_metadata: dict[str, Any] | None = None,
+    prefill_callback: Callable[[dict[str, Any]], None] | None = None,
+    repetition_stop: bool = False,
 ) -> GenerationOutput:
     """Generate with a fixed native-MTP depth.
 
@@ -3403,8 +4375,42 @@ def generate_mtpk(
     target cache snapshot and re-forwards only the committed prefix. This keeps
     the hybrid GDN/attention cache contract exact while we measure depth.
     """
+    if getattr(rt, "backend_id", None) == "gemma4_assistant":
+        from .backends.gemma4_assistant import generate_gemma4_assistant
+
+        runtime_block_size = int(getattr(getattr(rt, "config", None), "draft_block_size", 0) or 0)
+        requested_block_size = int(speculative_depth or 0)
+        effective_block_size = (
+            runtime_block_size
+            if requested_block_size in {0, 3} and runtime_block_size > 0
+            else requested_block_size
+        )
+        return generate_gemma4_assistant(
+            rt,
+            prompt_ids,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_sampler=draft_sampler,
+            speculative_depth=effective_block_size,
+            seed=seed,
+            stop_token_ids=stop_token_ids,
+            token_callback=token_callback,
+            session_bank=session_bank,
+            session_restore_mode=session_restore_mode,
+            session_template_hash=session_template_hash,
+            session_draft_head_identity=session_draft_head_identity,
+            session_policy_fingerprint=session_policy_fingerprint,
+            capture_final_state=capture_final_state,
+            trace_label=trace_label,
+            trace_metadata=trace_metadata,
+            prefill_callback=prefill_callback,
+            repetition_stop=repetition_stop,
+            requested_speculative_depth=requested_block_size,
+        )
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtpk requires an MTP-enabled runtime")
+    base_hidden_variant = _resolve_runtime_base_hidden_variant(rt, base_hidden_variant)
+    mtp_hidden_variant = _resolve_runtime_mtp_hidden_variant(rt, mtp_hidden_variant)
     requested_speculative_depth = int(speculative_depth)
     if requested_speculative_depth < 1:
         raise ValueError("speculative_depth must be >= 1")
@@ -3459,11 +4465,15 @@ def generate_mtpk(
         "capture_commit",
         "graphbank",
         "graphbank_capture_commit",
+        "target_prefix",
+        "trim_commit",
     }:
         raise ValueError(
             "verify_strategy must be 'batched', 'capture_commit', "
-            "'graphbank', or 'graphbank_capture_commit'"
+            "'graphbank', 'graphbank_capture_commit', 'target_prefix', "
+            "or 'trim_commit'"
         )
+    target_prefix_verify = verify_strategy == "target_prefix"
     counter_start = _runtime_counter_snapshot(rt)
     verify_core_backend = resolve_gdn_capture_backend(verify_core)
     online_hidden_enabled = online_hidden_corrector_alpha > 0.0
@@ -3486,6 +4496,8 @@ def generate_mtpk(
         _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
     )
     started_all = time.perf_counter()
+    repetition_config = _repetition_stop_config(bool(repetition_stop))
+    repetition_result: RepetitionStopResult | None = None
     draft_time = verify_time = 0.0
     verify_forward_time = 0.0
     verify_eval_time = 0.0
@@ -3493,17 +4505,24 @@ def generate_mtpk(
     verify_hidden_eval_time = 0.0
     verify_joint_eval_time = 0.0
     verify_target_distribution_time = 0.0
+    target_distribution_materialized_rows = 0
+    target_distribution_materialized_windows = 0
+    lazy_bonus_verify_calls = 0
+    lazy_bonus_commit_time = 0.0
     verify_eval_unattributed_time = 0.0
     prompt_state = restore_or_prefill_prompt_state(
         rt,
         prompt_ids,
+        base_hidden_variant=base_hidden_variant,
         mtp_hidden_variant=mtp_hidden_variant,
         mtp_history_policy=mtp_history_policy,
         session_bank=session_bank,
         restore_mode=session_restore_mode,
+        session_id=session_id,
         template_hash=session_template_hash,
         draft_head_identity=session_draft_head_identity,
         policy_fingerprint=session_policy_fingerprint,
+        prefill_callback=prefill_callback,
     )
     prompt_prefix_bank_commit: dict[str, object] = {}
     if (
@@ -3526,17 +4545,25 @@ def generate_mtpk(
                 cache=prompt_state.trunk_cache,
                 logits=prompt_state.logits,
                 hidden=prompt_state.hidden,
-                hidden_variant=mtp_hidden_variant,
-                keep_live_ref=bool(commit_prompt_state_keep_live_ref),
+                hidden_variant=base_hidden_variant,
+                # This prompt cache is committed before decode continues and
+                # mutates the same KV/MTP objects. A live reference lease here
+                # can restore a post-decode cache under a pre-decode token
+                # prefix on the next OpenCode turn. Store a real snapshot or
+                # skip; generation-final/postcommit snapshots are the safe
+                # places for live leases.
+                keep_live_ref=False,
                 session_id=session_id,
                 template_hash=session_template_hash,
                 mtp_history_policy=prompt_state.mtp_history_policy,
                 draft_head_identity=session_draft_head_identity,
                 policy_fingerprint=session_policy_fingerprint,
                 mtp_history_snapshot=mtp_snapshot,
+                mtp_history_cache_ref=None,
                 snapshot_epoch=len(prompt_ids),
                 mtp_snapshot_epoch=len(prompt_ids)
                 if mtp_snapshot is not None
+                or prompt_state.committed_mtp_cache is not None
                 else None,
             )
             prompt_prefix_bank_commit = {
@@ -3585,7 +4612,7 @@ def generate_mtpk(
     online_hidden_corrector_time = 0.0
     tokens: list[int] = []
     events: list[dict] = []
-    record_events = not os.environ.get("MTPLX_DROP_EVENTS")
+    record_events = not _env_truthy("MTPLX_DROP_EVENTS")
     append_event = events.append if record_events else (lambda _event: None)
     accepted = rejected = drafted = 0
     bonus_tokens = correction_tokens = verify_calls = 0
@@ -3641,12 +4668,7 @@ def generate_mtpk(
     late_depth_after = int(
         os.environ.get("MTPLX_LATE_DEPTH_AFTER") or speculative_depth
     )
-    mtp_position_mode = (
-        (os.environ.get("MTPLX_MTP_POSITION_MODE") or "default")
-        .strip()
-        .lower()
-        .replace("-", "_")
-    )
+    mtp_position_mode = _resolve_runtime_mtp_position_mode(rt)
     mtp_position_cap = max(
         0,
         int(os.environ.get("MTPLX_MTP_POSITION_CAP") or 4096),
@@ -3655,9 +4677,14 @@ def generate_mtpk(
         0,
         int(os.environ.get("MTPLX_MTP_POSITION_PERIOD") or 4096),
     )
+    position_base_env = os.environ.get("MTPLX_MTP_POSITION_BASE")
     mtp_position_base = max(
         0,
-        int(os.environ.get("MTPLX_MTP_POSITION_BASE") or 0),
+        int(
+            position_base_env
+            if position_base_env is not None
+            else (len(prompt_state.token_prefix) if mtp_position_mode == "absolute" else 0)
+        ),
     )
     # Validate env spelling before a long generation starts.
     _mtp_position_offset(
@@ -3669,18 +4696,15 @@ def generate_mtpk(
     )
 
     def mtp_position_offset_for_cache(mtp_cache) -> int | None:
-        if (
-            mtp_history_position_base > 0
-            and mtp_cache is mtp_history_cache
-            and _mtp_history_uses_committed_cache(mtp_history_policy)
-        ):
-            return _mtp_cache_offset(mtp_cache) + mtp_history_position_base
+        position_base = mtp_position_base
+        if mtp_cache is mtp_history_cache and _mtp_history_uses_committed_cache(mtp_history_policy):
+            position_base = mtp_history_position_base
         return _mtp_position_offset(
             _mtp_cache_offset(mtp_cache),
             mode=mtp_position_mode,
             cap=mtp_position_cap,
             period=mtp_position_period,
-            base=mtp_position_base,
+            base=position_base,
         )
 
     mtp_history_tokens_since_materialize = 0
@@ -3706,7 +4730,7 @@ def generate_mtpk(
     state_rebase_observed_tokens = 0
     state_rebase_events = 0
     state_rebase_time_s = 0.0
-    state_root_eval_enabled = bool(os.environ.get("MTPLX_EVAL_STATE_ROOTS_ON_COMMIT"))
+    state_root_eval_enabled = _env_truthy("MTPLX_EVAL_STATE_ROOTS_ON_COMMIT")
     state_root_eval_include_mtp = os.environ.get(
         "MTPLX_EVAL_STATE_ROOTS_INCLUDE_MTP", "1"
     ).strip().lower() not in {"0", "false", "no", "off"}
@@ -3715,6 +4739,7 @@ def generate_mtpk(
     ).strip().lower() not in {"0", "false", "no", "off"}
     defer_verify_hidden_eval = _defer_verify_hidden_eval_enabled()
     verify_hidden_mode = _verify_hidden_mode()
+    lazy_target_distributions = _lazy_target_distributions_enabled()
     state_root_eval_events = 0
     state_root_eval_time_s = 0.0
     state_root_eval_arrays = 0
@@ -3767,7 +4792,7 @@ def generate_mtpk(
     dirty_detach_time_s = 0.0
     dirty_detach_arrays = 0
     dirty_detach_bytes = 0
-    live_output_detach_enabled = bool(os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS"))
+    live_output_detach_enabled = _env_truthy("MTPLX_DETACH_LIVE_OUTPUTS")
     live_output_detach_mode = (
         (
             os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS_MODE")
@@ -3982,6 +5007,7 @@ def generate_mtpk(
         rebased = restore_or_prefill_prompt_state(
             rt,
             prefix_tokens,
+            base_hidden_variant=base_hidden_variant,
             mtp_hidden_variant=mtp_hidden_variant,
             mtp_history_policy=mtp_history_policy,
             session_bank=None,
@@ -4143,6 +5169,10 @@ def generate_mtpk(
             "verify_hidden_eval_time_s": verify_hidden_eval_time,
             "verify_joint_eval_time_s": verify_joint_eval_time,
             "verify_target_distribution_time_s": verify_target_distribution_time,
+            "target_distribution_materialized_rows": target_distribution_materialized_rows,
+            "target_distribution_materialized_windows": target_distribution_materialized_windows,
+            "lazy_bonus_verify_calls": lazy_bonus_verify_calls,
+            "lazy_bonus_commit_time_s": lazy_bonus_commit_time,
             "verify_eval_unattributed_time_s": verify_eval_unattributed_time,
             "draft_time_s": draft_time,
             "accept_time_s": accept_time,
@@ -4209,6 +5239,22 @@ def generate_mtpk(
 
     step = 0
     while len(tokens) < max_tokens:
+        repetition_result = _trim_repeated_suffix(tokens, repetition_config)
+        if repetition_result is not None:
+            events.append(
+                {
+                    "step": step,
+                    "repetition_stop": {
+                        "reason": "exact_repeated_token_suffix",
+                        "block_tokens": repetition_result.block_tokens,
+                        "repeats": repetition_result.repeats,
+                        "trimmed_tokens": repetition_result.repeated_tokens,
+                    },
+                }
+            )
+            streamed_token_count = min(streamed_token_count, len(tokens))
+            emit_trace(force=True)
+            break
         primary_already_emitted = pending_primary is not None
         if pending_primary is None:
             primary, _ = _sample_from_logits(logits[0], sampler, rng)
@@ -4228,7 +5274,7 @@ def generate_mtpk(
                 if len(tokens) >= late_depth_switch_after
                 else late_depth_before
             )
-            planned_depth = max(1, min(int(planned_depth), int(speculative_depth)))
+        planned_depth = max(1, min(int(planned_depth), int(speculative_depth)))
         event = {
             "step": step,
             "primary": primary,
@@ -4566,14 +5612,18 @@ def generate_mtpk(
                             draft_logits[:, -1, :][0],
                             draft_sampler,
                             rng,
-                            need_distribution=sampler.temperature > 0,
+                            need_distribution=(
+                                sampler.temperature > 0 and not target_prefix_verify
+                            ),
                         )
                 else:
                     draft_token, draft_q = _sample_draft_from_logits(
                         draft_logits[:, -1, :][0],
                         draft_sampler,
                         rng,
-                        need_distribution=sampler.temperature > 0,
+                        need_distribution=(
+                            sampler.temperature > 0 and not target_prefix_verify
+                        ),
                     )
             elapsed_draft = time.perf_counter() - started
             draft_time += elapsed_draft
@@ -4698,7 +5748,7 @@ def generate_mtpk(
                     break
 
         before_verify = None
-        if os.environ.get("MTPLX_SKIP_VERIFY_SNAPSHOT"):
+        if _env_truthy("MTPLX_SKIP_VERIFY_SNAPSHOT"):
             event["snapshot"] = "skipped_capture_commit_required"
         else:
             started = time.perf_counter()
@@ -4706,7 +5756,48 @@ def generate_mtpk(
             elapsed_snapshot = time.perf_counter() - started
             snapshot_time += elapsed_snapshot
             _add_timing(event, "snapshot", elapsed_snapshot)
-        verify_input = [primary] + draft_tokens
+        lazy_bonus_verify_min_depth = _lazy_bonus_verify_min_depth()
+        lazy_bonus_verify_requested = _lazy_bonus_verify_enabled()
+        lazy_bonus_verify = (
+            lazy_bonus_verify_requested
+            and not lazy_target_distributions
+            and not target_prefix_verify
+            and len(draft_tokens) > 0
+            and len(draft_tokens) >= lazy_bonus_verify_min_depth
+            and not any(_is_stop(token, stop_token_ids) for token in draft_tokens[:-1])
+        )
+        omit_speculative_bonus = _omit_speculative_bonus_enabled()
+        bonus_distribution_row_needed = (
+            not omit_speculative_bonus
+            and not lazy_bonus_verify
+            and len(draft_tokens) > 0
+            and len(tokens) + len(draft_tokens) < max_tokens
+            and not any(_is_stop(token, stop_token_ids) for token in draft_tokens)
+        )
+        target_distribution_rows_needed = len(draft_tokens) + (
+            1 if bonus_distribution_row_needed else 0
+        )
+        if lazy_bonus_verify:
+            lazy_bonus_verify_calls += 1
+        verify_input = [primary] + (
+            draft_tokens[:-1] if lazy_bonus_verify else draft_tokens
+        )
+        event["lazy_bonus_verify"] = {
+            "enabled": bool(lazy_bonus_verify),
+            "requested": bool(lazy_bonus_verify_requested),
+            "disabled_by": "lazy_target_distributions"
+            if lazy_bonus_verify_requested
+            and lazy_target_distributions
+            and not target_prefix_verify
+            else None,
+            "min_depth": int(lazy_bonus_verify_min_depth),
+            "verify_input_tokens": int(len(verify_input)),
+            "draft_tokens": int(len(draft_tokens)),
+        }
+        event["speculative_bonus"] = {
+            "omitted": bool(omit_speculative_bonus),
+            "distribution_row_needed": bool(bonus_distribution_row_needed),
+        }
         set_native_mlp_context(len(tokens))
         started_forward = time.perf_counter()
         captures = None
@@ -4718,6 +5809,7 @@ def generate_mtpk(
                             mx.array([verify_input]),
                             cache=cache,
                             return_hidden=True,
+                            hidden_variant=base_hidden_variant,
                         )
                     )
                 else:
@@ -4725,6 +5817,7 @@ def generate_mtpk(
                         mx.array([verify_input]),
                         cache=cache,
                         return_hidden=True,
+                        hidden_variant=base_hidden_variant,
                         capture_backend=verify_core_backend,
                     )
             elif graphbank is not None:
@@ -4732,29 +5825,89 @@ def generate_mtpk(
                     mx.array([verify_input]),
                     cache=cache,
                     return_hidden=True,
+                    hidden_variant=base_hidden_variant,
                 )
             else:
                 verify_logits, verify_hidden = rt.forward_ar(
                     mx.array([verify_input]),
                     cache=cache,
                     return_hidden=True,
+                    hidden_variant=base_hidden_variant,
                 )
         elapsed_verify_forward = time.perf_counter() - started_forward
         verify_forward_time += elapsed_verify_forward
         _add_timing(event, "verify_forward", elapsed_verify_forward)
         target_distribution_batch = None
         target_distributions = None
+        target_prefix_tokens: list[int] | None = None
         target_distribution_precomputed = False
         elapsed_target_distribution_eval = 0.0
         started_eval = time.perf_counter()
-        if (
+        if target_prefix_verify:
+            target_distribution_rows = min(
+                int(verify_logits.shape[1]),
+                target_distribution_rows_needed,
+            )
+            target_distribution_logits = verify_logits[:, :target_distribution_rows, :]
+            started_distribution = time.perf_counter()
+            sampled_target_ids = sample_token_ids_from_mlx_logits(
+                target_distribution_logits,
+                sampler,
+            )
+            if sampled_target_ids is None:
+                raise RuntimeError(
+                    "target_prefix verification requires top-k sampling or top_p=1"
+                )
+            _eval(sampled_target_ids)
+            target_prefix_tokens = [
+                int(token) for token in np.asarray(sampled_target_ids).reshape(-1)
+            ]
+            elapsed_target_distribution_eval = (
+                time.perf_counter() - started_distribution
+            )
+            target_distribution_materialized_rows += int(target_distribution_rows)
+            target_distribution_materialized_windows += 1
+            verify_target_distribution_time += elapsed_target_distribution_eval
+            target_distribution_precomputed = True
+            event["target_distribution_materialized"] = {
+                "mode": "target_prefix",
+                "exact": True,
+                "p_q_residual": False,
+                "rows": int(target_distribution_rows),
+                "time_s": float(elapsed_target_distribution_eval),
+                "top_k": int(sampler.top_k),
+            }
+            if defer_verify_hidden_eval:
+                verify_eval_timings = {
+                    "verify_logits_eval_time_s": elapsed_target_distribution_eval,
+                    "verify_hidden_eval_time_s": 0.0,
+                    "verify_joint_eval_time_s": 0.0,
+                }
+                event["defer_verify_hidden_eval"] = {
+                    "mode": "target_prefix",
+                    "verify_hidden_mode": verify_hidden_mode,
+                    "rows": int(target_distribution_rows),
+                    "time_s": float(elapsed_target_distribution_eval),
+                }
+            elif captures is not None:
+                verify_eval_timings = _eval_verify_outputs(
+                    verify_logits, verify_hidden, captures
+                )
+            else:
+                verify_eval_timings = _eval_verify_outputs(verify_logits, verify_hidden)
+        elif (
             defer_verify_hidden_eval
             and sampler.temperature > 0
+            and not lazy_target_distributions
             and (
                 _batch_target_arrays_enabled() or _batch_target_distributions_enabled()
             )
         ):
-            target_distribution_logits = verify_logits[:, : len(draft_tokens) + 1, :]
+            target_distribution_rows = min(
+                int(verify_logits.shape[1]),
+                target_distribution_rows_needed,
+            )
+            target_distribution_logits = verify_logits[:, :target_distribution_rows, :]
             started_distribution = time.perf_counter()
             if _batch_target_arrays_enabled():
                 target_distribution_batch = _batched_distributions_from_mlx_logits(
@@ -4769,6 +5922,8 @@ def generate_mtpk(
             elapsed_target_distribution_eval = (
                 time.perf_counter() - started_distribution
             )
+            target_distribution_materialized_rows += int(target_distribution_rows)
+            target_distribution_materialized_windows += 1
             verify_eval_timings = {
                 "verify_logits_eval_time_s": elapsed_target_distribution_eval,
                 "verify_hidden_eval_time_s": 0.0,
@@ -4783,7 +5938,8 @@ def generate_mtpk(
                 "batch_target_distributions": bool(
                     _batch_target_distributions_enabled()
                 ),
-                "rows": int(len(draft_tokens) + 1),
+                "rows": int(target_distribution_rows),
+                "time_s": float(elapsed_target_distribution_eval),
             }
         elif captures is not None:
             verify_eval_timings = _eval_verify_outputs(
@@ -4843,8 +5999,16 @@ def generate_mtpk(
         accepted_count = 0
         rejection_correction: int | None = None
         started_accept = time.perf_counter()
-        if sampler.temperature > 0 and not target_distribution_precomputed:
-            target_distribution_logits = verify_logits[:, : len(draft_tokens) + 1, :]
+        if (
+            sampler.temperature > 0
+            and not target_distribution_precomputed
+            and not lazy_target_distributions
+        ):
+            target_distribution_rows = min(
+                int(verify_logits.shape[1]),
+                target_distribution_rows_needed,
+            )
+            target_distribution_logits = verify_logits[:, :target_distribution_rows, :]
             if _batch_target_arrays_enabled():
                 target_distribution_batch = _batched_distributions_from_mlx_logits(
                     target_distribution_logits,
@@ -4855,6 +6019,20 @@ def generate_mtpk(
                     target_distribution_logits,
                     sampler,
                 )
+            if target_distribution_batch is not None or target_distributions is not None:
+                target_distribution_materialized_rows += int(target_distribution_rows)
+                target_distribution_materialized_windows += 1
+                event["target_distribution_materialized"] = {
+                    "mode": "accept_path",
+                    "rows": int(target_distribution_rows),
+                    "batch_target_arrays": bool(_batch_target_arrays_enabled()),
+                    "batch_target_distributions": bool(
+                        _batch_target_distributions_enabled()
+                    ),
+                }
+        lazy_target_distribution_rows = 0
+        lazy_target_distribution_time = 0.0
+        lazy_target_distribution_window_counted = False
         for depth_index, draft_token in enumerate(draft_tokens):
             target_logits_for_draft = verify_logits[:, depth_index, :]
             target_p_for_cache = None
@@ -4863,6 +6041,11 @@ def generate_mtpk(
                     mx.argmax(target_logits_for_draft[0], axis=-1).item()
                 )
                 accepted_now = draft_token == target_token
+                accept_prob = 1.0 if accepted_now else 0.0
+                correction = target_token
+            elif target_prefix_tokens is not None:
+                target_token = int(target_prefix_tokens[depth_index])
+                accepted_now = int(draft_token) == target_token
                 accept_prob = 1.0 if accepted_now else 0.0
                 correction = target_token
             elif target_distribution_batch is not None:
@@ -4902,10 +6085,27 @@ def generate_mtpk(
                 target_p = (
                     target_distributions[depth_index]
                     if target_distributions is not None
-                    else _distribution_from_mlx_logits(
+                    else None
+                )
+                if target_p is None:
+                    started_target_distribution = time.perf_counter()
+                    target_p = _distribution_from_mlx_logits(
                         target_logits_for_draft[0], sampler
                     )
-                )
+                    elapsed_target_distribution = (
+                        time.perf_counter() - started_target_distribution
+                    )
+                    lazy_target_distribution_time += elapsed_target_distribution
+                    lazy_target_distribution_rows += 1
+                    if not lazy_target_distribution_window_counted:
+                        target_distribution_materialized_windows += 1
+                        lazy_target_distribution_window_counted = True
+                    target_distribution_materialized_rows += 1
+                    verify_target_distribution_time += elapsed_target_distribution
+                    verify_logits_eval_time += elapsed_target_distribution
+                    verify_eval_time += elapsed_target_distribution
+                    verify_time += elapsed_target_distribution
+                    target_time += elapsed_target_distribution
                 draft_q = draft_probs[depth_index]
                 if draft_q is None:
                     raise RuntimeError("non-greedy MTP requires draft distributions")
@@ -4939,6 +6139,7 @@ def generate_mtpk(
             event["rejected_at_depth"] = depth_index + 1
             if (
                 online_correction_cache
+                and target_prefix_tokens is None
                 and depth_index + 1 >= online_correction_cache_min_depth
                 and depth_index < len(draft_cache_keys)
             ):
@@ -4960,9 +6161,25 @@ def generate_mtpk(
             if sampler.temperature > 0:
                 rejection_correction = int(correction)
             break
-        elapsed_accept = time.perf_counter() - started_accept
+        elapsed_accept = max(
+            0.0,
+            time.perf_counter() - started_accept - lazy_target_distribution_time,
+        )
         accept_time += elapsed_accept
         _add_timing(event, "accept", elapsed_accept)
+        if lazy_target_distribution_rows:
+            event["target_distribution_materialized"] = {
+                "mode": "lazy_accept_path",
+                "rows": int(lazy_target_distribution_rows),
+                "time_s": float(lazy_target_distribution_time),
+                "batch_target_arrays": False,
+                "batch_target_distributions": False,
+            }
+            _add_timing(
+                event,
+                "verify_target_distribution_lazy_accept",
+                lazy_target_distribution_time,
+            )
 
         event["accepted_depths"] = accepted_count
         if adaptive_policy is not None:
@@ -5032,10 +6249,58 @@ def generate_mtpk(
                     verify_hidden[:, : max(0, len(committed) - 1), :],
                     committed[1:],
                 )
-            logits, hidden = own_live_logits_hidden(
-                verify_logits[:, len(draft_tokens), :],
-                verify_hidden[:, -1:, :],
-            )
+            if lazy_bonus_verify:
+                started_bonus_commit_forward = time.perf_counter()
+                with attention_phase("decode_verify"):
+                    bonus_commit_logits, bonus_commit_hidden = rt.forward_ar(
+                        mx.array([[int(draft_tokens[-1])]]),
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                    )
+                elapsed_bonus_commit_forward = (
+                    time.perf_counter() - started_bonus_commit_forward
+                )
+                started_bonus_commit_eval = time.perf_counter()
+                _eval(bonus_commit_logits, bonus_commit_hidden)
+                elapsed_bonus_commit_eval = (
+                    time.perf_counter() - started_bonus_commit_eval
+                )
+                elapsed_bonus_commit = (
+                    elapsed_bonus_commit_forward + elapsed_bonus_commit_eval
+                )
+                lazy_bonus_commit_time += elapsed_bonus_commit
+                verify_forward_time += elapsed_bonus_commit_forward
+                verify_eval_time += elapsed_bonus_commit_eval
+                verify_joint_eval_time += elapsed_bonus_commit_eval
+                verify_time += elapsed_bonus_commit
+                target_time += elapsed_bonus_commit
+                commit_time += elapsed_bonus_commit
+                event["lazy_bonus_verify"]["bonus_commit_forward_s"] = float(
+                    elapsed_bonus_commit_forward
+                )
+                event["lazy_bonus_verify"]["bonus_commit_eval_s"] = float(
+                    elapsed_bonus_commit_eval
+                )
+                _add_timing(
+                    event,
+                    "lazy_bonus_commit_forward",
+                    elapsed_bonus_commit_forward,
+                )
+                _add_timing(
+                    event,
+                    "lazy_bonus_commit_eval",
+                    elapsed_bonus_commit_eval,
+                )
+                logits, hidden = own_live_logits_hidden(
+                    bonus_commit_logits[:, -1, :],
+                    bonus_commit_hidden[:, -1:, :],
+                )
+            else:
+                logits, hidden = own_live_logits_hidden(
+                    verify_logits[:, len(draft_tokens), :],
+                    verify_hidden[:, -1:, :],
+                )
             if any(_is_stop(token, stop_token_ids) for token in draft_tokens):
                 tokens = _truncate_after_first_stop(tokens, stop_token_ids)
                 detach_capture_committed_state(len(tokens))
@@ -5049,19 +6314,72 @@ def generate_mtpk(
             maybe_rebase_decode_state(len(tokens))
             emit_new_tokens()
             if len(tokens) < max_tokens:
+                if omit_speculative_bonus:
+                    event["bonus_token_omitted"] = True
+                    maybe_eval_state_roots(event, len(tokens))
+                    append_event(event)
+                    emit_trace()
+                    continue
                 started_bonus = time.perf_counter()
-                if target_distribution_batch is not None:
+                bonus_target_distribution_time = 0.0
+                if (
+                    target_prefix_tokens is not None
+                    and len(target_prefix_tokens) > len(draft_tokens)
+                ):
+                    bonus = int(target_prefix_tokens[len(draft_tokens)])
+                elif target_distribution_batch is not None and not lazy_bonus_verify:
                     bonus = target_distribution_batch.sample(len(draft_tokens), rng)
-                elif target_distributions is not None and len(
-                    target_distributions
-                ) > len(draft_tokens):
+                elif (
+                    target_distributions is not None
+                    and not lazy_bonus_verify
+                    and len(target_distributions) > len(draft_tokens)
+                ):
                     bonus = sample_from_distribution(
                         target_distributions[len(draft_tokens)],
                         rng,
                     )
                 else:
+                    started_bonus_distribution = time.perf_counter()
                     bonus, _ = _sample_from_logits(logits[0], sampler, rng)
-                elapsed_bonus = time.perf_counter() - started_bonus
+                    if sampler.temperature > 0:
+                        bonus_target_distribution_time = (
+                            time.perf_counter() - started_bonus_distribution
+                        )
+                        if not lazy_target_distribution_window_counted:
+                            target_distribution_materialized_windows += 1
+                            lazy_target_distribution_window_counted = True
+                        target_distribution_materialized_rows += 1
+                        verify_target_distribution_time += bonus_target_distribution_time
+                        verify_logits_eval_time += bonus_target_distribution_time
+                        verify_eval_time += bonus_target_distribution_time
+                        verify_time += bonus_target_distribution_time
+                        target_time += bonus_target_distribution_time
+                        materialized = event.get("target_distribution_materialized")
+                        if isinstance(materialized, dict) and str(
+                            materialized.get("mode", "")
+                        ).startswith("lazy"):
+                            materialized["mode"] = "lazy_accept_bonus_path"
+                            materialized["rows"] = int(materialized.get("rows") or 0) + 1
+                            materialized["time_s"] = float(
+                                materialized.get("time_s") or 0.0
+                            ) + float(bonus_target_distribution_time)
+                        else:
+                            event["target_distribution_materialized"] = {
+                                "mode": "lazy_bonus_path",
+                                "rows": 1,
+                                "time_s": float(bonus_target_distribution_time),
+                                "batch_target_arrays": False,
+                                "batch_target_distributions": False,
+                            }
+                        _add_timing(
+                            event,
+                            "verify_target_distribution_lazy_bonus",
+                            bonus_target_distribution_time,
+                        )
+                elapsed_bonus = max(
+                    0.0,
+                    time.perf_counter() - started_bonus - bonus_target_distribution_time,
+                )
                 bonus_time += elapsed_bonus
                 _add_timing(event, "bonus_sample", elapsed_bonus)
                 tokens.append(bonus)
@@ -5087,6 +6405,7 @@ def generate_mtpk(
 
         committed_prefix_len = 1 + accepted_count
         committed_from_capture = False
+        committed_from_trim = False
         cache_committed_token_count = len(tokens)
         if rejection_correction is not None:
             cache_committed_token_count = max(0, cache_committed_token_count - 1)
@@ -5119,6 +6438,25 @@ def generate_mtpk(
                 capture_commit_detach_bytes += int(commit_detach_stats["bytes"])
             _add_timing(event, "capture_commit", elapsed_commit)
 
+        if (
+            not committed_from_capture
+            and verify_strategy in {"trim_commit", "target_prefix"}
+            and before_verify is not None
+        ):
+            started_trim_commit = time.perf_counter()
+            committed_from_trim = trim_verified_window_to_prefix(
+                cache,
+                before_verify,
+                verified_tokens=len(verify_input),
+                keep_tokens=committed_prefix_len,
+            )
+            elapsed_trim_commit = time.perf_counter() - started_trim_commit
+            if committed_from_trim:
+                commit_time += elapsed_trim_commit
+                _add_timing(event, "trim_commit", elapsed_trim_commit)
+            else:
+                _add_timing(event, "trim_commit_failed", elapsed_trim_commit)
+
         if committed_from_capture:
             event["capture_repair"] = "captured_prefix_commit"
             if rejection_correction is None:
@@ -5143,6 +6481,32 @@ def generate_mtpk(
                 deferred_correction_repairs += 1
                 event["capture_repair"] = "captured_prefix_pending_correction"
                 event["pending_primary"] = int(rejection_correction)
+        elif committed_from_trim:
+            if rejection_correction is None:
+                repair_logits, repair_hidden = own_live_logits_hidden(
+                    verify_logits[
+                        :, committed_prefix_len - 1 : committed_prefix_len, :
+                    ],
+                    verify_hidden[
+                        :, committed_prefix_len - 1 : committed_prefix_len, :
+                    ],
+                )
+                event["capture_repair"] = "trimmed_prefix_commit"
+            else:
+                started = time.perf_counter()
+                with attention_phase("decode_verify"):
+                    repair_logits, repair_hidden = rt.forward_ar(
+                        mx.array([[int(rejection_correction)]]),
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                    )
+                _eval(repair_logits, repair_hidden)
+                elapsed_repair = time.perf_counter() - started
+                target_time += elapsed_repair
+                repair_time += elapsed_repair
+                _add_timing(event, "repair_forward", elapsed_repair)
+                event["capture_repair"] = "trimmed_prefix_correction_forward"
         else:
             if before_verify is None:
                 raise RuntimeError(
@@ -5164,6 +6528,7 @@ def generate_mtpk(
                     mx.array([committed]),
                     cache=cache,
                     return_hidden=True,
+                    hidden_variant=base_hidden_variant,
                 )
             _eval(repair_logits, repair_hidden)
             elapsed_repair = time.perf_counter() - started
@@ -5174,11 +6539,10 @@ def generate_mtpk(
             assert mtp_cache is not None and cycle_mtp_offset is not None
             _rollback_mtp_cache(mtp_cache, cycle_mtp_offset + 1)
             history_tokens = committed[1:]
-            history_hidden = (
-                verify_hidden[:, : max(0, len(committed) - 1), :]
-                if committed_from_capture
-                else repair_hidden[:, : max(0, len(committed) - 1), :]
-            )
+            if committed_from_capture or committed_from_trim:
+                history_hidden = verify_hidden[:, : max(0, len(committed) - 1), :]
+            else:
+                history_hidden = repair_hidden[:, : max(0, len(committed) - 1), :]
             if committed_from_capture and rejection_correction is not None:
                 history_tokens = history_tokens[:-1]
                 history_hidden = verify_hidden[:, : max(0, committed_prefix_len - 1), :]
@@ -5208,7 +6572,12 @@ def generate_mtpk(
         emit_trace()
 
     final_state: GenerationFinalState | None = None
-    if capture_final_state and pending_primary is not None and tokens:
+    if (
+        capture_final_state
+        and pending_primary is not None
+        and tokens
+        and repetition_result is None
+    ):
         pending_token = int(pending_primary)
         if (
             _mtp_history_uses_committed_cache(mtp_history_policy)
@@ -5228,6 +6597,7 @@ def generate_mtpk(
                 mx.array([[pending_token]]),
                 cache=cache,
                 return_hidden=True,
+                hidden_variant=base_hidden_variant,
             )
         _eval(commit_logits, commit_hidden)
         elapsed_commit_forward = time.perf_counter() - commit_started
@@ -5246,7 +6616,10 @@ def generate_mtpk(
     emit_trace(force=True, final=True)
     elapsed = time.perf_counter() - started_all
     finish_reason = (
-        "stop" if any(_is_stop(token, stop_token_ids) for token in tokens) else "length"
+        "stop"
+        if repetition_result is not None
+        or any(_is_stop(token, stop_token_ids) for token in tokens)
+        else "length"
     )
     if capture_final_state:
         final_state = GenerationFinalState(
@@ -5255,7 +6628,7 @@ def generate_mtpk(
             final_hidden=hidden,
             final_committed_mtp_cache=mtp_history_cache,
             generated_token_ids=tuple(int(token) for token in tokens),
-            safe_to_commit=pending_primary is None,
+            safe_to_commit=pending_primary is None and repetition_result is None,
             finish_reason=finish_reason,
             mtp_history_policy=mtp_history_policy,
             mtp_history_window_tokens=int(prompt_state.mtp_history_window_tokens),
@@ -5270,6 +6643,7 @@ def generate_mtpk(
             generated_tokens=len(tokens),
             elapsed_s=elapsed,
             prompt_eval_time_s=prompt_eval_time,
+            cache_restore_time_s=prompt_state.cache_restore_time_s,
         ),
         accepted_drafts=accepted,
         rejected_drafts=rejected,
@@ -5281,6 +6655,13 @@ def generate_mtpk(
         verify_hidden_eval_time_s=verify_hidden_eval_time,
         verify_joint_eval_time_s=verify_joint_eval_time,
         verify_target_distribution_time_s=verify_target_distribution_time,
+        target_distribution_materialized_rows=target_distribution_materialized_rows,
+        target_distribution_materialized_windows=target_distribution_materialized_windows,
+        target_distribution_share=(
+            verify_target_distribution_time / verify_time if verify_time > 0 else 0.0
+        ),
+        lazy_bonus_verify_calls=lazy_bonus_verify_calls,
+        lazy_bonus_commit_time_s=lazy_bonus_commit_time,
         verify_eval_unattributed_time_s=verify_eval_unattributed_time,
         verify_hidden_mode=verify_hidden_mode,
         draft_time_s=draft_time,
@@ -5293,6 +6674,7 @@ def generate_mtpk(
         ),
         prompt_target_prefill_time_s=prompt_target_prefill_time,
         prompt_mtp_history_time_s=prompt_state.prompt_mtp_history_time_s,
+        cache_restore_time_s=prompt_state.cache_restore_time_s,
         prompt_target_prefill_tok_s=(
             prompt_state.suffix_tokens / prompt_target_prefill_time
             if prompt_target_prefill_time > 0
@@ -5309,6 +6691,11 @@ def generate_mtpk(
         cached_tokens=prompt_state.cached_tokens,
         new_prefill_tokens=prompt_state.suffix_tokens,
         session_cache_hit=prompt_state.cache_hit,
+        cache_source=prompt_state.cache_source,
+        ssd_cache_hit=prompt_state.ssd_cache_hit,
+        ssd_cached_tokens=prompt_state.ssd_cached_tokens,
+        ssd_restore_s=prompt_state.ssd_restore_s,
+        ssd_suffix_tokens=prompt_state.suffix_tokens if prompt_state.ssd_cache_hit else 0,
         cache_miss_reason=prompt_state.cache_miss_reason,
         session_restore_mode=prompt_state.restore_mode,
         session_prompt_prefix_bank_commit=prompt_prefix_bank_commit,
@@ -5425,6 +6812,24 @@ def generate_mtpk(
         },
         owned_recurrent_state=owned_recurrent_state_stats(cache),
         owned_attn_kv=tail_owned_attention_kv_stats(cache),
+        repetition_stop_triggered=repetition_result is not None,
+        repetition_stop_reason=(
+            "exact_repeated_token_suffix" if repetition_result is not None else None
+        ),
+        repetition_stop_block_tokens=(
+            0 if repetition_result is None else repetition_result.block_tokens
+        ),
+        repetition_stop_repeats=(
+            0 if repetition_result is None else repetition_result.repeats
+        ),
+        repetition_stop_trimmed_tokens=(
+            0 if repetition_result is None else repetition_result.repeated_tokens
+        ),
+        repetition_stop_raw_tokens=(
+            0
+            if repetition_result is None
+            else len(tokens) + repetition_result.repeated_tokens
+        ),
         events=events,
     )
     _attach_runtime_diagnostics(stats, rt, counter_start)
@@ -5433,6 +6838,7 @@ def generate_mtpk(
         text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
         stats=stats,
         final_state=final_state,
+        finish_reason=finish_reason,
     )
 
 
@@ -5706,8 +7112,14 @@ def generate_mtpa(
         events=events,
     )
     _attach_runtime_diagnostics(stats, rt, counter_start)
+    finish_reason = _finish_reason_from_tokens(
+        tokens,
+        stop_token_ids=stop_token_ids,
+        max_tokens=max_tokens,
+    )
     return GenerationOutput(
         tokens=tokens,
         text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
         stats=stats,
+        finish_reason=finish_reason,
     )

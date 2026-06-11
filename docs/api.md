@@ -54,7 +54,7 @@ Examples:
 
 ```bash
 mtplx serve --port 8000
-mtplx serve --host 0.0.0.0 --api-key "$MTPLX_AUTH"
+mtplx serve --host 0.0.0.0 --api-key "$MTPLX_API_KEY"
 mtplx serve --rate-limit 120
 mtplx serve --stream-interval 4
 mtplx serve --warmup-tokens 16

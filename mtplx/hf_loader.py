@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import errno
+import importlib
 import json
 import os
 import shutil
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,32 +23,57 @@ REQUIRED_MTPLX_MODEL_FILES = (
     "config.json",
     "tokenizer.json",
     "model.safetensors.index.json",
-    "mtp.safetensors",
     "mtplx_runtime.json",
 )
+MTP_SIDECAR_FALLBACKS = (
+    "mtp.safetensors",
+    "mtp/weights.safetensors",
+    "model-mtp.safetensors",
+)
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class RepoFile:
+    path: str
+    size_bytes: int | None
+
+
+def _query_repo_files(repo_id: str, *, revision: str | None = None) -> list[RepoFile]:
+    """Return downloadable files with Hub-reported sizes when available."""
+
+    try:
+        hf_hub = importlib.import_module("huggingface_hub")
+        api = hf_hub.HfApi()
+    except Exception:
+        return []
+    try:
+        info = api.model_info(
+            repo_id=repo_id,
+            revision=revision,
+            files_metadata=True,
+            token=hf_token_for_download(),
+        )
+    except Exception:
+        return []
+    siblings = getattr(info, "siblings", None) or []
+    files: list[RepoFile] = []
+    for sibling in siblings:
+        name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
+        if not isinstance(name, str) or not name.strip():
+            continue
+        size = getattr(sibling, "size", None)
+        files.append(RepoFile(path=name, size_bytes=size if isinstance(size, int) else None))
+    return files
 
 
 def _query_repo_total_bytes(repo_id: str, *, revision: str | None = None) -> int | None:
     """Best-effort estimate of the remote repo's total size."""
 
-    try:
-        from huggingface_hub import HfApi
-    except Exception:
-        return None
-    try:
-        info = HfApi().model_info(
-            repo_id=repo_id,
-            revision=revision,
-            files_metadata=True,
-        )
-    except Exception:
-        return None
-    siblings = getattr(info, "siblings", None) or []
     total = 0
-    for sibling in siblings:
-        size = getattr(sibling, "size", None)
-        if isinstance(size, int) and size > 0:
-            total += size
+    for repo_file in _query_repo_files(repo_id, revision=revision):
+        if isinstance(repo_file.size_bytes, int) and repo_file.size_bytes > 0:
+            total += repo_file.size_bytes
     return total or None
 
 
@@ -102,6 +128,12 @@ def cached_model_path(repo_id: str, *, cache_dir: str | Path | None = None) -> P
     return model_cache_dir(cache_dir) / safe_model_name(repo_id)
 
 
+def hf_token_for_download() -> str | bool:
+    """Use explicit env auth only; public pulls should never need HF login."""
+
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or False
+
+
 def _complete_indexed_weights(path: Path, index_name: str) -> bool:
     index = path / index_name
     if not index.is_file():
@@ -149,13 +181,53 @@ def cached_model_is_complete(path: Path) -> bool:
     which looks cached even though the weight shards are missing.
     """
 
-    if not path.is_dir() or not (path / "config.json").is_file():
+    if not path.is_dir():
         return False
-    return (
-        _complete_indexed_weights(path, "model.safetensors.index.json")
-        or _complete_indexed_weights(path, "pytorch_model.bin.index.json")
-        or _complete_unindexed_weights(path)
-    )
+    # Assistant-pair bundles (Gemma 4) have no top-level config.json — the
+    # weights live under target/ and assistant/ with an mtplx_pair.json
+    # marker. Require both halves to be complete (QA-112).
+    if (path / "mtplx_pair.json").is_file():
+        return _pair_bundle_is_complete(path)
+    if not (path / "config.json").is_file():
+        return False
+    index_names = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
+    if any((path / name).is_file() for name in index_names):
+        return any(_complete_indexed_weights(path, name) for name in index_names)
+    return _complete_unindexed_weights(path)
+
+
+def _pair_bundle_is_complete(path: Path) -> bool:
+    """Completeness for an assistant-pair bundle (target/ + assistant/).
+
+    Resolves the half-paths from the pair marker's declared layout and
+    checks each half exactly the way a single model is checked.
+    """
+
+    try:
+        from mtplx.gemma4_pair import resolve_gemma4_pair_paths
+    except Exception:
+        return False
+    resolved = resolve_gemma4_pair_paths(path)
+    if not resolved:
+        return False
+    for key in ("target_model", "assistant_model"):
+        half = resolved.get(key)
+        if not half or not cached_model_is_complete(Path(half)):
+            return False
+    return True
+
+
+def _repo_requires_qwen_mtplx_payload(repo_id: str) -> bool:
+    lower = repo_id.lower()
+    return lower.startswith("youssofal/qwen3.") and "mtplx" in lower
+
+
+def _cached_model_ready_for_repo(path: Path, repo_id: str) -> bool:
+    if not cached_model_is_complete(path):
+        return False
+    if _repo_requires_qwen_mtplx_payload(repo_id):
+        return bool(validate_mtplx_model_files(path).get("ok"))
+    return True
 
 
 def resolve_model_path(model_ref: str, *, cache_dir: str | Path | None = None) -> Path:
@@ -166,11 +238,55 @@ def resolve_model_path(model_ref: str, *, cache_dir: str | Path | None = None) -
     if repo_id is None:
         raise FileNotFoundError(f"Model path is not available locally: {local}")
     cached = cached_model_path(repo_id, cache_dir=cache_dir)
-    if cached_model_is_complete(cached):
+    if _cached_model_ready_for_repo(cached, repo_id):
         return cached
     raise FileNotFoundError(
         f"Model {repo_id} is not cached. Run: mtplx pull {repo_id}"
     )
+
+
+def _configured_mtp_file(contract: dict[str, Any] | None, config: dict[str, Any] | None) -> str | None:
+    for source in (config, contract):
+        extra = source.get("mlx_lm_extra_tensors", {}) if isinstance(source, dict) else {}
+        if isinstance(extra, dict) and extra.get("mtp_file"):
+            return str(extra["mtp_file"])
+    if isinstance(contract, dict):
+        for key in ("mtp_file", "mtp_sidecar_file"):
+            value = contract.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return None
+
+
+def _mtp_sidecar_candidates(path: Path, contract: dict[str, Any] | None = None) -> list[str]:
+    config: dict[str, Any] | None = None
+    config_path = path / "config.json"
+    if config_path.exists():
+        try:
+            loaded = json.loads(config_path.read_text(encoding="utf-8"))
+            config = loaded if isinstance(loaded, dict) else None
+        except Exception:
+            config = None
+    candidates: list[str] = []
+    configured = _configured_mtp_file(contract, config)
+    if configured:
+        candidates.append(configured)
+    candidates.extend(MTP_SIDECAR_FALLBACKS)
+    result: list[str] = []
+    for rel in candidates:
+        if rel not in result:
+            result.append(rel)
+    return result
+
+
+def _mtp_sidecar_exists(path: Path, contract: dict[str, Any] | None = None) -> bool:
+    for rel in _mtp_sidecar_candidates(path, contract):
+        try:
+            if (path / rel).is_file():
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def validate_mtplx_model_files(path: Path) -> dict[str, Any]:
@@ -184,9 +300,13 @@ def validate_mtplx_model_files(path: Path) -> dict[str, Any]:
             contract = loaded if isinstance(loaded, dict) else None
         except Exception as exc:
             contract_error = str(exc)
+    sidecar_candidates = _mtp_sidecar_candidates(path, contract)
+    if not _mtp_sidecar_exists(path, contract):
+        missing.append("mtp sidecar")
     return {
         "ok": not missing and contract_error is None,
-        "required_files": list(REQUIRED_MTPLX_MODEL_FILES),
+        "required_files": list(REQUIRED_MTPLX_MODEL_FILES) + [sidecar_candidates[0]],
+        "mtp_sidecar_candidates": sidecar_candidates,
         "missing_files": missing,
         "contract_present": contract_path.exists(),
         "contract_arch_id": contract.get("arch_id") if isinstance(contract, dict) else None,
@@ -217,41 +337,286 @@ def _emit_download_progress(callback: DownloadProgressCallback | None, payload: 
         return
 
 
-def _start_download_heartbeat(
-    destination: Path,
-    *,
+def _hub_runtime() -> tuple[Any, Callable[..., str], Callable[[], Any], Callable[..., dict[str, str]], Callable[[Any], None]]:
+    """Import the small Hub surface used by the app installer.
+
+    Tests often patch ``huggingface_hub`` with a lightweight module object, so
+    this helper keeps the imports forgiving while still using the official Hub
+    helpers when they are available.
+    """
+
+    try:
+        hf_hub = importlib.import_module("huggingface_hub")
+    except Exception as exc:
+        raise RuntimeError(f"huggingface_hub is required for mtplx pull: {exc}") from exc
+
+    try:
+        from huggingface_hub.utils import build_hf_headers, hf_raise_for_status
+    except Exception:
+
+        def build_hf_headers(**_kwargs: Any) -> dict[str, str]:
+            return {}
+
+        def hf_raise_for_status(response: Any) -> None:
+            raise_for_status = getattr(response, "raise_for_status", None)
+            if callable(raise_for_status):
+                raise_for_status()
+            elif int(getattr(response, "status_code", 200)) >= 400:
+                raise RuntimeError(f"Hugging Face request failed with HTTP {response.status_code}")
+
+    required = ["hf_hub_url", "get_session", "HfApi"]
+    missing = [name for name in required if not hasattr(hf_hub, name)]
+    if missing:
+        raise RuntimeError(
+            "huggingface_hub is too old for structured mtplx pull "
+            f"(missing {', '.join(missing)})"
+        )
+    return (
+        hf_hub.HfApi,
+        hf_hub.hf_hub_url,
+        hf_hub.get_session,
+        build_hf_headers,
+        hf_raise_for_status,
+    )
+
+
+def _classify_pull_error(exc: BaseException, repo_id: str) -> str:
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code in {401, 403}:
+        return (
+            f"Hugging Face denied access to {repo_id}. "
+            "Sign in with an access token or request access, then retry."
+        )
+    if status_code == 404:
+        return f"Hugging Face could not find {repo_id}. Check the model name, then retry."
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return "Not enough disk space to finish the model download. Free space, then retry."
+    return str(exc)
+
+
+def _safe_destination_for_repo_file(destination: Path, repo_file: RepoFile) -> Path:
+    target = destination / repo_file.path
+    try:
+        target.relative_to(destination)
+    except ValueError as exc:
+        raise RuntimeError(f"unsafe file path in Hugging Face repo: {repo_file.path}") from exc
+    return target
+
+
+def _emit_current_download_size(
     callback: DownloadProgressCallback | None,
-    interval_s: float,
-) -> tuple[threading.Event | None, threading.Thread | None]:
-    if callback is None or interval_s <= 0:
-        return None, None
+    *,
+    repo_id: str,
+    destination: Path,
+    total_bytes: int | None,
+    started_at: float,
+    last_emit_at: float,
+    last_emit_size: int,
+    file_path: str | None = None,
+) -> tuple[float, int]:
+    now = time.monotonic()
+    current_size = directory_size_bytes(destination)
+    interval = max(0.001, now - last_emit_at)
+    delta = current_size - last_emit_size
+    _emit_download_progress(
+        callback,
+        {
+            "event": "progress",
+            "repo_id": repo_id,
+            "path": str(destination),
+            "file": file_path,
+            "size_bytes": current_size,
+            "total_bytes": total_bytes,
+            "delta_bytes": delta,
+            "rate_bps": float(max(0, delta)) / interval,
+            "elapsed_s": now - started_at,
+            "interval_s": interval,
+            "stalled_s": 0,
+            "message": "Downloading model files",
+        },
+    )
+    return now, current_size
 
-    stop = threading.Event()
+
+def _open_hub_stream(session: Any, url: str, headers: dict[str, str]) -> Any:
+    stream = getattr(session, "stream", None)
+    if callable(stream):
+        return stream(
+            "GET",
+            url,
+            headers=headers,
+            follow_redirects=True,
+            timeout=60,
+        )
+    return session.get(url, headers=headers, stream=True, timeout=(10, 60))
+
+
+def _iter_response_bytes(response: Any) -> Iterator[bytes]:
+    iter_content = getattr(response, "iter_content", None)
+    if callable(iter_content):
+        yield from iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE)
+        return
+    iter_bytes = getattr(response, "iter_bytes", None)
+    if callable(iter_bytes):
+        yield from iter_bytes(chunk_size=DOWNLOAD_CHUNK_SIZE)
+        return
+    raise RuntimeError("Hugging Face response does not support byte streaming")
+
+
+def _download_repo_file(
+    repo_file: RepoFile,
+    *,
+    repo_id: str,
+    revision: str | None,
+    destination: Path,
+    session: Any,
+    hf_hub_url: Callable[..., str],
+    build_hf_headers: Callable[..., dict[str, str]],
+    hf_raise_for_status: Callable[[Any], None],
+    callback: DownloadProgressCallback | None,
+    total_bytes: int | None,
+    started_at: float,
+    progress_interval_s: float,
+    last_emit_at: float,
+    last_emit_size: int,
+) -> tuple[float, int]:
+    target = _safe_destination_for_repo_file(destination, repo_file)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    expected_size = repo_file.size_bytes
+    if expected_size is not None and target.exists() and target.stat().st_size == expected_size:
+        return last_emit_at, last_emit_size
+    if expected_size is None and target.exists() and target.stat().st_size > 0:
+        return last_emit_at, last_emit_size
+
+    partial = target.with_name(target.name + ".incomplete")
+    if target.exists():
+        if not partial.exists():
+            target.replace(partial)
+        else:
+            target.unlink()
+    existing = partial.stat().st_size if partial.exists() else 0
+    if expected_size is not None and existing > expected_size:
+        partial.unlink()
+        existing = 0
+
+    headers = build_hf_headers(token=hf_token_for_download())
+    if existing > 0:
+        headers["Range"] = f"bytes={existing}-"
+    url = hf_hub_url(repo_id=repo_id, filename=repo_file.path, revision=revision)
+    response_stream = _open_hub_stream(session, url, headers)
+    with response_stream as response:
+        status_code = int(getattr(response, "status_code", 200))
+        if existing > 0 and status_code == 200:
+            partial.unlink(missing_ok=True)
+            existing = 0
+        elif existing > 0 and status_code == 416 and expected_size is not None and existing == expected_size:
+            partial.replace(target)
+            return _emit_current_download_size(
+                callback,
+                repo_id=repo_id,
+                destination=destination,
+                total_bytes=total_bytes,
+                started_at=started_at,
+                last_emit_at=last_emit_at,
+                last_emit_size=last_emit_size,
+                file_path=repo_file.path,
+            )
+        hf_raise_for_status(response)
+        mode = "ab" if existing > 0 else "wb"
+        with partial.open(mode + "") as handle:
+            for chunk in _iter_response_bytes(response):
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                now = time.monotonic()
+                if now - last_emit_at >= progress_interval_s:
+                    last_emit_at, last_emit_size = _emit_current_download_size(
+                        callback,
+                        repo_id=repo_id,
+                        destination=destination,
+                        total_bytes=total_bytes,
+                        started_at=started_at,
+                        last_emit_at=last_emit_at,
+                        last_emit_size=last_emit_size,
+                        file_path=repo_file.path,
+                    )
+    if expected_size is not None and partial.stat().st_size != expected_size:
+        raise RuntimeError(
+            f"incomplete download for {repo_file.path}: "
+            f"expected {expected_size} bytes, got {partial.stat().st_size}"
+        )
+    partial.replace(target)
+    return _emit_current_download_size(
+        callback,
+        repo_id=repo_id,
+        destination=destination,
+        total_bytes=total_bytes,
+        started_at=started_at,
+        last_emit_at=last_emit_at,
+        last_emit_size=last_emit_size,
+        file_path=repo_file.path,
+    )
+
+
+def _download_snapshot_with_structured_progress(
+    *,
+    repo_id: str,
+    revision: str | None,
+    destination: Path,
+    progress_callback: DownloadProgressCallback | None,
+    progress_interval_s: float,
+) -> tuple[Path, int | None]:
+    HfApi, hf_hub_url, get_session, build_hf_headers, hf_raise_for_status = _hub_runtime()
+    try:
+        info = HfApi().model_info(
+            repo_id=repo_id,
+            revision=revision,
+            files_metadata=True,
+            token=hf_token_for_download(),
+        )
+    except Exception as exc:
+        raise RuntimeError(_classify_pull_error(exc, repo_id)) from exc
+    siblings = getattr(info, "siblings", None) or []
+    repo_files: list[RepoFile] = []
+    for sibling in siblings:
+        name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
+        if not isinstance(name, str) or not name.strip():
+            continue
+        size = getattr(sibling, "size", None)
+        repo_files.append(RepoFile(path=name, size_bytes=size if isinstance(size, int) else None))
+    if not repo_files:
+        raise RuntimeError(f"Hugging Face repo {repo_id} did not return downloadable files.")
+
+    total_bytes = sum(
+        repo_file.size_bytes
+        for repo_file in repo_files
+        if isinstance(repo_file.size_bytes, int) and repo_file.size_bytes > 0
+    ) or None
+    session = get_session()
     started_at = time.monotonic()
-    last_at = started_at
-    last_size = directory_size_bytes(destination)
-
-    def run() -> None:
-        nonlocal last_at, last_size
-        while not stop.wait(interval_s):
-            now = time.monotonic()
-            current_size = directory_size_bytes(destination)
-            delta = current_size - last_size
-            payload = {
-                "event": "progress",
-                "path": str(destination),
-                "size_bytes": current_size,
-                "delta_bytes": delta,
-                "elapsed_s": now - started_at,
-                "interval_s": now - last_at,
-            }
-            last_at = now
-            last_size = current_size
-            _emit_download_progress(callback, payload)
-
-    thread = threading.Thread(target=run, name="mtplx-download-heartbeat", daemon=True)
-    thread.start()
-    return stop, thread
+    last_emit_at = started_at
+    last_emit_size = directory_size_bytes(destination)
+    for repo_file in repo_files:
+        try:
+            last_emit_at, last_emit_size = _download_repo_file(
+                repo_file,
+                repo_id=repo_id,
+                revision=revision,
+                destination=destination,
+                session=session,
+                hf_hub_url=hf_hub_url,
+                build_hf_headers=build_hf_headers,
+                hf_raise_for_status=hf_raise_for_status,
+                callback=progress_callback,
+                total_bytes=total_bytes,
+                started_at=started_at,
+                progress_interval_s=max(0.1, progress_interval_s),
+                last_emit_at=last_emit_at,
+                last_emit_size=last_emit_size,
+            )
+        except Exception as exc:
+            raise RuntimeError(_classify_pull_error(exc, repo_id)) from exc
+    return destination, total_bytes
 
 
 @dataclass(frozen=True)
@@ -314,13 +679,8 @@ def pull_model(
     root.mkdir(parents=True, exist_ok=True)
     destination = cached_model_path(repo_id, cache_dir=root)
 
-    try:
-        from huggingface_hub import snapshot_download
-    except Exception as exc:
-        raise RuntimeError(f"huggingface_hub is required for mtplx pull: {exc}") from exc
-
     started_size = directory_size_bytes(destination)
-    if destination.exists() and cached_model_is_complete(destination):
+    if destination.exists() and _cached_model_ready_for_repo(destination, repo_id):
         resolved = destination
         reused_existing = True
         resumed_existing = False
@@ -330,6 +690,18 @@ def pull_model(
                 "cached MTPLX model is incomplete: "
                 + ", ".join(validation["missing_files"] or [str(validation.get("contract_error"))])
             )
+        _emit_download_progress(
+            progress_callback,
+            {
+                "event": "complete",
+                "repo_id": repo_id,
+                "path": str(resolved),
+                "size_bytes": directory_size_bytes(resolved),
+                "total_bytes": directory_size_bytes(resolved),
+                "delta_bytes": 0,
+                "reused_existing": True,
+            },
+        )
     else:
         reused_existing = False
         resumed_existing = destination.exists() and started_size > 0
@@ -349,40 +721,57 @@ def pull_model(
                 "total_bytes": total_bytes,
             },
         )
-        stop, thread = _start_download_heartbeat(
-            destination,
-            callback=progress_callback,
-            interval_s=progress_interval_s,
-        )
         progress_suppression = (
             _suppress_hf_hub_progress()
             if progress_callback is not None
             else contextlib.nullcontext()
         )
-        try:
-            with progress_suppression:
+        with progress_suppression:
+            if progress_callback is not None:
+                resolved, total_bytes_from_download = _download_snapshot_with_structured_progress(
+                    repo_id=repo_id,
+                    revision=revision,
+                    destination=destination,
+                    progress_callback=progress_callback,
+                    progress_interval_s=progress_interval_s,
+                )
+                if total_bytes_from_download:
+                    total_bytes = total_bytes_from_download
+            else:
+                try:
+                    from huggingface_hub import snapshot_download
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"huggingface_hub is required for mtplx pull: {exc}"
+                    ) from exc
                 path = snapshot_download(
                     repo_id=repo_id,
                     repo_type="model",
                     revision=revision,
                     local_dir=str(destination),
+                    token=hf_token_for_download(),
                 )
-            resolved = Path(path)
-            validation = validate_mtplx_model_files(resolved)
-            if not cached_model_is_complete(resolved):
-                raise RuntimeError(
-                    "downloaded model is incomplete: weight shards are missing or still partial"
-                )
-            if repo_id.lower().startswith("youssofal/qwen3.6-27b-mtplx") and not validation["ok"]:
-                raise RuntimeError(
-                    "downloaded MTPLX model is incomplete: "
-                    + ", ".join(validation["missing_files"] or [str(validation.get("contract_error"))])
-                )
-        finally:
-            if stop is not None:
-                stop.set()
-            if thread is not None:
-                thread.join(timeout=1.0)
+                resolved = Path(path)
+        _emit_download_progress(
+            progress_callback,
+            {
+                "event": "verifying",
+                "repo_id": repo_id,
+                "path": str(resolved),
+                "size_bytes": directory_size_bytes(resolved),
+                "total_bytes": total_bytes,
+            },
+        )
+        validation = validate_mtplx_model_files(resolved)
+        if not cached_model_is_complete(resolved):
+            raise RuntimeError(
+                "downloaded model is incomplete: weight shards are missing or still partial"
+            )
+        if repo_id.lower().startswith("youssofal/qwen3.6-27b-mtplx") and not validation["ok"]:
+            raise RuntimeError(
+                "downloaded MTPLX model is incomplete: "
+                + ", ".join(validation["missing_files"] or [str(validation.get("contract_error"))])
+            )
         final_size = directory_size_bytes(resolved)
         _emit_download_progress(
             progress_callback,

@@ -306,41 +306,45 @@ def run_mtp_chain_probe(
                                 prefixes: list[int] = []
                                 rows = []
                                 started = time.perf_counter()
-                                for case in prompts:
-                                    trace = traces[(case.id, base_hidden)]
-                                    for window_index in range(windows):
-                                        window_start = window_index * stride
-                                        result = _run_variant_on_trace(
-                                            rt,
-                                            trace,
-                                            depth=depth,
-                                            anchor=anchor,
-                                            mtp_hidden_variant=mtp_hidden,
-                                            cache_policy=cache_policy,
-                                            concat_order=concat_order,
-                                            mtp_position_mode=mtp_position_mode,
-                                            history_mode=history_mode,
-                                            window_start=window_start,
-                                            max_rank=max_rank,
-                                        )
-                                        prefixes.append(int(result["prefix"]))
-                                        for row in result["rows"]:
-                                            idx = int(row["depth"]) - 1
-                                            totals_by_depth[idx] += 1
-                                            matches_by_depth[idx] += int(row["match"])
-                                            target_rank = row.get("target_rank")
-                                            for rank in selected_top_ranks:
-                                                if target_rank is not None and int(target_rank) <= rank:
-                                                    topk_hits_by_depth[str(rank)][idx] += 1
-                                        rows.append(
-                                            {
-                                                "prompt_id": case.id,
-                                                "window_index": window_index,
-                                                "window_start": window_start,
-                                                "prefix": int(result["prefix"]),
-                                                "drafts": result["rows"],
-                                            }
-                                        )
+                                variant_error = None
+                                try:
+                                    for case in prompts:
+                                        trace = traces[(case.id, base_hidden)]
+                                        for window_index in range(windows):
+                                            window_start = window_index * stride
+                                            result = _run_variant_on_trace(
+                                                rt,
+                                                trace,
+                                                depth=depth,
+                                                anchor=anchor,
+                                                mtp_hidden_variant=mtp_hidden,
+                                                cache_policy=cache_policy,
+                                                concat_order=concat_order,
+                                                mtp_position_mode=mtp_position_mode,
+                                                history_mode=history_mode,
+                                                window_start=window_start,
+                                                max_rank=max_rank,
+                                            )
+                                            prefixes.append(int(result["prefix"]))
+                                            for row in result["rows"]:
+                                                idx = int(row["depth"]) - 1
+                                                totals_by_depth[idx] += 1
+                                                matches_by_depth[idx] += int(row["match"])
+                                                target_rank = row.get("target_rank")
+                                                for rank in selected_top_ranks:
+                                                    if target_rank is not None and int(target_rank) <= rank:
+                                                        topk_hits_by_depth[str(rank)][idx] += 1
+                                            rows.append(
+                                                {
+                                                    "prompt_id": case.id,
+                                                    "window_index": window_index,
+                                                    "window_start": window_start,
+                                                    "prefix": int(result["prefix"]),
+                                                    "drafts": result["rows"],
+                                                }
+                                            )
+                                except Exception as exc:
+                                    variant_error = f"{type(exc).__name__}: {exc}"
                                 elapsed = time.perf_counter() - started
                                 agreement_by_depth = [
                                     (matches / total if total else None)
@@ -371,6 +375,7 @@ def run_mtp_chain_probe(
                                         "prefixes": prefixes,
                                         "elapsed_s": elapsed,
                                         "rows": rows,
+                                        "error": variant_error,
                                     }
                                 )
 
