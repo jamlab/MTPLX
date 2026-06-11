@@ -70,6 +70,14 @@ model_artifacts="$(mktemp)"
 record_model_artifact() {
   local path="$1"
   case "$path" in
+    # The Mac app intentionally bundles small adapter weights as
+    # product resources; stray checkpoints everywhere else stay
+    # forbidden (and the 50 MB cap above still applies here).
+    apps/MTPLXApp/Sources/MTPLXAppCore/Resources/*|./apps/MTPLXApp/Sources/MTPLXAppCore/Resources/*)
+      return 0
+      ;;
+  esac
+  case "$path" in
     *.safetensors|*.gguf|*.mlx|*.bin|*.npz|*.npy)
       print_public_path "$path"
       ;;
@@ -125,7 +133,21 @@ rg --hidden --line-number \
   --glob '!dist/**' \
   --glob '!build/**' \
   --glob '!*.egg-info/**' \
-  'TOKEN|SECRET|PASSWORD|API_KEY|webui_secret|gho_|hf_' . >"$secret_matches" || true
+  -e '\bhf_[A-Za-z0-9]{30,}' \
+  -e '\bgh[pousr]_[A-Za-z0-9]{30,}' \
+  -e '\bgithub_pat_[A-Za-z0-9_]{30,}' \
+  -e '\bsk-[A-Za-z0-9_-]{30,}' \
+  -e '\bxox[baprs]-[A-Za-z0-9-]{20,}' \
+  -e '\bAKIA[0-9A-Z]{16}\b' \
+  -e 'BEGIN [A-Z ]*PRIVATE KEY' \
+  -e '(?i)(api[_-]?key|client[_-]?secret|password|auth[_-]?token)[" ]*[:=][ ]*["'\''][A-Za-z0-9+/=_-]{20,}["'\'']' \
+  . >"$secret_matches" || true
+# The patterns above match credential-shaped strings (token prefixes
+# at credential length, key blocks, long literals assigned to
+# secret-named variables) rather than keyword mentions. The keyword
+# grep this replaced drowned the 1.0.0 tree in false positives:
+# max_tokens, hf_model, and local placeholder keys like "mtplx-local"
+# are vocabulary here, not leaks.
 
 filtered_secrets="$(mktemp)"
 awk '

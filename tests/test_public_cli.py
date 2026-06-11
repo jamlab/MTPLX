@@ -36,6 +36,24 @@ from mtplx.profiles import (
 from mtplx.version import DISPLAY_VERSION, __version__
 
 
+def _pin_big_apple_silicon(monkeypatch):
+    """Pin the hardware probe to a big newer-generation machine.
+
+    The auto default is device-aware: M1/M2 routes to FP16 and under
+    32 GiB routes to the 9B artifact. CI runners are small M1 hosts,
+    so tests that assert the big-machine 27B default must pin the
+    probe instead of inheriting whatever host they run on.
+    """
+    monkeypatch.setattr(
+        "mtplx.default_models.detect_apple_silicon",
+        lambda: {
+            "apple_silicon_generation": "m5",
+            "chip": "Apple M5 Max",
+            "memory_gib": 64.0,
+        },
+    )
+
+
 def test_version_metadata_matches_package_metadata():
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
@@ -578,6 +596,7 @@ def test_start_dry_run_is_consumer_friendly(monkeypatch, tmp_path, capsys):
 
 
 def test_start_auto_default_can_route_to_fp16(monkeypatch, tmp_path, capsys):
+    _pin_big_apple_silicon(monkeypatch)
     monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
     monkeypatch.setenv("MTPLX_DEFAULT_MODEL_VARIANT", "fp16")
 
@@ -593,6 +612,7 @@ def test_start_auto_default_can_route_to_fp16(monkeypatch, tmp_path, capsys):
 def test_start_default_openwebui_dry_run_uses_resolved_model(
     monkeypatch, tmp_path, capsys
 ):
+    _pin_big_apple_silicon(monkeypatch)
     monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
 
     code = main(["start", "--dry-run", "--json"])
@@ -1899,7 +1919,8 @@ def test_quickstart_default_missing_cache_is_not_legacy_models_path(tmp_path, ca
     assert "tier: no-MTP" not in captured
 
 
-def test_tune_default_dry_run_is_not_legacy_models_path(tmp_path, capsys):
+def test_tune_default_dry_run_is_not_legacy_models_path(monkeypatch, tmp_path, capsys):
+    _pin_big_apple_silicon(monkeypatch)
     code = main(["tune", "--dry-run", "--json", "--cache-dir", str(tmp_path / "cache")])
 
     payload = json.loads(capsys.readouterr().out)
