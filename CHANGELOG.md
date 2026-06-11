@@ -4,6 +4,38 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.2] - 2026-06-11
+
+Bug-fix release with one small feature.
+
+### Fixed
+
+- Choosing the Auto or Sustained Max profile in the app's Settings left
+  the engine unable to start, showing Degraded on every launch until
+  the profile was changed back. Both values now resolve to real
+  profiles (Sustained Max keeps its pinned-fans intent as the fan mode
+  setting), existing configurations heal themselves on load, and the
+  picker only offers values the engine accepts. `mtplx serve --profile
+  auto` works from the command line too.
+- Parallel requests from agent tools that do not send session ids could
+  fail with "session anon-... is already in flight" when they shared a
+  prompt prefix. Busy sessions now fork to a fresh session instead of
+  erroring, and anonymous session ids are random rather than clock
+  derived. Reported and fixed by Frank Denis (@jedisct1) in #95.
+- A daemon launch that lost its port (another server bound it between
+  checks, or a listener invisible to the local probe held it) now
+  remediates and retries once before reporting a failure, and the
+  failure message names the occupant when it can.
+
+### Added
+
+- Optional Hugging Face download mirror for networks where
+  huggingface.co is blocked (requested from mainland China in #96). Set
+  it inline in the onboarding download step or later in Settings under
+  Advanced; downloads and the engine then use the mirror endpoint. The
+  stored HF token is never sent to a mirror, so gated repos stay on the
+  official endpoint.
+
 ## [1.0.1] - 2026-06-11
 
 Bug-fix release.
