@@ -4,6 +4,21 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-06-11
+
+Bug-fix release.
+
+### Fixed
+
+- First-run tuning no longer fails on Macs where fan control cannot
+  verify a max ramp (for example when the passwordless helper grant is
+  not in place yet). Tuning now runs with fans on automatic, the
+  results are labeled accordingly, and `--require-max-fans` keeps the
+  strict behavior for benchmarking.
+- The `mtplx` CLI accepts the official Gemma 4 assistant-pair repos
+  directly from Hugging Face. The app already ran them; the CLI's
+  preflight now reaches the same verdict.
+
 ## [1.0.0] - 2026-06-10
 
 The first full release: the native macOS app and the `mtplx` command line

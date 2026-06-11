@@ -21,8 +21,8 @@ NOTES_OUT="$RELEASES_OUT/notes"
 SPARKLE_ARCHIVES="$OUT_ROOT/sparkle-archives"
 APP_NOTARY_ZIP="$OUT_ROOT/MTPLX-$VERSION.app.zip"
 
-if [[ "$VERSION" != "1.0.0" ]]; then
-  echo "error: v1 release must build version 1.0.0, got $VERSION" >&2
+if [[ "$VERSION" != 1.0.* ]]; then
+  echo "error: v1 release must build a 1.0.x version, got $VERSION" >&2
   exit 1
 fi
 
