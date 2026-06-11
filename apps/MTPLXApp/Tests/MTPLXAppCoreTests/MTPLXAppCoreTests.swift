@@ -4136,10 +4136,16 @@ final class MTPLXAppCoreTests: XCTestCase {
             .failed(exitCode: 1, stderrTail: "network failed"),
             request: request
         )
-        XCTAssertEqual(
-            backend.modelDownloadFailure,
-            "The download could not reach Hugging Face. Check the network connection and try again."
+        let failure = try XCTUnwrap(backend.modelDownloadFailure)
+        XCTAssertTrue(
+            failure.hasPrefix(
+                "The download could not reach Hugging Face. Check the network connection and try again."
+            ),
+            failure
         )
+        // No mirror is configured in this fixture, so the failure copy
+        // points at the mirror option.
+        XCTAssertTrue(failure.contains("HF download mirror"), failure)
 
         await backend.handleModelDownloadEvent(
             .progress(
