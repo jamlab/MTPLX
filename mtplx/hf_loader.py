@@ -664,6 +664,35 @@ def list_cached_models(*, cache_dir: str | Path | None = None) -> list[CachedMod
     return rows
 
 
+def _local_matches_remote_index(
+    path: Path, repo_id: str, revision: str | None
+) -> bool:
+    """Best-effort remote freshness check for an explicit pull.
+
+    A pull is a stated intent to sync, so a locally-complete copy must
+    still pick up files added to the repo after the first download
+    (restored vision towers, repaired contracts). The weight index is
+    the cheap proxy: when it changed upstream, fall through to the
+    download branch and let snapshot_download fetch only the delta.
+    Network failures err on reuse so offline pulls keep working.
+    """
+
+    local_index = path / "model.safetensors.index.json"
+    if not local_index.is_file():
+        return True
+    try:
+        from huggingface_hub import hf_hub_download
+
+        remote = hf_hub_download(
+            repo_id,
+            "model.safetensors.index.json",
+            revision=revision,
+        )
+        return Path(remote).read_bytes() == local_index.read_bytes()
+    except Exception:
+        return True
+
+
 def pull_model(
     model_ref: str,
     *,
@@ -680,7 +709,11 @@ def pull_model(
     destination = cached_model_path(repo_id, cache_dir=root)
 
     started_size = directory_size_bytes(destination)
-    if destination.exists() and _cached_model_ready_for_repo(destination, repo_id):
+    if (
+        destination.exists()
+        and _cached_model_ready_for_repo(destination, repo_id)
+        and _local_matches_remote_index(destination, repo_id, revision)
+    ):
         resolved = destination
         reused_existing = True
         resumed_existing = False

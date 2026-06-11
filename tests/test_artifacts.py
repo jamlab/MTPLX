@@ -1983,3 +1983,42 @@ def test_user_promoted_contract_runs_as_unverified_label(monkeypatch, tmp_path):
     assert compatibility["unsafe_force_required"] is False
     assert compatibility["runtime_compatibility"] == "runtime-contract-unverified"
     assert "runs as unverified" in compatibility["message"]
+
+
+def test_pull_refreshes_when_remote_index_changed(monkeypatch, tmp_path):
+    # An explicit pull must sync repo deltas (restored vision towers)
+    # even when the local copy passes the completeness check.
+    import json as _json
+
+    from mtplx import hf_loader
+
+    local = tmp_path / "model"
+    local.mkdir()
+    (local / "model.safetensors.index.json").write_text(
+        _json.dumps({"weight_map": {"a": "model.safetensors"}}), encoding="utf-8"
+    )
+
+    remote_same = tmp_path / "remote_same.json"
+    remote_same.write_bytes((local / "model.safetensors.index.json").read_bytes())
+    remote_changed = tmp_path / "remote_changed.json"
+    remote_changed.write_text(
+        _json.dumps({"weight_map": {"a": "model.safetensors", "vision_tower.x": "model-vision.safetensors"}}),
+        encoding="utf-8",
+    )
+
+    def fake_download(repo_id, filename, revision=None):
+        return str(fake_download.target)
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_download)
+
+    fake_download.target = remote_same
+    assert hf_loader._local_matches_remote_index(local, "org/repo", None) is True
+
+    fake_download.target = remote_changed
+    assert hf_loader._local_matches_remote_index(local, "org/repo", None) is False
+
+    def broken_download(repo_id, filename, revision=None):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", broken_download)
+    assert hf_loader._local_matches_remote_index(local, "org/repo", None) is True
