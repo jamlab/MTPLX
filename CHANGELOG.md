@@ -4,6 +4,31 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.4] - 2026-06-12
+
+Same-day hotfix: 1.0.3 broke coding agents on their first tool turn,
+and pasting a GGUF repo got a wrong answer.
+
+### Fixed
+
+- Coding agents crashed on 1.0.3. Any tool-using client (Pi, Hermes,
+  OpenCode, or anything speaking the OpenAI tools protocol) hit
+  "unexpected keyword argument 'vision_splice'" on its first tool
+  turn after a cache miss: non-streaming callers got a 500, streaming
+  agents lost the stream, and the app reported "Stream offline." One
+  stray argument left behind by the vision work, in a diagnostics
+  call only agent tool turns reach. Removed, with tests that drive
+  the exact path and an audit test that fails if any call ever passes
+  an argument its target does not accept (#99, #100).
+- Pasting a GGUF repo into "Add a model from Hugging Face" claimed
+  the repository did not exist. The app now says what is actually
+  going on: GGUF is llama.cpp's format and MTPLX runs MLX models. It
+  names the source repo the GGUF was made from so Forge can convert
+  it, and genuine typos get "check the name" instead.
+- The "Add a model" repo check now follows the configured Hugging
+  Face download mirror instead of always probing huggingface.co, so
+  it works on networks where huggingface.co is blocked.
+
 ## [1.0.3] - 2026-06-12
 
 The app can see. Vision lands across the Qwen models, and the
