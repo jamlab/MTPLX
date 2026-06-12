@@ -416,7 +416,7 @@ struct ModelPickerOverlay: View {
         }
         errorMessage = nil
         checkingCustomRepo = true
-        let probe = HuggingFaceProbe()
+        let probe = HuggingFaceProbe(endpoint: backend.configuration.hfEndpoint)
         Task {
             let result = await probe.probe(repo: option.hfModelID)
             await MainActor.run {

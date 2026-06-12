@@ -288,4 +288,128 @@ final class HuggingFaceProbeForgeTests: XCTestCase {
         XCTAssertEqual(result.verdict, .ready)
         XCTAssertEqual(result.hfRepo, "Qwen/Qwen3.6-27B")
     }
+
+    // MARK: - Missing-config triage (GGUF and friends)
+
+    func testProbeExplainsGGUFRepoAndSuggestsSource() async {
+        let fake = FakeRunner()
+        // config.json 404s (FakeRunner default); the metadata endpoint
+        // says the repo exists, is GGUF, and names its source.
+        fake.install(
+            url: "https://huggingface.co/api/models/Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF",
+            body: """
+            {
+              "id": "Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF",
+              "tags": [
+                "gguf",
+                "llama.cpp",
+                "base_model:Jackrong/Qwopus3.6-27B-Coder",
+                "base_model:quantized:Jackrong/Qwopus3.6-27B-Coder"
+              ],
+              "siblings": [ { "rfilename": "Qwopus3.6-27B-Coder-MTP-Q4_K_M.gguf" } ]
+            }
+            """
+        )
+        let probe = HuggingFaceProbe(runner: fake.runner())
+        let result = await probe.probe(repo: "Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF")
+        XCTAssertEqual(result.verdict, .probeFailed)
+        XCTAssertEqual(result.diagnostic, "gguf_repo")
+        XCTAssertTrue(result.message.contains("GGUF"))
+        XCTAssertTrue(result.message.contains("made from Jackrong/Qwopus3.6-27B-Coder."))
+        XCTAssertFalse(result.message.lowercased().contains("not found"))
+    }
+
+    func testProbeDetectsGGUFFromSiblingsAndPointsAtSourceGenerically() async {
+        let fake = FakeRunner()
+        fake.install(
+            url: "https://huggingface.co/api/models/someone/quant-dump",
+            body: """
+            {
+              "id": "someone/quant-dump",
+              "tags": [],
+              "siblings": [ { "rfilename": "model-Q5_K_S.GGUF" } ]
+            }
+            """
+        )
+        let probe = HuggingFaceProbe(runner: fake.runner())
+        let result = await probe.probe(repo: "someone/quant-dump")
+        XCTAssertEqual(result.diagnostic, "gguf_repo")
+        XCTAssertTrue(result.message.contains("Paste the original repo"))
+    }
+
+    func testProbeMissingRepoSaysCheckTheName() async {
+        // FakeRunner 404s everything: config.json AND the metadata
+        // endpoint, which is the genuine-typo case.
+        let fake = FakeRunner()
+        let probe = HuggingFaceProbe(runner: fake.runner())
+        let result = await probe.probe(repo: "nosuch/repo-at-all")
+        XCTAssertEqual(result.verdict, .probeFailed)
+        XCTAssertEqual(result.diagnostic, "repo_not_found")
+        XCTAssertTrue(result.message.contains("doesn't exist"))
+    }
+
+    func testProbeMissingRepoBehindAuthBlurSaysExistOrGated() async {
+        // Live huggingface.co answers 401 (not 404) on the metadata
+        // endpoint for repos that do not exist, deliberately blurring
+        // missing and private. The message must cover both readings.
+        let fake = FakeRunner()
+        fake.install(
+            url: "https://huggingface.co/api/models/nosuch/repo-at-all",
+            status: 401,
+            body: "{}"
+        )
+        let probe = HuggingFaceProbe(runner: fake.runner())
+        let result = await probe.probe(repo: "nosuch/repo-at-all")
+        XCTAssertEqual(result.verdict, .probeFailed)
+        XCTAssertEqual(result.diagnostic, "repo_not_found_or_gated")
+        XCTAssertTrue(result.message.contains("doesn't exist"))
+        XCTAssertTrue(result.message.contains("private or gated"))
+    }
+
+    func testProbeExistingRepoWithoutConfigOrGGUFMentionsExport() async {
+        let fake = FakeRunner()
+        fake.install(
+            url: "https://huggingface.co/api/models/someone/raw-export",
+            body: """
+            { "id": "someone/raw-export", "tags": ["pytorch"], "siblings": [ { "rfilename": "model.bin" } ] }
+            """
+        )
+        let probe = HuggingFaceProbe(runner: fake.runner())
+        let result = await probe.probe(repo: "someone/raw-export")
+        XCTAssertEqual(result.diagnostic, "config_missing")
+        XCTAssertTrue(result.message.contains("no config.json"))
+    }
+
+    func testForgeProbeSurfacesGGUFTriageMessage() async {
+        let fake = FakeRunner()
+        fake.install(
+            url: "https://huggingface.co/api/models/Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF",
+            body: """
+            {
+              "tags": ["gguf", "base_model:Jackrong/Qwopus3.6-27B-Coder"],
+              "siblings": []
+            }
+            """
+        )
+        let probe = HuggingFaceProbe(runner: fake.runner())
+        let result = await probe.forgeProbe(repo: "Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF")
+        XCTAssertEqual(result.verdict, .probeFailed)
+        XCTAssertEqual(result.diagnostic, "gguf_repo")
+        XCTAssertTrue(result.message.contains("GGUF"))
+    }
+
+    func testProbeRoutesThroughConfiguredMirrorEndpoint() async {
+        let fake = FakeRunner()
+        // Only the mirror host serves config.json; reaching .noMTP
+        // proves every probe URL was built against the mirror.
+        fake.install(
+            url: "https://hf-mirror.example/mirror-org/some-model/resolve/main/config.json",
+            body: """
+            { "num_mtp_modules": 0 }
+            """
+        )
+        let probe = HuggingFaceProbe(endpoint: "https://hf-mirror.example/", runner: fake.runner())
+        let result = await probe.probe(repo: "mirror-org/some-model")
+        XCTAssertEqual(result.verdict, .noMTP)
+    }
 }

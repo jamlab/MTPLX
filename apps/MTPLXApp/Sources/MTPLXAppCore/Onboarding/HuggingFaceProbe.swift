@@ -21,9 +21,21 @@ public struct HuggingFaceProbe: Sendable {
     public typealias HTTPRunner = @Sendable (URL, String) async throws -> (Int, Data)
 
     private let runner: HTTPRunner
+    private let endpointBase: String
 
-    public init(runner: @escaping HTTPRunner = Self.defaultRunner) {
+    /// `endpoint` is the user's HF download mirror from Settings
+    /// (nil/empty = huggingface.co). The probe must follow it: on
+    /// networks where huggingface.co is blocked, probing the blocked
+    /// host would fail every Check & Add even though downloads work.
+    public init(endpoint: String? = nil, runner: @escaping HTTPRunner = Self.defaultRunner) {
+        self.endpointBase = Self.normalizedEndpoint(endpoint)
         self.runner = runner
+    }
+
+    static func normalizedEndpoint(_ raw: String?) -> String {
+        var value = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        while value.hasSuffix("/") { value = String(value.dropLast()) }
+        return value.isEmpty ? "https://huggingface.co" : value
     }
 
     // MARK: - Onboarding flow (unchanged)
@@ -165,7 +177,7 @@ public struct HuggingFaceProbe: Sendable {
     }
 
     private func fetchMtplxRuntimeJSON(repo: String) async -> [String: Any]? {
-        guard let url = URL(string: "https://huggingface.co/\(repo)/resolve/main/mtplx_runtime.json") else {
+        guard let url = URL(string: "\(endpointBase)/\(repo)/resolve/main/mtplx_runtime.json") else {
             return nil
         }
         do {
@@ -236,10 +248,10 @@ public struct HuggingFaceProbe: Sendable {
         case failed(OtherModelProbe)
     }
 
-    // MARK: - Step 1: GET https://huggingface.co/<repo>/resolve/main/config.json
+    // MARK: - Step 1: GET <endpoint>/<repo>/resolve/main/config.json
 
     private func fetchConfig(repo: String) async -> ConfigOutcome {
-        guard let url = URL(string: "https://huggingface.co/\(repo)/resolve/main/config.json") else {
+        guard let url = URL(string: "\(endpointBase)/\(repo)/resolve/main/config.json") else {
             return .failed(OtherModelProbe(
                 verdict: .probeFailed,
                 hfRepo: repo,
@@ -260,12 +272,13 @@ public struct HuggingFaceProbe: Sendable {
                     diagnostic: "http_\(status)"
                 ))
             case 404:
-                return .failed(OtherModelProbe(
-                    verdict: .probeFailed,
-                    hfRepo: repo,
-                    message: "Repository or config.json not found on huggingface.co.",
-                    diagnostic: "http_404"
-                ))
+                // A missing config.json does not mean a missing repo:
+                // GGUF exports carry no config.json at all, and they
+                // are exactly what users paste when a model trends
+                // with "MTP" in its name. One metadata GET separates
+                // "typo" from "wrong format" so the message can help
+                // instead of claiming the repo does not exist.
+                return .failed(await classifyMissingConfig(repo: repo))
             default:
                 return .failed(OtherModelProbe(
                     verdict: .probeFailed,
@@ -293,10 +306,110 @@ public struct HuggingFaceProbe: Sendable {
         }
     }
 
-    // MARK: - Step 2: GET https://huggingface.co/api/models/<repo>/tree/main
+    // MARK: - Missing-config triage
+
+    /// Decides what a config.json 404 actually means by asking the
+    /// repo metadata endpoint. Three honest outcomes instead of one
+    /// wrong one: the repo is GGUF (llama.cpp format we cannot run),
+    /// the repo exists but is unreadable, or the repo truly is not
+    /// there.
+    private func classifyMissingConfig(repo: String) async -> OtherModelProbe {
+        let fallback = OtherModelProbe(
+            verdict: .probeFailed,
+            hfRepo: repo,
+            message: "Repository or config.json not found on Hugging Face.",
+            diagnostic: "http_404"
+        )
+        guard let url = URL(string: "\(endpointBase)/api/models/\(repo)") else {
+            return fallback
+        }
+        guard let (status, body) = try? await runner(url, "GET") else {
+            return fallback
+        }
+        switch status {
+        case 200:
+            break
+        case 401, 403:
+            // Live behavior: the metadata endpoint answers 401 for
+            // repos that do not exist at all. HF deliberately blurs
+            // missing and private, so the message covers both.
+            return OtherModelProbe(
+                verdict: .probeFailed,
+                hfRepo: repo,
+                message: "This repo doesn't exist on Hugging Face, or it's private or gated. Check the name; public models download without a login.",
+                diagnostic: "repo_not_found_or_gated"
+            )
+        case 404:
+            return OtherModelProbe(
+                verdict: .probeFailed,
+                hfRepo: repo,
+                message: "This repo doesn't exist on Hugging Face. Check the name and try again.",
+                diagnostic: "repo_not_found"
+            )
+        default:
+            return fallback
+        }
+        let metadata = (try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:]
+        let tags = (metadata["tags"] as? [String]) ?? []
+        let siblings = (metadata["siblings"] as? [[String: Any]]) ?? []
+        let hasGGUF = tags.contains { $0.lowercased() == "gguf" }
+            || siblings.contains {
+                (($0["rfilename"] as? String) ?? "").lowercased().hasSuffix(".gguf")
+            }
+        if hasGGUF {
+            let source = Self.baseModelSuggestion(
+                tags: tags,
+                cardData: metadata["cardData"] as? [String: Any]
+            )
+            let pointer = source.map {
+                "This one was made from \($0). Paste that repo instead and Forge can convert it."
+            } ?? "Paste the original repo it was made from instead and Forge can convert it."
+            return OtherModelProbe(
+                verdict: .probeFailed,
+                hfRepo: repo,
+                message: "GGUF repos aren't supported: GGUF is llama.cpp's format and MTPLX runs MLX models. \(pointer)",
+                diagnostic: "gguf_repo"
+            )
+        }
+        return OtherModelProbe(
+            verdict: .probeFailed,
+            hfRepo: repo,
+            message: "This repo exists but has no config.json, so MTPLX can't read it. If it's a converted export, paste the original repo instead.",
+            diagnostic: "config_missing"
+        )
+    }
+
+    /// Pulls the source repo out of HF metadata. Plain
+    /// `base_model:Org/Name` tags win; relation-prefixed tags
+    /// (`base_model:quantized:Org/Name`) and cardData are fallbacks.
+    static func baseModelSuggestion(tags: [String], cardData: [String: Any]?) -> String? {
+        var relationFallback: String?
+        for tag in tags {
+            guard tag.lowercased().hasPrefix("base_model:") else { continue }
+            let value = String(tag.dropFirst("base_model:".count))
+            if let colon = value.firstIndex(of: ":") {
+                let repoPart = String(value[value.index(after: colon)...])
+                if relationFallback == nil, repoPart.contains("/") {
+                    relationFallback = repoPart
+                }
+            } else if value.contains("/") {
+                return value
+            }
+        }
+        if let card = cardData?["base_model"] as? String, card.contains("/") {
+            return card
+        }
+        if let cards = cardData?["base_model"] as? [String],
+           let first = cards.first(where: { $0.contains("/") }) {
+            return first
+        }
+        return relationFallback
+    }
+
+    // MARK: - Step 2: GET <endpoint>/api/models/<repo>/tree/main
 
     private func checkSidecarPublished(repo: String) async -> Bool {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repo)/tree/main") else {
+        guard let url = URL(string: "\(endpointBase)/api/models/\(repo)/tree/main") else {
             return false
         }
         guard let (status, body) = try? await runner(url, "GET"), status == 200 else {
